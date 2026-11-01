@@ -2,6 +2,7 @@
 //! an approval decision, or help. Supports slash commands and `@member` prefixes.
 
 use crate::domain::event::{ApprovalDecision, MessageTarget, RunId, RunStepStatus, UiCommand};
+use crate::domain::goal::GoalAction;
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::MemberId;
 use crate::tui::drawers::Drawer;
@@ -199,6 +200,17 @@ fn parse_slash(rest: &str) -> Submission {
                 name: Some(name.to_string()),
             }),
         },
+        // `/goal` alone reports the goal; `pause`, `resume` and `clear` are
+        // whole-argument subcommands; anything else is the objective.
+        "goal" => Submission::Runtime(UiCommand::Goal {
+            action: match arg.trim() {
+                "" => GoalAction::Show,
+                "pause" => GoalAction::Pause,
+                "resume" => GoalAction::Resume,
+                "clear" => GoalAction::Clear,
+                objective => GoalAction::Set(objective.to_string()),
+            },
+        }),
         "exit" if arg.is_empty() => Submission::Exit,
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
@@ -543,6 +555,35 @@ fn parse_run_id(value: &str) -> Option<RunId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn goal(action: GoalAction) -> Submission {
+        Submission::Runtime(UiCommand::Goal { action })
+    }
+
+    #[test]
+    fn goal_forms_parse() {
+        assert_eq!(parse("/goal"), goal(GoalAction::Show));
+        assert_eq!(parse("/goal   "), goal(GoalAction::Show));
+        assert_eq!(parse("/goal pause"), goal(GoalAction::Pause));
+        assert_eq!(parse("/goal resume"), goal(GoalAction::Resume));
+        assert_eq!(parse("/goal clear"), goal(GoalAction::Clear));
+        assert_eq!(
+            parse("/goal fix things fake-goal-3"),
+            goal(GoalAction::Set("fix things fake-goal-3".to_string()))
+        );
+        // Only the whole argument is a subcommand; a longer objective that
+        // starts with the word is an objective.
+        assert_eq!(
+            parse("/goal pause the deploy until the tests pass"),
+            goal(GoalAction::Set(
+                "pause the deploy until the tests pass".to_string()
+            ))
+        );
+        assert_eq!(
+            parse("/goal   keep   spacing inside  "),
+            goal(GoalAction::Set("keep   spacing inside".to_string()))
+        );
+    }
 
     #[test]
     fn plain_text_requires_an_explicit_target_prefix() {

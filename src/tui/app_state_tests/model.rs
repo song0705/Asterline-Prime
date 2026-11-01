@@ -665,6 +665,75 @@ fn welcome_summary_resolves_the_effective_model_and_effort() {
 }
 
 #[test]
+fn member_model_label_matches_the_welcome_format_and_falls_back_to_the_backend() {
+    let mut state = AppState::new(Vec::new());
+    let builder = summary("builder", "Builder", BackendKind::Codex, MemberStatus::Idle);
+    state.apply(ready_with(
+        Some(DefaultTarget::Member(MemberId::new("builder"))),
+        vec![builder],
+    ));
+    let member = state.members()[0].clone();
+    // No catalog yet: just the backend.
+    assert_eq!(state.member_model_label(&member), "codex");
+
+    let mut sol = model_with_default_effort("gpt-sol", &[Effort::Low, Effort::High], Effort::High);
+    sol.name = "GPT-Sol".to_string();
+    sol.is_default = true;
+    state.seed_installed_catalog(
+        BackendKind::Codex,
+        DiscoveredCatalog {
+            models: vec![sol],
+            ..Default::default()
+        },
+    );
+    assert_eq!(state.member_model_label(&member), "GPT-Sol · high");
+    assert_eq!(
+        state.welcome_model_summary().as_deref(),
+        Some(state.member_model_label(&member).as_str())
+    );
+}
+
+#[test]
+fn model_labels_keep_resolving_while_the_team_editor_holds_the_catalog() {
+    let mut state = AppState::new(Vec::new());
+    let builder = summary("builder", "Builder", BackendKind::Codex, MemberStatus::Idle);
+    state.apply(ready_with(
+        Some(DefaultTarget::Member(MemberId::new("builder"))),
+        vec![builder],
+    ));
+    let mut sol = model_with_default_effort("gpt-sol", &[Effort::Low, Effort::High], Effort::High);
+    sol.name = "GPT-Sol".to_string();
+    sol.is_default = true;
+    state.seed_installed_catalog(
+        BackendKind::Codex,
+        DiscoveredCatalog {
+            models: vec![sol],
+            ..Default::default()
+        },
+    );
+    let member = state.members()[0].clone();
+    let id = member.id.clone();
+    let before = state.member_model_label(&member);
+    assert_eq!(before, "GPT-Sol · high");
+
+    // Opening `/team` moves the catalog into the editor; labels must not change.
+    state.toggle_drawer(Drawer::Team);
+    assert!(state.team_editor().is_some());
+    assert_eq!(state.member_model_label(&member), before);
+    assert_eq!(state.member_model_label_by_id(&id), Some(before.clone()));
+    assert_eq!(state.welcome_model_summary(), Some(before.clone()));
+    assert_eq!(
+        state.member_model_summary(&member).as_deref(),
+        Some("GPT-Sol · high")
+    );
+
+    // And again once the editor closes and returns the catalog.
+    state.close_drawer();
+    assert!(state.team_editor().is_none());
+    assert_eq!(state.member_model_label(&member), before);
+}
+
+#[test]
 fn team_updated_confirmation_is_dropped_only_after_a_model_switch() {
     let mut state = model_state();
     let notices = |state: &AppState| {

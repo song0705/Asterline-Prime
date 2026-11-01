@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod event;
+pub mod goal;
 pub mod mode;
 pub mod team;
 

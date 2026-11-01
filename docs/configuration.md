@@ -81,21 +81,18 @@ terminal.
     {
       "display_name": "Builder",
       "backend": "codex",
-      "role": "implementation",
       "sandbox": "workspace-write",
       "effort": "high"
     },
     {
       "display_name": "Reviewer",
       "backend": "claude",
-      "role": "review and risk analysis",
       "permission_mode": "plan",
       "effort": "medium"
     },
     {
       "display_name": "Grok",
       "backend": "grok",
-      "role": "implementation",
       "sandbox": "workspace-write",
       "permission_mode": "auto"
     }
@@ -151,9 +148,9 @@ targets (case-insensitive).
 ### Collaboration modes (`modes`)
 
 Optional bindings for `/mode review`, `/mode plan`, `/mode brainstorm`, and `/mode team`. Most
-omitted role fields are derived from member roles and `default_target`
+omitted seat fields are derived from member names and `default_target`
 (the Review-mode builder ≈ default target or first non-reviewer; reviewer ≈
-role contains "review"; leader ≈ role contains "plan" or "lead", else first
+a member whose name or id contains "review"; leader ≈ name or id contains "plan" or "lead", else first
 participant; participants = full roster). The Plan-mode `builder` defaults to the
 leader, who plans and then carries the checklist out. The Plan `reviewer` is optional:
 when omitted, a complete checklist proceeds directly to the Builder. `auto_execute` defaults
@@ -239,7 +236,7 @@ relate to backend-native sandbox and permission enforcement.
 | ----------------- | --------------------------- | ------------------------------------------------------- |
 | `display_name`    | Yes unless `id` supplies it | Visible member name                                     |
 | `backend`         | Yes                         | `codex`, `claude`, `grok`, or `agy`                     |
-| `role`            | Yes                         | Free-form team responsibility                           |
+| `role`            | No (legacy)                 | Optional job text; not shown in the UI                  |
 | `id`              | No                          | Stable handle used by `@member` and routing             |
 | `cwd`             | No                          | Advanced per-member working-directory override          |
 | `model`           | No                          | Omitted delegates to the backend CLI                    |
@@ -250,6 +247,11 @@ relate to backend-native sandbox and permission enforcement.
 | `allowed_tools`   | No                          | Backend-specific tool allowlist                         |
 | `session_policy`  | No                          | `resume` (default) or `fresh`                           |
 | `session_id`      | No                          | Native CLI session/conversation ID to resume            |
+
+The `display_name` is a member's only label. `role` is a legacy optional field:
+older files that carry it keep working (Review and Plan seat defaults still read
+it), it is written back only when non-empty, and `/team` neither shows nor edits
+it. Prefer a descriptive name such as `Reviewer` or `Planner`.
 
 On startup, a `resume` member with a bound session is scanned for native
 transcript rows written while Asterline was closed (Grok CLI, Codex, or
@@ -495,7 +497,7 @@ are approved automatically unless `--manual-approvals` or
 `approvals.manual` is on; then the card above the composer is used.
 
 The `danger-full-access` sandbox and bypass-style permission modes should be
-treated as explicit trust decisions. Never assume a team role or model name
+treated as explicit trust decisions. Never assume a member name or model name
 limits what the underlying process can access.
 
 ## Agent-to-agent coordination
@@ -532,7 +534,7 @@ handoffs are capped by `max_auto_relays`; `/retry` resumes a paused route.
 An agent may request a missing specialty:
 
 ```text
-@@team_member {"display_name":"QA","backend":"codex","role":"tests"}
+@@team_member {"display_name":"QA","backend":"codex"}
 ```
 
 Asterline validates duplicate IDs and names, starts the runner, saves the
@@ -548,7 +550,7 @@ A top-level member (in `normal` or `team` mode) can open a sub-agent for a side
 task, such as an independent review or a piece of parallel work:
 
 ```text
-@@spawn {"name":"reviewer","task":"Review the diff and list real bugs.","backend":"claude","model":"opus","effort":"high","role":"review"}
+@@spawn {"name":"reviewer","task":"Review the diff and list real bugs.","backend":"claude","model":"opus","effort":"high"}
 ```
 
 `name` and `task` are required. Omitted `backend`, `model`, and `effort` follow

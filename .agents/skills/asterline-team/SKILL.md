@@ -2,7 +2,7 @@
 name: asterline-team
 description: Use when acting as an Asterline team member who actually needs to message teammates, open a sub-agent for a side task, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 23
+  version: 24
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -12,9 +12,9 @@ Asterline reads special control lines from your final output. Put each control l
 
 ## Roster And Messaging Policy
 
-Read `.asterline/roster.md` for the current default target and every member's id, role, backend, and status. Asterline rewrites that file when the team or a status changes.
+Read `.asterline/roster.md` for the current default target and every member's id, name, backend, and status. Asterline rewrites that file when the team or a status changes.
 
-Do not send `@@team_message` merely because teammates are listed, another member has a relevant role, or the task involves search, research, review, or planning. Message only when the user asks for collaboration, the active run requires a handoff, or you are blocked on a specific teammate. If you can finish the request yourself, do not emit `@@team_message`.
+Do not send `@@team_message` merely because teammates are listed, another member's name suggests a relevant specialty, or the task involves search, research, review, or planning. Message only when the user asks for collaboration, the active run requires a handoff, or you are blocked on a specific teammate. If you can finish the request yourself, do not emit `@@team_message`.
 
 ## Every Received Message Must Be Answered
 
@@ -58,7 +58,7 @@ A top-level member can open sub-agents for side work. They belong to the current
 
 Name a sub-agent after its job, short: `reviewer`, `test-writer`, `researcher`. Never use a model, model family, or CLI name (`sol`, `opus`, `gpt-6-1`, `codex`): the Agents list already shows each sub-agent's model, and the name goes stale when the model changes. Use `helper` when there is no specific job. If you do, Asterline renames it to `helper` (`helper-2`, ... when taken) and tells you the real name once.
 
-Required fields: `name` and `task`. Optional fields: `backend` (`codex`, `claude`, `grok`, or `agy`), `model`, `effort`, `role`. Omitted `backend`, `model`, and `effort` follow you; a different backend gets that backend's default permissions, and the same backend keeps yours.
+Required fields: `name` and `task`. Optional fields: `backend` (`codex`, `claude`, `grok`, or `agy`), `model`, `effort`, `role` (a short job description, never required). Omitted `backend`, `model`, and `effort` follow you; a different backend gets that backend's default permissions, and the same backend keeps yours.
 
 When it is worth it:
 - Independent pieces of work can run in parallel.
@@ -85,11 +85,11 @@ when the prompt says the roster is locked.
 When adding is allowed and the roster lacks a needed specialty, request a new teammate:
 
 ```text
-@@team_member {"display_name":"QA","backend":"codex","role":"tests"}
+@@team_member {"display_name":"QA","backend":"codex"}
 ```
 
-Required fields: `display_name`, `backend`, `role`.
-Optional fields: `id`, `model`, `effort`, `cwd`, `sandbox`, `permission_mode`, `allowed_tools`, `session_policy`, `session_id`, `system_prompt`.
+Required fields: `display_name`, `backend`. Pick a descriptive `display_name`, since it is the member's only label.
+Optional fields: `role` (a short job description, only shown in protocol text), `id`, `model`, `effort`, `cwd`, `sandbox`, `permission_mode`, `allowed_tools`, `session_policy`, `session_id`, `system_prompt`.
 
 Omitted `sandbox` and `permission_mode` use Asterline's write defaults for
 that backend (Agy: `accept-edits` with sandbox off). Set them only to

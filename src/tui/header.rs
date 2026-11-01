@@ -32,7 +32,7 @@ pub(crate) fn display_workspace(workspace: &str, home: Option<&str>) -> String {
 /// Columns kept clear between the key hints and the workspace path.
 const FOOTER_PATH_GAP: usize = 2;
 
-/// Header: one line of member chips (a status glyph, name and backend each),
+/// Header: one line of member chips (a status glyph, name and model each),
 /// then the mode chip when a collaboration mode is active. No title row and no
 /// rule: the product name and version live in `/help`, the path in the footer.
 pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -126,7 +126,7 @@ fn push_member_chip(
     }
     chips.push(Span::styled(member.display_name.clone(), name_style));
     chips.push(Span::styled(
-        format!(" · {}", member.backend.as_str()),
+        format!(" · {}", state.member_model_label(member)),
         theme::muted(),
     ));
 }

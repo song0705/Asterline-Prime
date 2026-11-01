@@ -20,6 +20,7 @@ use crate::domain::event::{
     LogEntry, LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId, RunStatus, RunStepStatus,
     RunStepSummary, RunSummary, RunVerification, TurnId,
 };
+use crate::domain::goal::{GoalState, GoalStatus};
 use crate::domain::mode::{CollabMode, ModeStatusSummary, ModesConfig, TerminalMode};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
@@ -198,6 +199,18 @@ impl SqliteStore {
                 mode            TEXT NOT NULL DEFAULT 'normal',
                 mode_overrides_json TEXT NOT NULL DEFAULT '{}',
                 updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_goals (
+                conversation_id    INTEGER PRIMARY KEY,
+                objective          TEXT NOT NULL,
+                status             TEXT NOT NULL,
+                member_id          TEXT NOT NULL,
+                turns              INTEGER NOT NULL DEFAULT 0,
+                created_at         INTEGER NOT NULL,
+                last_reason        TEXT,
+                no_progress_streak INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id)
             );
 
@@ -663,7 +676,7 @@ impl SqliteStore {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM messages
              WHERE conversation_id = ?1
-               AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')",
+               AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict', 'goal_marker')",
             params![conversation],
             |row| row.get(0),
         )?;
@@ -683,7 +696,7 @@ impl SqliteStore {
                 "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
                  FROM messages
                  WHERE conversation_id = ?1
-                   AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')
+                   AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict', 'goal_marker')
                  ORDER BY id ASC",
             )?;
             let rows = stmt.query_map(params![conversation], map_chat_item)?;
@@ -700,7 +713,7 @@ impl SqliteStore {
             "SELECT kind, member_id, display_name, backend, text, name, summary, ok, targets
              FROM messages
              WHERE conversation_id = ?1
-               AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict')
+               AND kind IN ('user', 'agent', 'thinking', 'tool', 'route', 'diff', 'notice', 'error', 'verdict', 'goal_marker')
              ORDER BY id DESC
              LIMIT ?2",
         )?;
@@ -1168,6 +1181,7 @@ impl SqliteStore {
                 "DELETE FROM approvals WHERE conversation_id = ?1",
                 "DELETE FROM messages WHERE conversation_id = ?1",
                 "DELETE FROM conversation_snapshots WHERE conversation_id = ?1",
+                "DELETE FROM conversation_goals WHERE conversation_id = ?1",
             ] {
                 self.conn.execute(sql, params![conversation])?;
             }
@@ -1176,6 +1190,86 @@ impl SqliteStore {
                 params![conversation],
             )?;
             Ok(removed > 0)
+        })
+    }
+
+    // --- goals -----------------------------------------------------------
+
+    /// Save the active conversation's goal (one row per chat).
+    pub fn save_goal(&self, goal: &GoalState) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO conversation_goals
+                (conversation_id, objective, status, member_id, turns, created_at,
+                 last_reason, no_progress_streak)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                objective = excluded.objective,
+                status = excluded.status,
+                member_id = excluded.member_id,
+                turns = excluded.turns,
+                created_at = excluded.created_at,
+                last_reason = excluded.last_reason,
+                no_progress_streak = excluded.no_progress_streak",
+            params![
+                self.conversation.get(),
+                goal.objective,
+                goal.status.as_str(),
+                goal.member.as_str(),
+                i64::from(goal.turns),
+                i64::try_from(goal.created_at).unwrap_or(i64::MAX),
+                goal.last_reason,
+                i64::from(goal.no_progress_streak),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the active conversation's goal.
+    pub fn clear_goal(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM conversation_goals WHERE conversation_id = ?1",
+            params![self.conversation.get()],
+        )?;
+        Ok(())
+    }
+
+    /// One conversation's saved goal, if it has one.
+    pub fn goal_for(&self, conversation: i64) -> Result<Option<GoalState>> {
+        self.conn
+            .query_row(
+                "SELECT objective, status, member_id, turns, created_at, last_reason,
+                        no_progress_streak
+                 FROM conversation_goals WHERE conversation_id = ?1",
+                params![conversation],
+                |row| {
+                    Ok(GoalState {
+                        objective: row.get(0)?,
+                        status: GoalStatus::parse(&row.get::<_, String>(1)?),
+                        member: MemberId::new(row.get::<_, String>(2)?),
+                        turns: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        created_at: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        last_reason: row.get(5)?,
+                        no_progress_streak: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Persist the marker row the goal loop shows when it starts a turn.
+    pub fn record_goal_marker(
+        &self,
+        turn: TurnId,
+        member: &MemberId,
+        number: u32,
+    ) -> Result<MessageId> {
+        let number = number.to_string();
+        self.insert_message(MessageRow {
+            turn: Some(turn),
+            kind: "goal_marker",
+            member: Some(member),
+            text: Some(&number),
+            ..MessageRow::default()
         })
     }
 
@@ -2271,6 +2365,7 @@ fn chat_item_replay_bytes(item: &ChatItem) -> usize {
         ChatItem::Verdict {
             member, summary, ..
         } => member.as_str().len() + summary.len(),
+        ChatItem::GoalMarker { member, .. } => member.as_str().len() + 4,
     };
     REPLAY_ITEM_OVERHEAD.saturating_add(payload)
 }
@@ -2346,6 +2441,10 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
             member: MemberId::new(member_id.unwrap_or_default()),
             approve: ok.map(|v| v != 0).unwrap_or(false),
             summary: text.unwrap_or_default(),
+        },
+        "goal_marker" => ChatItem::GoalMarker {
+            member: MemberId::new(member_id.unwrap_or_default()),
+            turn: text.and_then(|value| value.parse().ok()).unwrap_or(0),
         },
         _ => return Ok(None),
     };

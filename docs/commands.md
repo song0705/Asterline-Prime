@@ -103,7 +103,10 @@ is intended for development, demos, and tests. A prompt containing `slow`
 makes the fake agent take about five seconds, so the running state can be
 inspected. A prompt containing the word `tools` makes it run eight tool calls
 of mixed kinds (one of them failing) before it answers, which is a quick way to
-see a long tool group.
+see a long tool group. For [`/goal`](#goal), an objective containing
+`fake-goal-<N>` makes the fake agent finish the goal on its N-th goal turn, and
+`fake-goal-silent` makes every goal turn reply with nothing (to see the
+no-progress pause).
 
 ```bash
 asterline --fake
@@ -274,6 +277,64 @@ survives a restart and `/resume`; `/new` starts an unnamed chat. You can also
 rename a chat from the Agents list with `Ctrl+R`, which can clear a name too.
 A named chat is listed under **Inactive** even before you send a message to it.
 
+### `/goal`
+
+```text
+/goal
+/goal <objective>
+/goal pause
+/goal resume
+/goal clear
+```
+
+Gives the main member a persistent goal for this chat and keeps it working
+until the goal is done. `/goal <objective>` sets the goal and immediately sends
+the main member a goal prompt (to the `main` member, else the first top-level
+member, the same target `/new <prompt>` uses). The chat shows your objective as
+an ordinary message. The objective is trimmed, must not be empty and may be at
+most 4000 characters. A goal runs in `normal` mode only; in `review`, `plan`,
+`brainstorm` and `team` mode the command is refused with a notice, and
+switching to one of those modes pauses a running goal.
+
+When the main member's turn ends (including a sub-agent's hand-back that belongs
+to it) and the goal is still active, Asterline sends it a continuation prompt as
+its next turn, over and over. The prompt is not shown as a message; the chat
+gets a dim marker row such as `↻ goal · turn 4` in the main agent's window and in
+All. A message you send while a goal is active is delivered normally; the loop
+carries on after that turn. The goal has **no turn, token or time cap**. It
+stops only when:
+
+- the main member ends a reply with the control line
+  `@@goal_complete {"summary":"one sentence"}` (the summary is optional). Only
+  the goal's member can complete its goal, and only while it is active. The
+  line is removed from the displayed text and Asterline posts
+  `Goal complete: <summary>`;
+- you run `/goal pause` (the turn in progress finishes first) or `/goal clear`;
+- you interrupt the main member with `Esc`, or its turn fails: the goal is
+  paused with the reason (`Paused by interrupt`, or the error text);
+- the no-progress guard trips: three continuation turns in a row that produced
+  no reply text and no tool calls pause the goal with
+  `Paused: 3 turns in a row made no progress`. Any turn that produces something
+  resets the count.
+
+`/goal` alone shows the objective, status, turns so far and age. `/goal resume`
+continues a paused goal at once (or after the current turn). `/goal <objective>`
+on a chat that already has a goal replaces its objective, keeps its turn count
+and age, and sends an "objective was edited" prompt; when the main member is
+busy that prompt becomes its next turn. A completed goal is replaced by a new
+one.
+
+While a goal is active or paused, one dim line sits just above the composer in
+the main member's window and in All (not in a sub-agent's window):
+`◎ Goal · <objective> · turn 4 · 12m`, or
+`◎ Goal paused · <reason> (/goal resume)`.
+
+The goal belongs to the chat: it is saved with it, is not carried into `/new`,
+and is deleted with the chat. A goal that was active when Asterline was closed
+(or when you left the chat) comes back **paused** after a restart or `/resume`
+(`Paused: restored — /goal resume to continue`); a goal never starts running
+by itself.
+
 ### `/retry`
 
 ```text
@@ -375,7 +436,7 @@ Focus the member's `model` field and press `t` to re-fetch it at any time; the
 result is shared by matching backend/workspace members.
 Missing CLIs remain visible for diagnosis but cannot be selected.
 
-The editor changes the roster, backend, role, model, effort, native session ID,
+The editor changes the roster, names, backend, model, effort, native session ID,
 and approval behavior. The model field shows what the member effectively runs:
 its pinned model and effort, else the ones the CLI's own configuration selects,
 else the catalog default. Changes stay in a draft until `s` applies and saves

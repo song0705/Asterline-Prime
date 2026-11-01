@@ -236,6 +236,7 @@ pub fn export_chat_items_to_root(
             | ChatItem::Route { .. }
             | ChatItem::Spawn { .. }
             | ChatItem::Notice { .. }
+            | ChatItem::GoalMarker { .. }
             | ChatItem::Error { .. }
             | ChatItem::Verdict { .. } => {}
         }

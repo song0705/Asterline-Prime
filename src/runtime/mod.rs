@@ -371,6 +371,7 @@ fn run_loop(
     let mut pending_events = VecDeque::new();
     let mut startup_events = vec![runtime.ready_event()];
     startup_events.extend(runtime.chat_name_event());
+    startup_events.extend(runtime.goal_event());
     if runtime.active_mode() != TerminalMode::Normal {
         startup_events.push(RuntimeEvent::ModeChanged {
             mode: runtime.active_mode(),
@@ -1118,6 +1119,101 @@ mod tests {
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
+    }
+
+    /// Run `/goal <objective>` against the fake teammate on the real runtime
+    /// thread and collect the events until `stop` accepts one (or time runs
+    /// out).
+    fn run_goal_with_fake(
+        objective: &str,
+        stop: impl Fn(&RuntimeEvent) -> bool,
+    ) -> Vec<RuntimeEvent> {
+        let mut runners: Runners = HashMap::new();
+        runners.insert(
+            MemberId::new("builder"),
+            Arc::new(FakeRunner::team(BackendKind::Codex)),
+        );
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let (handle, join) = spawn(
+            single_codex_team(),
+            SqliteStore::in_memory().unwrap(),
+            runners,
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        handle.send(UiCommand::Goal {
+            action: crate::domain::goal::GoalAction::Set(objective.to_string()),
+        });
+        let mut seen = Vec::new();
+        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(5)) {
+            let done = stop(&event);
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        // Let anything wrongly still coming (a fourth turn) show up.
+        while let Ok(event) = evt_rx.recv_timeout(Duration::from_millis(300)) {
+            seen.push(event);
+        }
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+        seen
+    }
+
+    #[test]
+    fn a_fake_goal_runs_exactly_three_turns_and_then_completes() {
+        let seen = run_goal_with_fake(
+            "fix things fake-goal-3",
+            |event| matches!(event, RuntimeEvent::Notice(text) if text.starts_with("Goal complete")),
+        );
+
+        let replies = seen
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::MessageCompleted { text, .. } if text.contains("working on the goal")))
+            .count();
+        assert_eq!(replies, 3, "{seen:#?}");
+        let markers: Vec<u32> = seen
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::GoalMarker { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, vec![2, 3]);
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(text) if text == "Goal complete: fake goal done"
+        )));
+        let finished = seen.iter().rev().find_map(|event| match event {
+            RuntimeEvent::GoalUpdated { goal: Some(goal) } => Some(goal),
+            _ => None,
+        });
+        assert_eq!(finished.map(|goal| goal.turns), Some(3));
+    }
+
+    #[test]
+    fn a_silent_fake_goal_pauses_after_three_silent_continuations() {
+        use crate::domain::goal::{GoalStatus, REASON_NO_PROGRESS};
+        let seen = run_goal_with_fake("do nothing fake-goal-silent", |event| {
+            matches!(
+                event,
+                RuntimeEvent::GoalUpdated { goal: Some(goal) } if goal.status == GoalStatus::Paused
+            )
+        });
+
+        let markers = seen
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::GoalMarker { .. }))
+            .count();
+        assert_eq!(markers, 3, "{seen:#?}");
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::GoalUpdated { goal: Some(goal) }
+                if goal.last_reason.as_deref() == Some(REASON_NO_PROGRESS)
+        )));
     }
 
     #[test]

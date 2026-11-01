@@ -1159,7 +1159,6 @@ pub(crate) fn model_picker_lines(
 pub(crate) enum Field {
     Name,
     Backend,
-    Role,
     Model,
     Sandbox,
     Permission,
@@ -1171,7 +1170,6 @@ impl Field {
     pub(crate) const ALL: &'static [Field] = &[
         Field::Name,
         Field::Backend,
-        Field::Role,
         Field::Model,
         Field::Sandbox,
         Field::Permission,
@@ -1182,7 +1180,6 @@ impl Field {
     const CODEX_FIELDS: &'static [Field] = &[
         Field::Name,
         Field::Backend,
-        Field::Role,
         Field::Model,
         Field::Permission,
         Field::Session,
@@ -1192,7 +1189,6 @@ impl Field {
     const CLAUDE_FIELDS: &'static [Field] = &[
         Field::Name,
         Field::Backend,
-        Field::Role,
         Field::Model,
         Field::Permission,
         Field::Session,
@@ -1214,7 +1210,6 @@ impl Field {
         match self {
             Self::Name => "name",
             Self::Backend => "backend",
-            Self::Role => "role",
             Self::Model => "model",
             Self::Sandbox => "sandbox",
             Self::Permission => "permission",
@@ -1243,10 +1238,7 @@ impl Field {
     }
 
     pub(crate) fn is_text(self) -> bool {
-        matches!(
-            self,
-            Self::Name | Self::Role | Self::Model | Self::SessionId
-        )
+        matches!(self, Self::Name | Self::Model | Self::SessionId)
     }
 }
 
@@ -1549,7 +1541,6 @@ pub(crate) fn field_value(member: &TeamMember, field: Field) -> String {
     match field {
         Field::Name => member.display_name.clone(),
         Field::Backend => member.backend.as_str().to_string(),
-        Field::Role => member.role.clone(),
         Field::Model => member
             .model
             .clone()
@@ -2478,7 +2469,7 @@ mod tests {
 
     #[test]
     fn edit_state_moves_and_edits_unicode_at_the_cursor() {
-        let mut edit = EditState::new(Field::Role, "你 model".to_string());
+        let mut edit = EditState::new(Field::Model, "你 model".to_string());
         edit.apply_key(KeyCode::Left, KeyModifiers::NONE);
         edit.apply_key(KeyCode::Left, KeyModifiers::NONE);
         edit.insert_text("好");
@@ -2503,7 +2494,7 @@ mod tests {
 
     #[test]
     fn edit_state_moves_and_deletes_complete_graphemes() {
-        let mut combining = EditState::new(Field::Role, "e\u{301}".to_string());
+        let mut combining = EditState::new(Field::Model, "e\u{301}".to_string());
         combining.apply_key(KeyCode::Left, KeyModifiers::NONE);
         assert_eq!(combining.cursor, 0);
         combining.apply_key(KeyCode::Right, KeyModifiers::NONE);
@@ -2511,7 +2502,7 @@ mod tests {
         combining.apply_key(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(combining.buffer.is_empty());
 
-        let mut family = EditState::new(Field::Role, "👨‍👩‍👧‍👦".to_string());
+        let mut family = EditState::new(Field::Model, "👨‍👩‍👧‍👦".to_string());
         family.apply_key(KeyCode::Home, KeyModifiers::NONE);
         family.apply_key(KeyCode::Delete, KeyModifiers::NONE);
         assert!(family.buffer.is_empty());

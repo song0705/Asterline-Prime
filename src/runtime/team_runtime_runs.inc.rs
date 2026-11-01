@@ -206,13 +206,13 @@ impl TeamRuntime {
         self.enqueue_prompt(&id, turn, prompt, step);
     }
 
-    /// Teammate list for coordinator prompts: `id (role)`, excluding the coordinator.
+    /// Teammate list for coordinator prompts: `id [role]` (role only when set), excluding the coordinator.
     fn team_teammate_list(&self, coordinator: &MemberId) -> String {
         self.config
             .members
             .iter()
             .filter(|m| &m.id != coordinator && m.parent.is_none())
-            .map(|m| format!("{} ({})", m.id, m.role))
+            .map(|m| m.listing_label())
             .collect::<Vec<_>>()
             .join(", ")
     }

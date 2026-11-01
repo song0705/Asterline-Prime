@@ -29,6 +29,11 @@ use crate::domain::event::{
     RunStepRequest, RunStepStatus, RunStepSummary, RunSummary, RuntimeEvent, SpawnRequest,
     TeamMessage, TurnId, UiCommand,
 };
+use crate::domain::goal::{
+    CONTINUATION_NO_PROGRESS_CAP, GoalAction, GoalState, GoalStatus, REASON_INTERRUPT,
+    REASON_NO_PROGRESS, REASON_RESTORED, REASON_USER_PAUSE, continuation_prompt, format_goal_age,
+    initial_prompt, normalize_objective, objective_edited_prompt, unix_now,
+};
 use crate::domain::mode::{
     AutoSeat, BrainstormCard, CollabMode, ModeStatusSummary, ModesConfig, ReviewVerdict,
     ReviewVerdictKind, TerminalMode, apply_mode_overrides, auto_seat_parent, clear_mode_overrides,
@@ -138,6 +143,8 @@ struct RunningState {
     messaged_origin: bool,
     /// The latest non-empty visible reply of this run.
     last_reply: String,
+    /// What went wrong, when the backend reported a failure.
+    error: Option<String>,
 }
 
 struct QueuedPrompt {
@@ -233,6 +240,10 @@ pub struct TeamRuntime {
     startup_notices: Vec<String>,
     startup_events: Vec<RuntimeEvent>,
     startup_reconciled: bool,
+    /// The persistent goal of this chat's main agent (`/goal`).
+    goal: Option<GoalState>,
+    /// Turns the goal's member took part in, for the continuation loop.
+    goal_turns: HashMap<TurnId, GoalTurn>,
 }
 
 impl TeamRuntime {
@@ -343,8 +354,15 @@ impl TeamRuntime {
             startup_notices,
             startup_events: Vec::new(),
             startup_reconciled,
+            goal: None,
+            goal_turns: HashMap::new(),
         };
         let mut runtime = runtime;
+        if let Err(err) = runtime.restore_goal() {
+            runtime
+                .startup_notices
+                .push(format!("could not restore the chat's goal: {err}"));
+        }
         if let Err(err) = runtime.persist_conversation_snapshot() {
             runtime
                 .startup_notices
@@ -537,6 +555,9 @@ impl TeamRuntime {
                 | UiCommand::ResolvePausedRoute { resume: true }
                 | UiCommand::ContinueRun { .. }
                 | UiCommand::RunMode { .. }
+                | UiCommand::Goal {
+                    action: GoalAction::Set(_) | GoalAction::Resume
+                }
         );
         if requires_reconciled_startup && !self.startup_reconciled {
             let reason = "cannot change chats or dispatch work because interrupted runs were not reconciled; restart after fixing SQLite persistence"
@@ -563,6 +584,7 @@ impl TeamRuntime {
                     )));
                     return step;
                 }
+                self.goal_pause_for_mode(mode, &mut step);
                 step.events.push(RuntimeEvent::ModeChanged { mode });
                 step.events
                     .push(RuntimeEvent::Notice(self.mode_switch_notice(mode)));
@@ -576,7 +598,12 @@ impl TeamRuntime {
             UiCommand::UserMessage { target, body } => {
                 self.handle_active_user_message(target, body, &mut step);
             }
-            UiCommand::Cancel { member } => self.handle_cancel(member, &mut step),
+            UiCommand::Cancel { member } => {
+                // Pause first so the cancelled turn does not continue the goal.
+                self.goal_pause_for_interrupt(member.as_ref(), &mut step);
+                self.handle_cancel(member, &mut step)
+            }
+            UiCommand::Goal { action } => self.handle_goal_command(action, &mut step),
             UiCommand::EditQueuedPrompt { member } => {
                 self.handle_edit_queued_prompt(member, &mut step);
             }
@@ -810,6 +837,18 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) -> Option<TurnId> {
         self.last_user = Some((target.clone(), body.clone()));
+        self.dispatch_user_turn(target, body.clone(), body, step)
+    }
+
+    /// Start a user turn: `body` is what the chat shows as the user's message
+    /// and `prompt` is what the members receive (they differ for a goal).
+    fn dispatch_user_turn(
+        &mut self,
+        target: MessageTarget,
+        body: String,
+        prompt: String,
+        step: &mut RuntimeStep,
+    ) -> Option<TurnId> {
         let (targets, unknown) = self.resolve_message_target(&target);
         for name in unknown {
             step.events
@@ -860,7 +899,7 @@ impl TeamRuntime {
             },
         );
         for member in targets {
-            self.enqueue_prompt(&member, turn, body.clone(), step);
+            self.enqueue_prompt(&member, turn, prompt.clone(), step);
         }
         Some(turn)
     }
@@ -1096,6 +1135,11 @@ impl TeamRuntime {
         self.paused_routes.clear();
         self.held_approvals.clear();
         self.last_user = None;
+        // The goal belongs to the chat being left; the fresh chat has none.
+        self.goal_turns.clear();
+        if self.goal.take().is_some() {
+            step.events.push(RuntimeEvent::GoalUpdated { goal: None });
+        }
         if previous_mode != TerminalMode::Normal {
             step.events.push(RuntimeEvent::ModeChanged {
                 mode: TerminalMode::Normal,
@@ -1289,6 +1333,10 @@ impl TeamRuntime {
         self.active_mode = mode;
         self.session_mode_overrides = mode_overrides;
         self.last_user = None;
+        if let Err(err) = self.restore_goal() {
+            self.goal = None;
+            self.report_store_error("restore the chat's goal", err, step);
+        }
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
                 member: Box::new(member),
@@ -1301,6 +1349,9 @@ impl TeamRuntime {
         step.events.extend(self.chat_name_event());
         step.events.push(self.ready_event());
         step.events.push(RuntimeEvent::ModeChanged { mode });
+        step.events.push(RuntimeEvent::GoalUpdated {
+            goal: self.goal.clone(),
+        });
         self.note_roster_write(step);
     }
 
@@ -2201,6 +2252,9 @@ impl TeamRuntime {
             }
             AgentEvent::MessageCompleted(text) => self.complete_message(member, text, &mut step),
             AgentEvent::ToolStarted { id, name, summary } => {
+                if let Some(turn) = self.running_turn(member) {
+                    self.goal_note_output(member, turn);
+                }
                 self.commit_open_thinking(member, &mut step);
                 self.commit_open_message_before_tools(member, &mut step);
                 if let Some(state) = self.members.get_mut(member) {
@@ -2280,6 +2334,9 @@ impl TeamRuntime {
                 });
             }
             AgentEvent::FileChange { files, ok } => {
+                if let Some(turn) = self.running_turn(member) {
+                    self.goal_note_output(member, turn);
+                }
                 if let Some(turn) = self.running_turn(member)
                     && let Err(err) = self.store.record_diff(turn, member, &files, ok)
                 {
@@ -2414,6 +2471,13 @@ impl TeamRuntime {
                 } else if permission_denied || already_denied {
                     self.record_permission_denial(member, &message, &mut step);
                 } else {
+                    if let Some(running) = self
+                        .members
+                        .get_mut(member)
+                        .and_then(|state| state.running.as_mut())
+                    {
+                        running.error.get_or_insert_with(|| message.clone());
+                    }
                     if let Some(turn) = turn
                         && let Err(err) =
                             self.store.record_error(Some(turn), Some(member), &message)
@@ -2567,7 +2631,8 @@ impl TeamRuntime {
             || !parsed.run_steps.is_empty()
             || !parsed.reviews.is_empty()
             || !parsed.brainstorm_votes.is_empty()
-            || !parsed.brainstorm_cards.is_empty();
+            || !parsed.brainstorm_cards.is_empty()
+            || !parsed.goal_completes.is_empty();
         if has_controls {
             let raw_persistence_failed = self
                 .members
@@ -2635,6 +2700,15 @@ impl TeamRuntime {
             }
         }
 
+        // Reply text or a team action counts as progress for the goal loop.
+        if !visible_text.trim().is_empty()
+            || !parsed.messages.is_empty()
+            || !parsed.members.is_empty()
+            || !parsed.spawns.is_empty()
+            || !parsed.run_steps.is_empty()
+        {
+            self.goal_note_output(member, turn);
+        }
         self.mode_record_message(member, turn, &visible_text, &parsed, step);
 
         for member_request in parsed.members {
@@ -2657,6 +2731,9 @@ impl TeamRuntime {
         }
         for tmsg in parsed.messages {
             self.route_team_message(member, turn, tmsg, step);
+        }
+        for done in parsed.goal_completes {
+            self.goal_complete_from_agent(member, done.summary, step);
         }
     }
 
@@ -2747,7 +2824,11 @@ impl TeamRuntime {
 
         let id = member.id.clone();
         let backend = member.backend;
-        let role = member.role.clone();
+        let detail = if member.role.trim().is_empty() {
+            backend.to_string()
+        } else {
+            format!("{backend}, {}", member.role.trim())
+        };
         let mut members = self.config.members.clone();
         members.push(member);
         let default_target = self.config.default_target.clone();
@@ -2756,7 +2837,7 @@ impl TeamRuntime {
         if self.config.member(&id).is_some() {
             step.events.push(RuntimeEvent::MemberNotice {
                 member: from.clone(),
-                text: format!("{from} added teammate {id} ({backend}, {role})"),
+                text: format!("{from} added teammate {id} ({detail})"),
             });
         }
     }
@@ -3015,21 +3096,43 @@ impl TeamRuntime {
         }
 
         let handback: SubAgentOutcome;
-        let (turn, cancelled, failed, permission_denied, denied_reason, permission_noticed) =
-            match self.members.get_mut(member).and_then(|s| s.running.take()) {
-                Some(running) => {
-                    handback = SubAgentOutcome::new(&running);
-                    (
-                        running.turn,
-                        running.cancel.load(Ordering::Relaxed),
-                        running.failed,
-                        running.permission_denied,
-                        running.denied_reason,
-                        running.permission_noticed,
-                    )
-                }
-                None => return,
-            };
+        let (
+            turn,
+            cancelled,
+            failed,
+            permission_denied,
+            denied_reason,
+            permission_noticed,
+            run_error,
+        ) = match self.members.get_mut(member).and_then(|s| s.running.take()) {
+            Some(running) => {
+                handback = SubAgentOutcome::new(&running);
+                (
+                    running.turn,
+                    running.cancel.load(Ordering::Relaxed),
+                    running.failed,
+                    running.permission_denied,
+                    running.denied_reason,
+                    running.permission_noticed,
+                    running.error,
+                )
+            }
+            None => return,
+        };
+
+        // A failed turn of the goal's member stops the goal loop; the check
+        // after it must not send a continuation.
+        if !cancelled && (failed || (!ok && !permission_denied)) {
+            let error = run_error.clone().unwrap_or_else(|| {
+                format!(
+                    "{} exited without success (code {})",
+                    self.member_backend(member),
+                    code.map(|c| c.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
+            });
+            self.goal_pause_for_failure(member, &error, step);
+        }
 
         let terminal_state_saved = if cancelled {
             // A user-requested cancel kills the process (no exit code); that is
@@ -3313,6 +3416,7 @@ impl TeamRuntime {
         // Both policies pin the first session id reported by the backend.
         // `fresh` only controls whether an older id is discarded when that
         // policy is selected; it must not create a new session every turn.
+        self.goal_note_participation(member, turn);
         let session = self.sessions.get(member);
         let cancel = Arc::new(AtomicBool::new(false));
         let effort = self.members.get(member).and_then(|s| s.effort);
@@ -3332,6 +3436,7 @@ impl TeamRuntime {
                 origin,
                 messaged_origin: false,
                 last_reply: String::new(),
+                error: None,
             });
             state.status = MemberStatus::Running;
             state.tools.clear();
@@ -3428,12 +3533,16 @@ impl TeamRuntime {
             .as_ref()
             .map(|parent| format!(" parent={parent}"))
             .unwrap_or_default();
+        let role = if member.role.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" role={:?}", member.role.trim())
+        };
         format!(
-            "id={} display_name={:?} backend={} role={:?} status={} model={} effort={} cwd={:?} sandbox={} permission_mode={} session_policy={} allowed_tools={}{parent}",
+            "id={} display_name={:?} backend={}{role} status={} model={} effort={} cwd={:?} sandbox={} permission_mode={} session_policy={} allowed_tools={}{parent}",
             member.id,
             member.display_name,
             member.backend.as_str(),
-            member.role,
             status.as_str(),
             model,
             effort,
@@ -3468,6 +3577,7 @@ impl TeamRuntime {
             let run_id = self.run_turns.get(&turn).copied();
             let completion_saved = match run_id {
                 Some(run_id) if self.mode_sessions.contains_key(&run_id) => {
+                    self.goal_turns.remove(&turn);
                     self.run_turns.remove(&turn);
                     step.events.push(RuntimeEvent::TurnFinished { turn });
                     self.mode_on_turn_complete(run_id, step);
@@ -3484,6 +3594,7 @@ impl TeamRuntime {
             }
             self.run_turns.remove(&turn);
             step.events.push(RuntimeEvent::TurnFinished { turn });
+            self.goal_on_turn_finished(turn, step);
         }
     }
 
@@ -3598,6 +3709,9 @@ include!("team_runtime_modes.inc.rs");
 
 // Sub-agents (`@@spawn`) and the automatic hand-back of their results.
 include!("team_runtime_sub_agents.inc.rs");
+
+// The persistent goal of the main agent (`/goal`) and its continuation loop.
+include!("team_runtime_goal.inc.rs");
 
 fn relay_prompt(from: &MemberId, from_display: &str, kind: Option<&str>, body: &str) -> String {
     let reply_instruction = if kind == Some("reply") {

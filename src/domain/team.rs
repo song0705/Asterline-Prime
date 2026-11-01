@@ -389,7 +389,8 @@ impl Effort {
     }
 }
 
-/// A single team member: a backend bound to a role and a stable id.
+/// A single team member: a backend bound to a display name and a stable id.
+/// `role` is an optional, legacy/internal job description; it is not user-facing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeamMember {
     pub id: MemberId,
@@ -419,6 +420,7 @@ impl Serialize for TeamMember {
     {
         let derived_id = derived_member_id(&self.display_name, self.backend.as_str());
         let include_id = self.id != derived_id;
+        let include_role = !self.role.trim().is_empty();
         let include_cwd = self.cwd.is_some();
         let include_model = self.model.is_some();
         let include_system_prompt = self.system_prompt.is_some();
@@ -431,8 +433,9 @@ impl Serialize for TeamMember {
         let include_effort = self.effort.is_some();
         let include_parent = self.parent.is_some();
 
-        let field_count = 3
+        let field_count = 2
             + usize::from(include_id)
+            + usize::from(include_role)
             + usize::from(include_cwd)
             + usize::from(include_model)
             + usize::from(include_system_prompt)
@@ -450,7 +453,9 @@ impl Serialize for TeamMember {
         }
         state.serialize_field("display_name", &self.display_name)?;
         state.serialize_field("backend", &self.backend)?;
-        state.serialize_field("role", &self.role)?;
+        if include_role {
+            state.serialize_field("role", &self.role)?;
+        }
         if include_cwd {
             state.serialize_field("cwd", &self.cwd)?;
         }
@@ -500,6 +505,8 @@ impl<'de> Deserialize<'de> for TeamMember {
             #[serde(default)]
             display_name: Option<String>,
             backend: BackendKind,
+            /// Legacy field: old rosters carry it, new ones omit it.
+            #[serde(default)]
             role: String,
             #[serde(default)]
             cwd: Option<PathBuf>,
@@ -539,7 +546,7 @@ impl<'de> Deserialize<'de> for TeamMember {
             id,
             display_name,
             backend: input.backend,
-            role: input.role,
+            role: input.role.trim().to_string(),
             cwd: input.cwd,
             model: input.model,
             system_prompt: input.system_prompt,
@@ -582,6 +589,17 @@ impl TeamMember {
             session_id: None,
             effort: None,
             parent: None,
+        }
+    }
+
+    /// How protocol text names this member to others: the id, followed by the
+    /// optional job description in brackets when one was given.
+    pub fn listing_label(&self) -> String {
+        let role = self.role.trim();
+        if role.is_empty() {
+            self.id.to_string()
+        } else {
+            format!("{} [{}]", self.id, role)
         }
     }
 
@@ -1415,6 +1433,29 @@ mod tests {
         assert_eq!(member.permission_native_label(), "Approve for me");
         member.cycle_codex_permissions();
         assert_eq!(member.permission_native_label(), "Full Access");
+    }
+
+    #[test]
+    fn role_is_serialized_only_when_set_and_old_files_still_load() {
+        let plain = TeamMember::new("main", "Main", BackendKind::Codex, "");
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("role"), "{json}");
+        let back: TeamMember = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plain);
+
+        let legacy: TeamMember =
+            serde_json::from_str(r#"{"display_name":"Old","backend":"codex","role":"impl"}"#)
+                .unwrap();
+        assert_eq!(legacy.role, "impl");
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(json.contains(r#""role":"impl""#), "{json}");
+        assert_eq!(serde_json::from_str::<TeamMember>(&json).unwrap(), legacy);
+
+        let none: TeamMember =
+            serde_json::from_str(r#"{"display_name":"New","backend":"claude"}"#).unwrap();
+        assert_eq!(none.role, "");
+        assert_eq!(none.listing_label(), "new");
+        assert_eq!(legacy.listing_label(), "old [impl]");
     }
 
     #[test]

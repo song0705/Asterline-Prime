@@ -14,6 +14,7 @@
 //! @@run_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
 //! @@run_step {"action":"assign","step":2,"owner":"reviewer"}
 //! @@review {"verdict":"approve","summary":"Looks good"}
+//! @@goal_complete {"summary":"All tests pass and the bug is fixed"}
 //! @@brainstorm_card {"title":"Fast probe","proposal":"Test a narrow path","mechanism":"Run a small experiment","operation":"SEED","sources":[]}
 //! ```
 
@@ -37,6 +38,7 @@ const RUN_STEP_PREFIX: &str = "@@run_step";
 const REVIEW_PREFIX: &str = "@@review";
 const BRAINSTORM_CARD_PREFIX: &str = "@@brainstorm_card";
 const BRAINSTORM_VOTE_PREFIX: &str = "@@brainstorm_vote";
+const GOAL_COMPLETE_PREFIX: &str = "@@goal_complete";
 /// A single model response must not expand into an unbounded number of
 /// persistent routes, approvals, or run mutations.
 pub const MAX_CONTROL_ENVELOPES: usize = 64;
@@ -63,8 +65,22 @@ pub struct ParsedAgentOutput {
     pub brainstorm_votes: Vec<BrainstormVote>,
     /// Structured cards emitted during brainstorm generation waves.
     pub brainstorm_cards: Vec<BrainstormCard>,
+    /// `@@goal_complete` lines: the agent says the persistent goal is done.
+    pub goal_completes: Vec<GoalComplete>,
     /// Human-readable warnings for malformed envelopes (kept in the logs drawer).
     pub warnings: Vec<String>,
+}
+
+/// An agent's claim that the persistent goal (`/goal`) is achieved.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GoalComplete {
+    pub summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoalCompleteRaw {
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +100,8 @@ struct TeamMemberRaw {
     #[serde(default)]
     display_name: Option<String>,
     backend: BackendKind,
+    /// Accepted for compatibility; optional job description, never required.
+    #[serde(default)]
     role: String,
     #[serde(default)]
     cwd: Option<PathBuf>,
@@ -191,6 +209,7 @@ enum EnvelopeValue {
     Review(ReviewVerdict),
     BrainstormCard(BrainstormCard),
     BrainstormVote(BrainstormVote),
+    GoalComplete(GoalComplete),
 }
 
 type EnvelopeParser = fn(&str) -> Result<EnvelopeValue, String>;
@@ -223,6 +242,10 @@ fn parse_brainstorm_card_envelope(payload: &str) -> Result<EnvelopeValue, String
     parse_brainstorm_card(payload).map(EnvelopeValue::BrainstormCard)
 }
 
+fn parse_goal_complete_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_goal_complete(payload).map(EnvelopeValue::GoalComplete)
+}
+
 /// Flat prefix table: first matching prefix wins. Keeps behavior identical to the
 /// previous nested-match chain while remaining easy to extend.
 const ENVELOPE_PARSERS: &[(&str, EnvelopeParser)] = &[
@@ -233,6 +256,7 @@ const ENVELOPE_PARSERS: &[(&str, EnvelopeParser)] = &[
     (REVIEW_PREFIX, parse_review_envelope),
     (BRAINSTORM_CARD_PREFIX, parse_brainstorm_card_envelope),
     (BRAINSTORM_VOTE_PREFIX, parse_brainstorm_vote_envelope),
+    (GOAL_COMPLETE_PREFIX, parse_goal_complete_envelope),
 ];
 
 /// Scan one agent message for control envelopes (`@@team_message`, …).
@@ -245,6 +269,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut reviews = Vec::new();
     let mut brainstorm_cards = Vec::new();
     let mut brainstorm_votes = Vec::new();
+    let mut goal_completes = Vec::new();
     let mut warnings = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     let mut envelope_lines = 0usize;
@@ -294,6 +319,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
                     Ok(EnvelopeValue::Review(review)) => reviews.push(review),
                     Ok(EnvelopeValue::BrainstormCard(card)) => brainstorm_cards.push(card),
                     Ok(EnvelopeValue::BrainstormVote(vote)) => brainstorm_votes.push(vote),
+                    Ok(EnvelopeValue::GoalComplete(done)) => goal_completes.push(done),
                     Err(warning) => {
                         warnings.push(warning);
                         kept_lines.push(line);
@@ -316,6 +342,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         reviews,
         brainstorm_cards,
         brainstorm_votes,
+        goal_completes,
         warnings,
     }
 }
@@ -380,9 +407,6 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
     }
 
     let role = raw.role.trim();
-    if role.is_empty() {
-        return Err("@@team_member role must be non-empty".to_string());
-    }
     let display_name = raw
         .display_name
         .map(|name| name.trim().to_string())
@@ -452,6 +476,22 @@ fn parse_spawn(payload: &str) -> Result<SpawnRequest, String> {
         model: optional(raw.model),
         effort: optional(raw.effort),
         role: optional(raw.role),
+    })
+}
+
+/// `@@goal_complete` takes an optional JSON object; a bare line completes the
+/// goal with no summary.
+fn parse_goal_complete(payload: &str) -> Result<GoalComplete, String> {
+    if payload.is_empty() {
+        return Ok(GoalComplete::default());
+    }
+    let raw: GoalCompleteRaw = serde_json::from_str(payload)
+        .map_err(|err| format!("invalid @@goal_complete envelope: {err}"))?;
+    Ok(GoalComplete {
+        summary: raw
+            .summary
+            .map(|summary| summary.trim().to_string())
+            .filter(|summary| !summary.is_empty()),
     })
 }
 
@@ -971,6 +1011,22 @@ mod tests {
     }
 
     #[test]
+    fn team_member_without_a_role_is_accepted() {
+        let parsed = parse_agent_output(r#"@@team_member {"display_name":"QA","backend":"codex"}"#);
+
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.members.len(), 1);
+        assert_eq!(parsed.members[0].display_name, "QA");
+        assert_eq!(parsed.members[0].role, "");
+
+        let blank = parse_agent_output(
+            r#"@@team_member {"display_name":"QA","backend":"codex","role":"  "}"#,
+        );
+        assert!(blank.warnings.is_empty());
+        assert_eq!(blank.members[0].role, "");
+    }
+
+    #[test]
     fn malformed_team_member_warns_and_keeps_line() {
         let parsed =
             parse_agent_output(r#"@@team_member {"id":"qa","backend":"bogus","role":"x"}"#);
@@ -1215,5 +1271,49 @@ mod tests {
 
         assert!(parsed.spawns.is_empty());
         assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_goal_complete_with_and_without_a_summary() {
+        let parsed =
+            parse_agent_output("All done.\n@@goal_complete {\"summary\":\" tests pass \"}\nbye");
+        assert_eq!(
+            parsed.goal_completes,
+            vec![GoalComplete {
+                summary: Some("tests pass".to_string())
+            }]
+        );
+        assert_eq!(parsed.visible_text, "All done.\nbye");
+        assert!(parsed.warnings.is_empty());
+
+        for line in [
+            "@@goal_complete",
+            "@@goal_complete {}",
+            r#"@@goal_complete {"summary":"  "}"#,
+        ] {
+            let parsed = parse_agent_output(line);
+            assert_eq!(
+                parsed.goal_completes,
+                vec![GoalComplete::default()],
+                "{line}"
+            );
+            assert_eq!(parsed.visible_text, "", "{line}");
+        }
+    }
+
+    #[test]
+    fn malformed_goal_complete_warns_and_keeps_line() {
+        let parsed = parse_agent_output("@@goal_complete not-json");
+        assert!(parsed.goal_completes.is_empty());
+        assert_eq!(parsed.visible_text, "@@goal_complete not-json");
+        assert!(parsed.warnings[0].contains("@@goal_complete"));
+    }
+
+    #[test]
+    fn goal_complete_examples_in_code_or_mid_sentence_are_ignored() {
+        let parsed = parse_agent_output(
+            "```\n@@goal_complete {}\n```\n    @@goal_complete {}\nsay @@goal_complete {} when done",
+        );
+        assert!(parsed.goal_completes.is_empty());
     }
 }

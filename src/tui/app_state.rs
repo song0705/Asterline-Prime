@@ -21,6 +21,7 @@ use crate::domain::event::{
     AgentSessionId, ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId,
     MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
 };
+use crate::domain::goal::GoalState;
 use crate::domain::mode::{ModesConfig, TerminalMode};
 use crate::domain::team::{
     BackendKind, CodexApprovalsReviewer, DefaultTarget, Effort, MemberId, PermissionMode,
@@ -235,6 +236,8 @@ pub(crate) fn focus_row(state: &AppState, item: &ChatItem) -> FocusRow {
         // The parent sees that it opened a sub-agent; the sub-agent's own
         // window starts at the task it received.
         ChatItem::Spawn { parent, .. } => own(parent),
+        // The goal loop's turn marker belongs to the goal's member.
+        ChatItem::GoalMarker { member, .. } => own(member),
     }
 }
 
@@ -366,6 +369,8 @@ pub struct AppState {
     agents_rename: Option<AgentsRename>,
     /// The name of the chat being viewed, if it has one.
     chat_name: Option<String>,
+    /// The chat's goal (`/goal`), as the runtime last reported it.
+    goal: Option<GoalState>,
     /// Screen rows of the Agents list's selectable entries, noted by the last
     /// paint so a mouse click can find its row.
     agents_click_rows: RefCell<Vec<(u16, AgentChoice)>>,
@@ -510,6 +515,7 @@ impl AppState {
             agents_delete_armed: None,
             agents_rename: None,
             chat_name: None,
+            goal: None,
             agents_click_rows: RefCell::new(Vec::new()),
             last_reply_at: HashMap::new(),
             header_selected: None,
@@ -1107,6 +1113,7 @@ impl AppState {
                 // the previous conversation and remain reachable via /resume.
                 self.active_mode = TerminalMode::Normal;
                 self.mode_editor = None;
+                self.goal = None;
                 self.saved_chats.clear();
                 self.chat_name = None;
                 self.agents_delete_armed = None;
@@ -1142,6 +1149,12 @@ impl AppState {
                     member.session_policy = SessionPolicy::Fresh;
                     member.status = MemberStatus::Idle;
                 }
+            }
+            RuntimeEvent::GoalUpdated { goal } => {
+                self.goal = goal;
+            }
+            RuntimeEvent::GoalMarker { member, turn } => {
+                self.push(ChatItem::GoalMarker { member, turn });
             }
             RuntimeEvent::ConversationRenamed { name } => {
                 self.chat_name = name.filter(|name| !name.trim().is_empty());
@@ -2901,7 +2914,7 @@ impl AppState {
             return String::new();
         };
         let mut model = backend.as_str().to_string();
-        if let Some(summary) = self.model_catalog.effective_summary(
+        if let Some(summary) = self.display_model_catalog().effective_summary(
             backend,
             chat.main_model.as_deref(),
             chat.main_effort,
@@ -3009,6 +3022,25 @@ impl AppState {
 
     pub fn agents_query(&self) -> &str {
         &self.agents_query
+    }
+
+    /// The chat's goal, whatever its status.
+    pub fn goal(&self) -> Option<&GoalState> {
+        self.goal.as_ref()
+    }
+
+    /// The goal to show above the composer: one that is active or paused, in
+    /// the view of the member working on it and in the All view (a sub-agent's
+    /// window does not show the main agent's goal).
+    pub fn visible_goal(&self) -> Option<&GoalState> {
+        let goal = self.goal.as_ref()?;
+        if goal.status == crate::domain::goal::GoalStatus::Complete {
+            return None;
+        }
+        match self.focus() {
+            Some(focus) if focus != &goal.member => None,
+            _ => Some(goal),
+        }
     }
 
     /// The name of the chat being viewed, if it has one.
@@ -3740,6 +3772,15 @@ impl AppState {
         self.team_editor = Some(editor);
     }
 
+    /// The catalog model labels read. While `/team` is open the editor holds
+    /// the catalog (it was moved in), so labels resolve through it instead of
+    /// falling back to the bare backend name.
+    fn display_model_catalog(&self) -> &ModelCatalog {
+        self.team_editor
+            .as_ref()
+            .map_or(&self.model_catalog, TeamEditor::model_catalog)
+    }
+
     fn stash_team_editor_catalog(&mut self) {
         if let Some(editor) = self.team_editor.take() {
             self.model_catalog = editor.into_model_catalog();
@@ -3768,7 +3809,7 @@ impl AppState {
     /// pinned values, else the CLI's configured ones, else the catalog default.
     /// `None` until a model catalog says (the caller falls back to the backend).
     pub fn member_model_summary(&self, member: &MemberView) -> Option<String> {
-        self.model_catalog.effective_summary(
+        self.display_model_catalog().effective_summary(
             member.backend,
             member.model.as_deref(),
             member.effort,
@@ -3776,16 +3817,11 @@ impl AppState {
         )
     }
 
-    /// The model line of the welcome page: the viewed agent (else the first)
-    /// as `<Display name> · <effort>`. Until a catalog names the model it is
-    /// the backend, with the effort when one is known.
-    pub fn welcome_model_summary(&self) -> Option<String> {
-        let member = self
-            .focus
-            .as_ref()
-            .and_then(|focus| self.members.iter().find(|member| member.id == *focus))
-            .or_else(|| self.members.first())?;
-        let effective = self.model_catalog.effective_model(
+    /// `<Display name> · <effort>` for what `member` effectively runs, as shown
+    /// on the header chip and the welcome page. Until a catalog names the model
+    /// it is the backend name; the effort part appears only when one is known.
+    pub fn member_model_label(&self, member: &MemberView) -> String {
+        let effective = self.display_model_catalog().effective_model(
             member.backend,
             member.model.as_deref(),
             member.effort,
@@ -3795,10 +3831,30 @@ impl AppState {
             .name
             .or(effective.id)
             .unwrap_or_else(|| member.backend.as_str().to_string());
-        Some(match effective.effort {
+        match effective.effort {
             Some(effort) => format!("{name} · {}", effort.as_str()),
             None => name,
-        })
+        }
+    }
+
+    /// `member_model_label` for the member with this id, `None` when no such
+    /// member is on the team any more.
+    pub fn member_model_label_by_id(&self, id: &MemberId) -> Option<String> {
+        self.members
+            .iter()
+            .find(|member| &member.id == id)
+            .map(|member| self.member_model_label(member))
+    }
+
+    /// The model line of the welcome page: the viewed agent (else the first)
+    /// as `<Display name> · <effort>` (see `member_model_label`).
+    pub fn welcome_model_summary(&self) -> Option<String> {
+        let member = self
+            .focus
+            .as_ref()
+            .and_then(|focus| self.members.iter().find(|member| member.id == *focus))
+            .or_else(|| self.members.first())?;
+        Some(self.member_model_label(member))
     }
 
     /// Test hook: pretend `backend` is installed and its models are known.
@@ -4585,6 +4641,7 @@ fn chat_item_search_text(item: &ChatItem) -> String {
         ChatItem::Notice { text, .. } => text.clone(),
         ChatItem::Error { message, .. } => message.clone(),
         ChatItem::Verdict { summary, .. } => summary.clone(),
+        ChatItem::GoalMarker { turn, .. } => format!("goal turn {turn}"),
     }
 }
 
@@ -4611,6 +4668,7 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
         ChatItem::Notice { text, .. } => text.lines().count().max(1),
         ChatItem::Error { message, .. } => message.lines().count().max(1),
         ChatItem::Verdict { summary, .. } => 1 + summary.lines().count(),
+        ChatItem::GoalMarker { .. } => 1,
     }
 }
 
@@ -4758,6 +4816,7 @@ fn bound_chat_item(item: ChatItem) -> ChatItem {
                 summary,
             })
         }
+        marker @ ChatItem::GoalMarker { .. } => Some(marker),
     };
     let bounded = bounded.unwrap_or_else(chat_truncation_notice);
     debug_assert!(chat_item_bytes(&bounded) <= MAX_CHAT_ITEM_BYTES);
@@ -4816,6 +4875,7 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
         ChatItem::Verdict {
             member, summary, ..
         } => member.as_str().len() + summary.len(),
+        ChatItem::GoalMarker { member, .. } => member.as_str().len() + 4,
     }
 }
 

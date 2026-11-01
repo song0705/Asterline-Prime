@@ -55,6 +55,7 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ),
     ("resume", "pick a saved chat in the agents list", true),
     ("name", "name the current chat", true),
+    ("goal", "work toward a goal until it is done", true),
     ("team", "edit roster · sessions · approvals", false),
     ("mode", "open mode panel or switch dispatch mode", true),
     ("find", "search the transcript", true),
@@ -88,8 +89,8 @@ pub(crate) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Common",
         &[
-            "model", "new", "resume", "name", "team", "mode", "find", "diff", "retry", "help",
-            "exit",
+            "model", "new", "resume", "name", "goal", "team", "mode", "find", "diff", "retry",
+            "help", "exit",
         ],
     ),
     (
@@ -115,7 +116,7 @@ const MODES: &[(&str, &str)] = &[
 ];
 
 /// Commands that run as typed even though they accept an optional argument.
-const OPTIONAL_ARGUMENT_COMMANDS: &[&str] = &["model", "logs", "new", "resume"];
+const OPTIONAL_ARGUMENT_COMMANDS: &[&str] = &["model", "logs", "new", "resume", "goal"];
 
 /// Whether `token` is a whole slash command that needs nothing more before
 /// Enter submits it: a known command with no (or only an optional) argument.
@@ -388,10 +389,20 @@ mod tests {
         assert!(!c.items.iter().any(|i| i.insert == "/abort"));
     }
 
-    const EXPECTED_ORDER: [&str; 22] = [
-        "model", "new", "resume", "name", "team", "mode", "find", "diff", "retry", "help", "exit",
-        "approve", "reject", "attach", "import", "export", "logs", "runs", "continue", "step",
-        "note", "block",
+    #[test]
+    fn goal_is_listed_after_name_and_runs_without_an_argument() {
+        let c = compute("/go", &[]).expect("completion");
+        assert!(c.items.iter().any(|i| i.insert == "/goal "));
+        assert!(command_is_complete("/goal"));
+        let common = COMMAND_GROUPS[0].1;
+        let name = common.iter().position(|c| *c == "name").unwrap();
+        assert_eq!(common[name + 1], "goal");
+    }
+
+    const EXPECTED_ORDER: [&str; 23] = [
+        "model", "new", "resume", "name", "goal", "team", "mode", "find", "diff", "retry", "help",
+        "exit", "approve", "reject", "attach", "import", "export", "logs", "runs", "continue",
+        "step", "note", "block",
     ];
 
     #[test]

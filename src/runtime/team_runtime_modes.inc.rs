@@ -253,7 +253,7 @@ impl TeamRuntime {
             .members
             .iter()
             .filter(|m| m.parent.is_none())
-            .map(|m| (m.id.to_string(), m.role.clone()))
+            .map(|m| (m.id.to_string(), m.listing_label()))
             .collect()
     }
 

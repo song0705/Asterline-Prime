@@ -59,6 +59,7 @@ fn is_separator_text(text: &str) -> bool {
 mod agents;
 mod chrome;
 mod focus;
+mod goal;
 mod grouping;
 mod render;
 mod tools;

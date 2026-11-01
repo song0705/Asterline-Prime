@@ -19,6 +19,7 @@ use crate::tui::completion::Completion;
 use crate::tui::drawer_view::{inline_height, is_inline, render_drawer, render_inline_drawer};
 use crate::tui::drawers::Drawer;
 use crate::tui::file_diff;
+use crate::tui::goal_surface;
 use crate::tui::header::{render_footer, render_header};
 use crate::tui::markdown;
 use crate::tui::model_picker;
@@ -186,6 +187,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     let completion_height = completion.as_ref().map_or(0, completion_popup_height);
     let queued_preview = queued_input_preview_lines(state, frame.area().width as usize);
     let queued_height = queued_preview.len() as u16;
+    // The goal's status line sits just below the chat, above anything that
+    // belongs to the composer.
+    let goal_height = goal_surface::height(state);
     let approval_height = approval_card_height(state, frame.area().width);
     let picker = state.model_picker_view();
     // Leave the chat a few rows even on a short terminal.
@@ -199,10 +203,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     // its content, at most about half the chat area.
     let inline_drawer = state.drawer().filter(is_inline);
     let inline_drawer_height = inline_drawer.as_ref().map_or(0, |drawer| {
-        let chat_rows = frame
-            .area()
-            .height
-            .saturating_sub(1 + queued_height + approval_height + composer_height + bottom_height);
+        let chat_rows = frame.area().height.saturating_sub(
+            1 + goal_height + queued_height + approval_height + composer_height + bottom_height,
+        );
         inline_height(
             state,
             drawer,
@@ -224,6 +227,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(goal_height),
             Constraint::Length(queued_height),
             Constraint::Length(approval_height),
             Constraint::Length(above_composer_height),
@@ -234,21 +238,22 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
 
     render_header(frame, chunks[0], state);
     let mut layout = render_chat(frame, chunks[1], state);
-    frame.render_widget(Paragraph::new(queued_preview), chunks[2]);
-    render_approval_card(frame, chunks[3], state);
-    render_composer(frame, chunks[5], state);
+    goal_surface::render(frame, chunks[2], state);
+    frame.render_widget(Paragraph::new(queued_preview), chunks[3]);
+    render_approval_card(frame, chunks[4], state);
+    render_composer(frame, chunks[6], state);
     // The panel area minus its leading blank row.
     let panel = Rect::new(
-        chunks[4].x,
-        chunks[4].y + PANEL_GAP.min(chunks[4].height),
-        chunks[4].width,
-        chunks[4].height.saturating_sub(PANEL_GAP),
+        chunks[5].x,
+        chunks[5].y + PANEL_GAP.min(chunks[5].height),
+        chunks[5].width,
+        chunks[5].height.saturating_sub(PANEL_GAP),
     );
     if let Some(view) = &picker {
         // After the composer so the search box owns the cursor.
         model_picker::render_picker(frame, panel, view);
     }
-    let composer_inner = composer_text_area(chunks[5]);
+    let composer_inner = composer_text_area(chunks[6]);
     layout.composer_area = Some(composer_inner);
     layout.composer_wrap = (composer_inner.width as usize).saturating_sub(2);
     layout.composer_text_origin = 0;
@@ -256,7 +261,7 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         render_popup(frame, panel, &completion, state.popup_selected());
         layout.completion_area = Some(panel);
     }
-    render_footer(frame, chunks[6], state);
+    render_footer(frame, chunks[7], state);
 
     if let Some(drawer) = state.drawer() {
         if is_inline(&drawer) {
@@ -418,6 +423,9 @@ struct PaintKey {
     find_current: Option<usize>,
     /// The welcome page's model line, which fills in when a catalog lands.
     welcome_model: Option<String>,
+    /// Every member's model label (speaker labels, spawn rows), which change
+    /// on a `/model` switch or once a catalog names the model.
+    member_labels: Vec<String>,
 }
 
 #[derive(Default)]
@@ -484,6 +492,11 @@ fn paint_key(state: &AppState, width: usize) -> PaintKey {
             .is_empty()
             .then(|| state.welcome_model_summary())
             .flatten(),
+        member_labels: state
+            .members()
+            .iter()
+            .map(|member| state.member_model_label(member))
+            .collect(),
     }
 }
 
@@ -738,6 +751,7 @@ fn item_rev(item: &ChatItem) -> u64 {
         ),
         ChatItem::Error { message, .. } => (8, message.len(), message.as_bytes()),
         ChatItem::Verdict { summary, .. } => (9, summary.len(), summary.as_bytes()),
+        ChatItem::GoalMarker { turn, .. } => (11u64, *turn as usize, &[][..]),
     };
     tag.wrapping_shl(56) ^ (len as u64).wrapping_shl(32) ^ fnv1a64_bytes(bytes)
 }
@@ -1018,6 +1032,9 @@ fn user_breaks_member_region(item: &ChatItem, member: &MemberId) -> bool {
             // split their later output into the other member's region.
             !interrupted.iter().any(|busy| busy == member)
         }
+        // The goal loop starts a turn for its member without a user message;
+        // the marker row opens a new region just like a prompt would.
+        ChatItem::GoalMarker { member: marked, .. } => marked == member,
         _ => false,
     }
 }
@@ -1266,6 +1283,7 @@ fn render_live_member_activity(
     if show_placeholder_header {
         out.extend(agent_header_line(
             state,
+            &member.id,
             &member.display_name,
             member.backend,
             state.member_color(&member.id),
@@ -1410,6 +1428,7 @@ fn render_work_run(
             let (display_name, backend) = state.member_meta(member);
             out.extend(agent_header_line(
                 state,
+                member,
                 &display_name,
                 backend,
                 state.member_color(member),
@@ -1580,6 +1599,7 @@ fn render_tool_group(
         let (display_name, backend) = state.member_meta(member);
         out.extend(agent_header_line(
             state,
+            member,
             &display_name,
             backend,
             state.member_color(member),
@@ -1840,7 +1860,12 @@ fn render_agent_message_row(
                     spans.push(agent_name_span(state, child));
                 }
             }
-            (summary.clone(), None)
+            // The live model label wins over the summary stored at spawn time,
+            // which names the raw model id; a removed child keeps the summary.
+            let label = state
+                .member_model_label_by_id(child)
+                .unwrap_or_else(|| summary.clone());
+            (label, None)
         }
         _ => return,
     };
@@ -2020,7 +2045,7 @@ fn item_member(item: &ChatItem) -> Option<&MemberId> {
         ChatItem::Spawn { parent, .. } => Some(parent),
         ChatItem::Error { member, .. } => member.as_ref(),
         ChatItem::Verdict { member, .. } => Some(member),
-        ChatItem::User { .. } | ChatItem::Notice { .. } => None,
+        ChatItem::User { .. } | ChatItem::Notice { .. } | ChatItem::GoalMarker { .. } => None,
     }
 }
 
@@ -2115,11 +2140,14 @@ fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
     lines
 }
 
-/// The speaker label of an agent block: a dim `Main · codex` line, only in
-/// the All view where several agents interleave. One agent's window has no
-/// label at all; the whole window is that agent.
+/// The speaker label of an agent block: a dim `Main · GPT-6.1-Sol · high`
+/// line (the member's model label, as on the header chip), only in the All
+/// view where several agents interleave. A member that no longer exists
+/// (replayed history of a removed sub-agent) falls back to its backend name.
+/// One agent's window has no label at all; the whole window is that agent.
 fn agent_header_line(
     state: &AppState,
+    member: &MemberId,
     display_name: &str,
     backend: crate::domain::team::BackendKind,
     color: Color,
@@ -2132,7 +2160,12 @@ fn agent_header_line(
                 Style::default().fg(color).add_modifier(Modifier::DIM),
             ),
             Span::styled(
-                format!(" · {}", backend.as_str()),
+                format!(
+                    " · {}",
+                    state
+                        .member_model_label_by_id(member)
+                        .unwrap_or_else(|| backend.as_str().to_string())
+                ),
                 theme::muted().add_modifier(Modifier::DIM),
             ),
         ])
@@ -2286,6 +2319,7 @@ fn render_item_wide(
         let (display_name, backend) = state.member_meta(member);
         out.extend(agent_header_line(
             state,
+            member,
             &display_name,
             backend,
             state.member_color(member),
@@ -2308,6 +2342,7 @@ fn render_item_wide(
             if show_sender_header {
                 out.extend(agent_header_line(
                     state,
+                    member,
                     display_name,
                     *backend,
                     state.member_color(member),
@@ -2378,6 +2413,13 @@ fn render_item_wide(
                     theme::notice(),
                 )));
             }
+        }
+        ChatItem::GoalMarker { turn, .. } => {
+            // The goal loop's own prompt is not a user message: one dim row.
+            out.push(Line::from(Span::styled(
+                format!("  {}", goal_surface::marker_text(*turn)),
+                theme::dim(),
+            )));
         }
         ChatItem::Error { member, message } => {
             if let Some(member) = member {

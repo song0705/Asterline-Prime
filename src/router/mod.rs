@@ -4,7 +4,7 @@
 pub mod envelope;
 pub mod relay;
 
-pub use envelope::{ParsedAgentOutput, parse_agent_output};
+pub use envelope::{GoalComplete, ParsedAgentOutput, parse_agent_output};
 pub use relay::{RelayDecision, RelayGuard};
 
 use crate::domain::event::RouteTo;

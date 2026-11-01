@@ -60,8 +60,11 @@ impl FakeRunner {
                 "fake-{}-session",
                 backend.as_str()
             )));
-            let text = team_response(backend, &req.prompt);
             let mut events = vec![session];
+            // Goal prompts: `fake-goal-silent` replies with nothing at all.
+            let Some(text) = team_response_opt(backend, &req.prompt) else {
+                return events;
+            };
             // Only a plain echoed message plays the tool script, never a mode
             // prompt that happens to mention tools.
             if text.starts_with(&format!("[{backend} fake] ")) && asks_for_tools(&req.prompt) {
@@ -120,6 +123,55 @@ fn tool_script() -> Vec<AgentEvent> {
         });
     }
     events
+}
+
+/// An objective containing `fake-goal-<N>` makes the fake finish the goal on
+/// its N-th goal turn; `fake-goal-silent` makes every goal turn reply with
+/// nothing, to exercise the no-progress guard. Other goal objectives never
+/// finish by themselves.
+const FAKE_GOAL_TRIGGER: &str = "fake-goal-";
+
+/// The reply to a goal prompt (initial, continuation or edited objective):
+/// `Some(None)` when the fake should stay silent, `None` when `prompt` is no
+/// goal prompt.
+fn goal_response(backend: BackendKind, prompt: &str) -> Option<Option<String>> {
+    let objective = prompt
+        .split_once("<objective>\n")
+        .and_then(|(_, rest)| rest.split_once("\n</objective>"))
+        .map(|(objective, _)| objective)?;
+    let turn: u32 = prompt
+        .split_once("- turn: ")
+        .map(|(_, rest)| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(1);
+    let trigger = objective
+        .split_once(FAKE_GOAL_TRIGGER)
+        .map(|(_, rest)| {
+            rest.split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or("")
+        })
+        .unwrap_or("");
+    if trigger == "silent" {
+        return Some(None);
+    }
+    let mut text = format!("[{backend} fake goal] working on the goal, turn {turn}");
+    if trigger.parse::<u32>().is_ok_and(|done_at| turn >= done_at) {
+        text.push_str("\n@@goal_complete {\"summary\":\"fake goal done\"}");
+    }
+    Some(Some(text))
+}
+
+/// `team_response`, except a goal prompt may get no reply at all.
+fn team_response_opt(backend: BackendKind, prompt: &str) -> Option<String> {
+    match goal_response(backend, prompt) {
+        Some(reply) => reply,
+        None => Some(team_response(backend, prompt)),
+    }
 }
 
 fn team_response(backend: BackendKind, prompt: &str) -> String {
@@ -484,5 +536,50 @@ mod tests {
         let events = run(&FakeRunner::team(BackendKind::Grok), "hello");
         let text = completed_text(&events);
         assert_eq!(text, "[grok fake] hello");
+    }
+
+    fn goal_prompt(objective: &str, turn: u32) -> String {
+        format!(
+            "Continue working toward the active goal.\n<objective>\n{objective}\n</objective>\n\nGoal state:\n- status: active\n- turn: {turn}\n"
+        )
+    }
+
+    #[test]
+    fn fake_goal_n_completes_on_the_nth_goal_turn() {
+        let runner = FakeRunner::team(BackendKind::Claude);
+        for turn in 1..=4 {
+            let events = run(&runner, &goal_prompt("fix things fake-goal-3", turn));
+            let text = completed_text(&events);
+            let parsed = crate::router::parse_agent_output(text);
+            assert_eq!(
+                parsed.goal_completes.len(),
+                usize::from(turn >= 3),
+                "turn {turn}"
+            );
+            assert!(!parsed.visible_text.is_empty(), "turn {turn}");
+        }
+    }
+
+    #[test]
+    fn fake_goal_silent_and_plain_goals_behave() {
+        let runner = FakeRunner::team(BackendKind::Claude);
+        let events = run(&runner, &goal_prompt("nothing fake-goal-silent", 2));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageCompleted(_)))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Exited { ok: true, .. })
+        ));
+
+        // An objective with no trigger never finishes by itself.
+        let events = run(&runner, &goal_prompt("just keep going", 9));
+        assert!(
+            crate::router::parse_agent_output(completed_text(&events))
+                .goal_completes
+                .is_empty()
+        );
     }
 }

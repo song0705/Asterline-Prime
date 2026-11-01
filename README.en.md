@@ -127,7 +127,7 @@ Asterline is not several chat windows stacked together. Each mode has owners, st
 /continue secret is now available
 ```
 
-A team can mix providers or use the same backend more than once. Each member can have its own role, model, reasoning setting, working directory, system prompt, sandbox, permission mode, tool allowlist, and session policy.
+A team can mix providers or use the same backend more than once. Each member has one name and can have its own model, reasoning setting, working directory, system prompt, sandbox, permission mode, tool allowlist, and session policy.
 
 | Backend | Integration                 | Session resume | Model discovery                |
 | ------- | --------------------------- | -------------- | ------------------------------ |
@@ -165,6 +165,7 @@ Codex tool asks are approved automatically unless you pass `--manual-approvals` 
 | `/runs`                | Inspect work state and next actions                  |
 | `/team`                | Edit the live roster                                 |
 | `/resume`              | Pick a saved conversation in the Agents list         |
+| `/goal <objective>`    | Work toward a goal until it is done                  |
 | `/approve` / `/reject` | Resolve a pending approval                           |
 | `/help`                | Open the command palette                             |
 

@@ -10,7 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::config::{MAIN_MEMBER_ID, upper_first};
-use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
+use crate::domain::team::{DefaultTarget, MemberId, TeamConfig, TeamMember};
 
 /// Mode selected for the lifetime of the current conversation.
 ///
@@ -1112,11 +1112,20 @@ pub fn resolve_team_coordinator(config: &TeamConfig) -> Result<MemberId, String>
     Ok(derive_roles(config).leader)
 }
 
-fn role_contains(role: &str, needle: &str) -> bool {
-    role.to_ascii_lowercase().contains(needle)
+/// Whether `member` fits a seat keyword: its display name or id says so (a
+/// member named "Reviewer" is the reviewer), or a legacy `team.json` `role`
+/// does, so old rosters keep resolving the same.
+fn member_suggests(member: &TeamMember, needle: &str) -> bool {
+    [
+        member.display_name.as_str(),
+        member.id.as_str(),
+        member.role.as_str(),
+    ]
+    .iter()
+    .any(|text| text.to_ascii_lowercase().contains(needle))
 }
 
-/// Role-heuristic defaults used when neither override nor config binding sets a field.
+/// Name-heuristic defaults used when neither override nor config binding sets a field.
 fn derive_roles(config: &TeamConfig) -> ResolvedModeRoles {
     // Sub-agents belong to their parent's conversation; modes fill their seats
     // from the top-level roster only.
@@ -1124,12 +1133,12 @@ fn derive_roles(config: &TeamConfig) -> ResolvedModeRoles {
     let config = &top_level;
     let first = config.members[0].id.clone();
 
-    // Prefer a role-tagged reviewer so builder can avoid that seat; otherwise
+    // Prefer a reviewer-named member so builder can avoid that seat; otherwise
     // pick builder first (default target / first member), then the last other member.
     let role_reviewer = config
         .members
         .iter()
-        .find(|member| role_contains(&member.role, "review"))
+        .find(|member| member_suggests(member, "review"))
         .map(|member| member.id.clone());
 
     let (builder, reviewer) = if let Some(reviewer) = role_reviewer {
@@ -1149,7 +1158,7 @@ fn derive_roles(config: &TeamConfig) -> ResolvedModeRoles {
     let leader = config
         .members
         .iter()
-        .find(|member| role_contains(&member.role, "plan") || role_contains(&member.role, "lead"))
+        .find(|member| member_suggests(member, "plan") || member_suggests(member, "lead"))
         .map(|member| member.id.clone())
         .unwrap_or_else(|| first.clone());
 
@@ -1198,6 +1207,61 @@ mod tests {
             .with_member(member("planner", "planning lead"))
             .with_member(member("builder", "implementation"))
             .with_member(member("reviewer", "code review"))
+    }
+
+    #[test]
+    fn a_member_named_reviewer_with_no_role_is_the_reviewer() {
+        let config = TeamConfig::new("named", "/tmp/ws")
+            .with_member(member("alpha", ""))
+            .with_member(member("reviewer", ""))
+            .with_member(member("gamma", ""));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.reviewer, MemberId::new("reviewer"));
+        assert_eq!(roles.builder, MemberId::new("alpha"));
+        assert!(roles.auto_seats.is_empty());
+
+        // The display name counts too, not only the id.
+        let mut renamed = member("qa", "");
+        renamed.display_name = "Code Reviewer".to_string();
+        let config = TeamConfig::new("named", "/tmp/ws")
+            .with_member(member("alpha", ""))
+            .with_member(renamed)
+            .with_member(member("gamma", ""));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.reviewer, MemberId::new("qa"));
+    }
+
+    #[test]
+    fn a_named_planner_leads_plan_mode() {
+        let config = TeamConfig::new("named", "/tmp/ws")
+            .with_member(member("alpha", ""))
+            .with_member(member("planner", ""));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Plan).unwrap();
+        assert_eq!(roles.leader, MemberId::new("planner"));
+    }
+
+    #[test]
+    fn a_legacy_role_still_picks_the_seat() {
+        let config = TeamConfig::new("legacy", "/tmp/ws")
+            .with_member(member("alpha", ""))
+            .with_member(member("bob", "code review"))
+            .with_member(member("carol", "tech lead"));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.reviewer, MemberId::new("bob"));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Plan).unwrap();
+        assert_eq!(roles.leader, MemberId::new("carol"));
+    }
+
+    #[test]
+    fn a_default_main_member_is_not_a_reviewer_by_a_hidden_role() {
+        let mut main = member("main", "");
+        main.display_name = "Main".to_string();
+        main.backend = BackendKind::Claude;
+        let config = TeamConfig::new("solo", "/tmp/ws").with_member(main);
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.builder, MemberId::new("main"));
+        assert_eq!(roles.reviewer, MemberId::new("reviewer"));
+        assert_eq!(roles.auto_seats.len(), 1);
     }
 
     #[test]

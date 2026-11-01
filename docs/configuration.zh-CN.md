@@ -63,21 +63,18 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
     {
       "display_name": "Builder",
       "backend": "codex",
-      "role": "implementation",
       "sandbox": "workspace-write",
       "effort": "high"
     },
     {
       "display_name": "Reviewer",
       "backend": "claude",
-      "role": "review and risk analysis",
       "permission_mode": "plan",
       "effort": "medium"
     },
     {
       "display_name": "Grok",
       "backend": "grok",
-      "role": "implementation",
       "sandbox": "workspace-write",
       "permission_mode": "auto"
     }
@@ -131,8 +128,8 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
 ### 协作模式（`modes`）
 
 可为 `/mode review`、`/mode plan`、`/mode brainstorm` 和 `/mode team` 设置可选绑定。除
-Plan 的 `builder` 和 `reviewer` 外，省略的角色字段会从成员 role 和 `default_target` 推导（Review 的
-builder ≈ 默认目标或第一位非 reviewer；reviewer ≈ role 含 `review`；leader ≈ role 含
+Plan 的 `builder` 和 `reviewer` 外，省略的席位字段会从成员名称和 `default_target` 推导（Review 的
+builder ≈ 默认目标或第一位非 reviewer；reviewer ≈ 名称或 id 含 `review` 的成员；leader ≈ 名称或 id 含
 `plan` 或 `lead`，否则为第一位 participant；participants = 完整 roster）。Plan 的
 `builder` 默认就是 leader（先做计划再自己执行 checklist）。`reviewer` 可省略，省略后可执行 checklist 会直接交给
 Builder。`auto_execute` 默认 `true`；设为 `false` 时，最终 checklist 会等待 `/approve` 后才派给
@@ -197,7 +194,7 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 | --- | --- | --- |
 | `display_name` | 除非由 `id` 提供，否则是 | 可见成员名 |
 | `backend` | 是 | `codex`、`claude`、`grok` 或 `agy` |
-| `role` | 是 | 自由文本的团队职责 |
+| `role` | 否（旧字段） | 可选的旧字段。界面不显示也不编辑 |
 | `id` | 否 | `@member` 和路由使用的稳定 handle |
 | `cwd` | 否 | 高级的逐成员工作目录覆盖 |
 | `model` | 否 | 省略时交给后端 CLI |
@@ -208,6 +205,8 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 | `allowed_tools` | 否 | 后端特定的工具 allowlist |
 | `session_policy` | 否 | `resume`（默认）或 `fresh` |
 | `session_id` | 否 | 要恢复的原生 CLI session/conversation ID |
+
+`display_name` 是成员唯一的标签。`role` 是可选的旧字段：带有它的旧文件照常可用（Review 与 Plan 的席位默认值仍会读取它），仅在非空时写回，`/team` 不显示也不编辑。建议直接用 `Reviewer`、`Planner` 这样描述性的名称。
 
 启动时，已绑定 session 的 `resume` 成员会扫描 Asterline 关闭期间写进原生会话的新记录
 （Grok CLI、Codex、Claude），只把尚未出现过的消息导入当前对话。
@@ -391,7 +390,7 @@ Asterline 本地启动后端 CLI，并继承其凭据、环境变量、文件系
 `--manual-approvals` 或 `approvals.manual` 后才用输入框上方的卡片。
 
 `danger-full-access` sandbox 与 bypass 风格 permission mode 应视为明确的信任决定。不要假定
-团队 role 或模型名限制了底层进程可访问的内容。
+成员名称或模型名限制了底层进程可访问的内容。
 
 ## Agent 间协作
 
@@ -421,7 +420,7 @@ handoff 由 `max_auto_relays` 限制；`/retry` 恢复暂停路由。
 Agent 可请求缺失的专长：
 
 ```text
-@@team_member {"display_name":"QA","backend":"codex","role":"tests"}
+@@team_member {"display_name":"QA","backend":"codex"}
 ```
 
 Asterline 校验重复 ID 与名称、启动 runner、保存 roster 并广播更新团队。未写
@@ -435,7 +434,7 @@ off）。Agent envelope 可以添加成员但不能删除；删除仍然是 `/te
 可并行的工作：
 
 ```text
-@@spawn {"name":"reviewer","task":"Review the diff and list real bugs.","backend":"claude","model":"opus","effort":"high","role":"review"}
+@@spawn {"name":"reviewer","task":"Review the diff and list real bugs.","backend":"claude","model":"opus","effort":"high"}
 ```
 
 `name` 和 `task` 必填。省略的 `backend`、`model`、`effort` 与开它的成员相同；换了

@@ -21,7 +21,7 @@ pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL
 /// Live roster and member status. Rewritten whenever the team or a status changes.
 pub const ASTERLINE_ROSTER_PATH: &str = ".asterline/roster.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 23;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 24;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
@@ -458,7 +458,7 @@ pub fn default_team(
 
 /// The `main` member on `backend`, with that backend's default permissions.
 pub fn main_member(backend: BackendKind) -> TeamMember {
-    let mut member = TeamMember::new(MAIN_MEMBER_ID, "Main", backend, "general");
+    let mut member = TeamMember::new(MAIN_MEMBER_ID, "Main", backend, "");
     apply_backend_defaults(&mut member);
     member
 }
@@ -508,10 +508,8 @@ pub fn sub_agent_member(parent: &TeamMember, request: &SpawnRequest) -> Result<T
         None if same_backend => parent.model.clone(),
         None => None,
     };
-    let role = request
-        .role
-        .clone()
-        .unwrap_or_else(|| "sub-agent".to_string());
+    // The parent's job text is optional; it only colors protocol text.
+    let role = request.role.clone().unwrap_or_default();
     let mut member = TeamMember::new(id, upper_first(request.name.trim()), backend, role);
     member.model = model;
     member.effort = effort;
@@ -616,25 +614,25 @@ pub fn apply_backend_defaults(member: &mut TeamMember) {
 pub fn default_member(backend: BackendKind) -> TeamMember {
     match backend {
         BackendKind::Codex => {
-            let mut m = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+            let mut m = TeamMember::new("builder", "Builder", BackendKind::Codex, "");
             m.apply_codex_permissions_preset(
                 crate::domain::team::CodexPermissionsPreset::AskForApproval,
             );
             m
         }
         BackendKind::Claude => {
-            let mut m = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+            let mut m = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "");
             m.permission_mode = Some(PermissionMode::AcceptEdits);
             m
         }
         BackendKind::Grok => {
-            let mut m = TeamMember::new("grok", "Grok", BackendKind::Grok, "implementation");
+            let mut m = TeamMember::new("grok", "Grok", BackendKind::Grok, "");
             m.sandbox = SandboxPolicy::WorkspaceWrite;
             m.permission_mode = Some(PermissionMode::Auto);
             m
         }
         BackendKind::Agy => {
-            let mut m = TeamMember::new("researcher", "Researcher", BackendKind::Agy, "research");
+            let mut m = TeamMember::new("researcher", "Researcher", BackendKind::Agy, "");
             m.sandbox = SandboxPolicy::WorkspaceWrite;
             m.permission_mode = Some(PermissionMode::AcceptEdits);
             m
@@ -655,11 +653,11 @@ pub fn inject_team_protocol(team: &mut TeamConfig) {
                     .members
                     .iter()
                     .filter(|other| other.id != me.id && other.parent.is_none())
-                    .map(|other| format!("{} [{}]", other.id, other.role))
+                    .map(|other| other.listing_label())
                     .collect();
                 let sub_agents: Vec<String> = team
                     .sub_agents_of(&me.id)
-                    .map(|child| format!("{} [{}]", child.id, child.role))
+                    .map(|child| child.listing_label())
                     .collect();
                 build_protocol(me.id.as_str(), &teammates, &sub_agents)
             }
@@ -784,7 +782,7 @@ mod tests {
         let main = &config.members[0];
         assert_eq!(main.id, MemberId::new("main"));
         assert_eq!(main.display_name, "Main");
-        assert_eq!(main.role, "general");
+        assert_eq!(main.role, "");
         assert_eq!(main.backend, BackendKind::Codex);
         assert_eq!(main.model, None);
         assert_eq!(main.effort, None);
@@ -995,9 +993,15 @@ mod tests {
     }
 
     #[test]
-    fn default_member_maps_backend_to_role() {
-        assert_eq!(default_member(BackendKind::Codex).role, "implementation");
-        assert_eq!(default_member(BackendKind::Claude).role, "review");
+    fn default_members_carry_no_hidden_role() {
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            assert_eq!(default_member(backend).role, "");
+        }
         assert_eq!(default_member(BackendKind::Grok).backend, BackendKind::Grok);
         assert_eq!(default_member(BackendKind::Agy).backend, BackendKind::Agy);
     }
@@ -1058,6 +1062,19 @@ mod tests {
     }
 
     #[test]
+    fn protocol_lists_teammates_with_a_role_only_when_one_is_set() {
+        let mut config = TeamConfig::new("t", "/tmp/ws")
+            .with_member(TeamMember::new("main", "Main", BackendKind::Codex, ""))
+            .with_member(TeamMember::new("qa", "QA", BackendKind::Claude, ""))
+            .with_member(TeamMember::new("ops", "Ops", BackendKind::Agy, "deploys"));
+
+        inject_team_protocol(&mut config);
+        let prompt = config.members[0].system_prompt.as_ref().unwrap();
+        assert!(prompt.contains("Teammates: qa, ops [deploys]"), "{prompt}");
+        assert!(!prompt.contains("qa ["));
+    }
+
+    #[test]
     fn ensure_team_skill_writes_repo_skill_when_missing() {
         let dir = std::env::temp_dir().join(format!("asterline-skill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1113,7 +1130,7 @@ mod tests {
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 23"));
+        assert!(text.contains("version: 24"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -1186,12 +1203,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v22() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 23);
+    fn embedded_team_skill_is_protocol_v24() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 24);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 23")
+                .any(|line| line.trim() == "version: 24")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1216,7 +1233,7 @@ mod tests {
                 .contains("Writing the plan, review, or patch \"for the user\" is not delivery")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(ASTERLINE_ROSTER_PATH));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 23);
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 24);
         assert!(ASTERLINE_TEAM_SKILL.contains("@@spawn"));
         assert!(ASTERLINE_TEAM_SKILL.contains("[hand-back from"));
         assert!(ASTERLINE_TEAM_SKILL.contains("at most 8 sub-agents"));
@@ -1325,7 +1342,7 @@ mod tests {
 
         assert_eq!(child.id, MemberId::new("reviewer"));
         assert_eq!(child.display_name, "Reviewer");
-        assert_eq!(child.role, "sub-agent");
+        assert_eq!(child.role, "");
         assert_eq!(child.parent, Some(parent.id.clone()));
         assert_eq!(child.backend, BackendKind::Claude);
         assert_eq!(child.model.as_deref(), Some("opus"));

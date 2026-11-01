@@ -228,7 +228,7 @@ fn a_sub_agent_window_has_no_row_for_the_prompt_to_its_parent() {
 
     assert!(!has(&text, "spawn please"), "{text:?}");
     assert!(!has(&text, "you →"), "{text:?}");
-    assert!(!has(&text, "opened Reviewer"), "{text:?}");
+    assert!(!has(&text, "· spawn"), "{text:?}");
     assert!(!has(&text, "builder reply"), "{text:?}");
     // Its own conversation stays: the task, its reply, the hand-back and the
     // user's direct message.
@@ -247,7 +247,9 @@ fn the_parent_window_has_no_row_for_the_direct_message_to_its_sub_agent() {
     assert!(!has(&text, "you →"), "{text:?}");
     assert!(!has(&text, "reviewer reply"), "{text:?}");
     assert!(has(&text, "spawn please"), "{text:?}");
-    assert!(has(&text, "opened Reviewer"), "{text:?}");
+    // The child exists, so the row shows its model label, not the summary.
+    assert!(has(&text, "· spawn  Reviewer  claude"), "{text:?}");
+    assert!(!has(&text, "opened Reviewer"), "{text:?}");
     assert!(has(&text, "task from the parent"), "{text:?}");
     assert!(has(&text, "hand-back to the parent"), "{text:?}");
     assert!(has(&text, "builder reply"), "{text:?}");
@@ -1432,7 +1434,10 @@ fn spawn_task_and_hand_back_are_rows_in_the_viewed_agents_group() {
         .position(|l| l.contains("· from   Scout"))
         .expect("result");
     assert!(spawn < task && task < back, "{parent:?}");
-    assert!(parent[spawn].contains("claude · opus · high"), "{parent:?}");
+    // Scout exists with no catalog: its label is the backend name, not the
+    // raw summary stored at spawn time.
+    assert!(parent[spawn].ends_with("Scout  claude"), "{parent:?}");
+    assert!(!parent[spawn].contains("opus"), "{parent:?}");
     assert_eq!(
         parent.iter().filter(|l| l.contains("⇄ agents")).count(),
         1,
@@ -1460,10 +1465,7 @@ fn spawn_task_and_hand_back_are_rows_in_the_viewed_agents_group() {
 
     // The interleaved view names both ends.
     let all = history(&tree_state(chat, None), 90);
-    assert!(
-        has(&all, "· spawn  Builder → Scout  claude · opus · high"),
-        "{all:?}"
-    );
+    assert!(has(&all, "· spawn  Builder → Scout  claude"), "{all:?}");
     assert!(has(&all, "· Builder → Scout  Task line one"), "{all:?}");
     assert!(has(&all, "· Scout → Builder  Result line one"), "{all:?}");
 }
@@ -1585,4 +1587,85 @@ fn header_dot_is_yellow_for_approval_and_red_for_failed() {
     let (glyph, failed) = header_dot(&terminal, "Reviewer");
     assert_eq!(glyph, "✗");
     assert_eq!(failed.fg, theme::error().fg);
+}
+
+fn seed_models(state: &mut AppState, name: &str) {
+    let mut model = crate::adapter::DiscoveredModel::simple("opus");
+    model.name = name.to_string();
+    model.is_default = true;
+    model.supported_efforts = vec![Effort::Low, Effort::High];
+    model.default_effort = Some(Effort::High);
+    state.seed_installed_catalog(
+        BackendKind::Claude,
+        crate::adapter::DiscoveredCatalog {
+            models: vec![model],
+            ..Default::default()
+        },
+    );
+}
+
+#[test]
+fn spawn_row_and_speaker_label_show_the_model_label_and_follow_the_catalog() {
+    let scout = MemberId::new("scout");
+    let chat = vec![
+        ChatItem::Spawn {
+            parent: builder(),
+            child: scout.clone(),
+            summary: "claude · opus · high".to_string(),
+        },
+        agent(&scout, "Scout", BackendKind::Claude, "scout reply"),
+    ];
+    let mut state = tree_state(chat, None);
+    let before = history(&state, 90);
+    assert!(
+        has(&before, "· spawn  Builder → Scout  claude"),
+        "{before:?}"
+    );
+    assert!(before.iter().any(|l| l == "  Scout · claude"), "{before:?}");
+
+    // The catalog lands: both rows re-render (the paint cache is invalidated).
+    seed_models(&mut state, "Opus 9");
+    let after = history(&state, 90);
+    assert!(
+        has(&after, "· spawn  Builder → Scout  Opus 9 · high"),
+        "{after:?}"
+    );
+    assert!(
+        after.iter().any(|l| l == "  Scout · Opus 9 · high"),
+        "{after:?}"
+    );
+
+    // The painted (cached) view follows a later catalog change too.
+    let painted = |state: &AppState| {
+        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, state);
+            })
+            .unwrap();
+        format!("{}", terminal.backend())
+    };
+    assert!(painted(&state).contains("Scout · Opus 9 · high"));
+    seed_models(&mut state, "Opus 10");
+    let repainted = painted(&state);
+    assert!(repainted.contains("Scout · Opus 10 · high"), "{repainted}");
+    assert!(repainted.contains("Scout  Opus 10 · high"), "{repainted}");
+}
+
+#[test]
+fn removed_members_keep_the_backend_name_and_the_stored_spawn_summary() {
+    let gone = MemberId::new("gone");
+    let chat = vec![
+        ChatItem::Spawn {
+            parent: builder(),
+            child: gone.clone(),
+            summary: "claude · opus · high".to_string(),
+        },
+        agent(&gone, "Gone", BackendKind::Claude, "last words"),
+    ];
+    let mut state = tree_state(chat, None);
+    seed_models(&mut state, "Opus 9");
+    let text = history(&state, 90);
+    assert!(has(&text, "claude · opus · high"), "{text:?}");
+    assert!(text.iter().any(|l| l == "  Gone · claude"), "{text:?}");
 }

@@ -472,14 +472,11 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
         let color =
             theme::backend_color_shaded(member.backend, state.member_color_index(&member.id));
         let status_label = theme::status_label(member.status);
-        // Header line: ● Name  backend · role  ·  status
+        // Header line: ● Name  backend  ·  status
         lines.push(Line::from(vec![
             Span::styled("● ", theme::bold(color)),
             Span::styled(member.display_name.clone(), theme::bold(color)),
-            Span::styled(
-                format!("   {} · {}", member.backend.as_str(), member.role),
-                theme::muted(),
-            ),
+            Span::styled(format!("   {}", member.backend.as_str()), theme::muted()),
             Span::styled(format!("   {status_label}"), {
                 Style::default().fg(theme::status_color(member.status))
             }),
@@ -530,7 +527,7 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
 // The roster is an identity overview. Configuration and live state belong in
 // the selected-member detail below it; repeating them here made the drawer
 // wide without helping selection.
-const EDITOR_COLUMNS: [usize; 2] = [17, 9];
+const EDITOR_COLUMNS: [usize; 1] = [17];
 
 fn drawer_team_editor(
     state: &AppState,
@@ -558,7 +555,7 @@ fn drawer_team_editor(
         lines.push(Line::styled(format!(" {notice}"), theme::warning()));
     }
     lines.push(Line::raw(""));
-    let (header, rule) = table_header(&["   Member", "Backend"], &EDITOR_COLUMNS, "Role");
+    let (header, rule) = table_header(&["   Member"], &EDITOR_COLUMNS, "Backend");
     lines.push(header);
     lines.push(rule);
 
@@ -589,13 +586,8 @@ fn drawer_team_editor(
                 pad_width(&member.display_name, EDITOR_COLUMNS[0] - 3),
                 row_style,
             ),
-            sep.clone(),
-            Span::styled(
-                pad_width(member.backend.as_str(), EDITOR_COLUMNS[1]),
-                row_style,
-            ),
             sep,
-            Span::styled(member.role.clone(), row_style),
+            Span::styled(member.backend.as_str().to_string(), row_style),
         ]));
     }
 
@@ -982,7 +974,7 @@ mod tests {
                 text.contains(':').then_some(text)
             })
             .filter(|line| {
-                ["name:", "role:", "backend:", "permissions:", "session id:"]
+                ["name:", "backend:", "permissions:", "session id:"]
                     .iter()
                     .any(|label| line.contains(label))
             })
@@ -995,7 +987,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(colon_positions.len() >= 5);
+        assert!(colon_positions.len() >= 4);
         assert!(colon_positions.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
@@ -1079,7 +1071,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let expected = vec![17, 28];
+        let expected = vec![17];
         assert_eq!(positions(&header, '│'), expected);
         assert_eq!(positions(&rule, '┼'), expected);
         assert_eq!(positions(&row, '│'), expected);

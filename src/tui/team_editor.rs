@@ -815,13 +815,6 @@ impl TeamEditor {
                     }
                 }
             }
-            Field::Role => {
-                if !value.is_empty()
-                    && let Some(member) = self.selected_member_mut()
-                {
-                    member.role = value.to_string();
-                }
-            }
             Field::Model => {
                 if let Some(member) = self.selected_member_mut() {
                     member.model = if value.is_empty() || value.eq_ignore_ascii_case("default") {
@@ -926,6 +919,41 @@ mod tests {
             editor.notice.as_deref(),
             Some("member added; press s to apply")
         );
+    }
+
+    #[test]
+    fn editor_has_no_role_field_and_new_members_have_no_role() {
+        let mut editor = editor();
+        editor.add_member();
+
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            let labels: Vec<&str> = Field::for_backend(backend)
+                .iter()
+                .map(|field| field.label())
+                .collect();
+            assert!(!labels.contains(&"role"), "{labels:?}");
+            assert!(labels.contains(&"name"));
+        }
+        assert!(Field::ALL.iter().all(|field| field.label() != "role"));
+        assert_eq!(editor.members.last().unwrap().role, "");
+    }
+
+    #[test]
+    fn editing_a_member_keeps_its_legacy_role() {
+        let mut editor = editor();
+        editor.members[0].role = "implementation".to_string();
+        editor.commit_edit(EditState::new(Field::Name, "Maker".to_string()));
+
+        let Some(UiCommand::ReplaceTeam { members, .. }) = editor.apply_command() else {
+            panic!("expected replace command");
+        };
+        assert_eq!(members[0].display_name, "Maker");
+        assert_eq!(members[0].role, "implementation");
     }
 
     #[test]

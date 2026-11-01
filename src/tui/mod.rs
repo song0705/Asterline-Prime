@@ -16,6 +16,7 @@ mod composer_wrap;
 pub mod drawer_view;
 pub mod drawers;
 mod file_diff;
+pub mod goal_surface;
 pub mod grok_import;
 pub mod header;
 mod import_io;

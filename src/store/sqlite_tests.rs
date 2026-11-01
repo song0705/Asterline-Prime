@@ -1835,3 +1835,91 @@ fn the_name_column_is_added_to_an_existing_database() {
         Some("old chat")
     );
 }
+
+fn sample_goal(objective: &str) -> crate::domain::goal::GoalState {
+    use crate::domain::goal::{GoalState, GoalStatus};
+    GoalState {
+        objective: objective.to_string(),
+        status: GoalStatus::Paused,
+        member: MemberId::new("main"),
+        turns: 7,
+        created_at: 1_700_000_000,
+        last_reason: Some("Paused by interrupt".to_string()),
+        no_progress_streak: 2,
+    }
+}
+
+#[test]
+fn a_goal_round_trips_per_conversation_and_updates_in_place() {
+    let store = store();
+    let first = store.current_conversation().unwrap();
+    assert_eq!(store.goal_for(first).unwrap(), None);
+
+    let mut goal = sample_goal("ship it");
+    store.save_goal(&goal).unwrap();
+    assert_eq!(store.goal_for(first).unwrap(), Some(goal.clone()));
+
+    goal.turns = 8;
+    goal.last_reason = None;
+    store.save_goal(&goal).unwrap();
+    assert_eq!(store.goal_for(first).unwrap(), Some(goal));
+
+    // Another conversation has its own row.
+    let second = store.create_and_set_conversation().unwrap();
+    assert_eq!(store.goal_for(second).unwrap(), None);
+    store.save_goal(&sample_goal("other")).unwrap();
+    assert_eq!(store.goal_for(first).unwrap().unwrap().objective, "ship it");
+    assert_eq!(store.goal_for(second).unwrap().unwrap().objective, "other");
+
+    store.clear_goal().unwrap();
+    assert_eq!(store.goal_for(second).unwrap(), None);
+    assert!(store.goal_for(first).unwrap().is_some());
+}
+
+#[test]
+fn deleting_a_conversation_deletes_its_goal() {
+    let store = store();
+    let doomed = store.current_conversation().unwrap();
+    store.save_goal(&sample_goal("forget me")).unwrap();
+    store.create_and_set_conversation().unwrap();
+
+    assert!(store.delete_conversation(doomed).unwrap());
+
+    assert_eq!(store.goal_for(doomed).unwrap(), None);
+}
+
+#[test]
+fn goal_markers_replay_in_order_with_their_turn_number() {
+    let store = store();
+    store.current_conversation().unwrap();
+    let turn = store.create_turn().unwrap();
+    let member = MemberId::new("main");
+    store.record_goal_marker(turn, &member, 4).unwrap();
+
+    assert_eq!(
+        store.replay_chat().unwrap(),
+        vec![ChatItem::GoalMarker { member, turn: 4 }]
+    );
+}
+
+#[test]
+fn an_existing_database_gains_the_goal_table_on_open() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );",
+    )
+    .unwrap();
+    let store = SqliteStore {
+        conn,
+        conversation: Cell::new(0),
+    };
+
+    store.create_schema().unwrap();
+    let id = store.create_and_set_conversation().unwrap();
+    store.save_goal(&sample_goal("late")).unwrap();
+
+    assert_eq!(store.goal_for(id).unwrap().unwrap().objective, "late");
+}

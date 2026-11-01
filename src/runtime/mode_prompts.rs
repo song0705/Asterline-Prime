@@ -119,21 +119,16 @@ pub fn verdict_nudge_prompt() -> String {
     )
 }
 
-/// Leader planning prompt for Plan mode. `teammates` are `(id, role)` pairs.
+/// Leader planning prompt for Plan mode. `teammates` are `(id, label)` pairs where
+/// the label is the id plus an optional `[job]` suffix.
 pub fn plan_plan_prompt(task: &str, teammates: &[(String, String)]) -> String {
-    let ids: Vec<&str> = teammates.iter().map(|(id, _)| id.as_str()).collect();
-    let roles: Vec<String> = teammates
-        .iter()
-        .map(|(id, role)| format!("{id} ({role})"))
-        .collect();
+    let labels: Vec<&str> = teammates.iter().map(|(_, label)| label.as_str()).collect();
     format!(
         "You are the planning lead.\n\n\
          Task:\n{task}\n\n\
-         Teammates: {}\n\
-         Roles: {}\n\n\
+         Teammates: {}\n\n\
          {PLAN_MODE_HINT}",
-        ids.join(", "),
-        roles.join(", ")
+        labels.join(", ")
     )
 }
 
@@ -447,13 +442,13 @@ mod tests {
     #[test]
     fn plan_plan_prompt_lists_teammates_and_hint() {
         let teammates = vec![
-            ("builder".into(), "impl".into()),
-            ("reviewer".into(), "review".into()),
+            ("builder".into(), "builder".into()),
+            ("reviewer".into(), "reviewer".into()),
         ];
         let prompt = plan_plan_prompt("ship the release", &teammates);
         assert!(prompt.contains("ship the release"));
         assert!(prompt.contains("Teammates: builder, reviewer"));
-        assert!(prompt.contains("builder (impl)"));
+        assert!(!prompt.contains("Roles:"));
         assert!(prompt.contains(PLAN_MODE_HINT));
     }
 

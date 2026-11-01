@@ -316,6 +316,36 @@ fn the_label_repeats_after_a_user_message_or_another_agents_message() {
 }
 
 #[test]
+fn header_chips_show_the_model_name_and_effort_once_a_catalog_names_it() {
+    let mut state = state_over(Vec::new(), Some(builder()));
+    // No catalog yet: the backend name.
+    let rows = draw_rows(&state, 80, 10);
+    assert!(rows[0].contains("● Builder · codex"), "{}", rows[0]);
+
+    let mut sol = crate::adapter::DiscoveredModel::simple("gpt-sol");
+    sol.name = "GPT-Sol".to_string();
+    sol.is_default = true;
+    sol.supported_efforts = vec![Effort::Low, Effort::High];
+    sol.default_effort = Some(Effort::High);
+    state.seed_installed_catalog(
+        BackendKind::Codex,
+        crate::adapter::DiscoveredCatalog {
+            models: vec![sol],
+            ..Default::default()
+        },
+    );
+    let rows = draw_rows(&state, 80, 10);
+    assert!(
+        rows[0].contains("● Builder · GPT-Sol · high"),
+        "{}",
+        rows[0]
+    );
+    assert!(!rows[0].contains("Builder · codex"), "{}", rows[0]);
+    // The other member has no catalog and keeps its backend name.
+    assert!(rows[0].contains("Reviewer · claude"), "{}", rows[0]);
+}
+
+#[test]
 fn the_screen_has_no_horizontal_rules_at_all() {
     let state = state_over(
         vec![

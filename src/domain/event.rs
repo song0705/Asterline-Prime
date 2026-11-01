@@ -6,6 +6,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::goal::{GoalAction, GoalState};
 use crate::domain::mode::{CollabMode, ModeStatusSummary, ModesConfig, TerminalMode};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
@@ -408,6 +409,8 @@ pub enum UiCommand {
     },
     /// Start a collaboration mode run.
     RunMode { mode: CollabMode, task: String },
+    /// `/goal`: show, set, pause, resume or clear the main agent's goal.
+    Goal { action: GoalAction },
     /// Begin a graceful shutdown.
     Shutdown,
 }
@@ -881,6 +884,17 @@ pub enum RuntimeEvent {
         conversation: i64,
         chat: Vec<ChatItem>,
     },
+    /// The chat's goal changed (`None`: it has none). Sent at startup, after a
+    /// chat is resumed and on every goal change.
+    GoalUpdated {
+        goal: Option<GoalState>,
+    },
+    /// The goal loop started its `turn`-th turn for `member` without a user
+    /// message; the chat shows a compact marker row for it.
+    GoalMarker {
+        member: MemberId,
+        turn: u32,
+    },
 }
 
 /// One saved chat, listed as an "Inactive" row of the Agents list.
@@ -973,6 +987,8 @@ pub enum ChatItem {
         approve: bool,
         summary: String,
     },
+    /// The goal loop started a turn on its own (`↻ goal · turn 4`).
+    GoalMarker { member: MemberId, turn: u32 },
 }
 
 #[cfg(test)]
