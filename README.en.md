@@ -45,17 +45,15 @@ cd /path/to/your/project
 ast
 ```
 
-On first launch, the Team editor discovers supported CLIs on `PATH`. Select a member with `↑`/`↓`, press `Enter` to edit, and press `s` to save.
+On first launch Asterline goes straight into a chat with the first supported CLI it finds on `PATH` (Codex, Claude, Grok, then Agy) using that CLI's default model. Type `/model` to switch the model of the agent you are viewing.
 
-<p align="center">
-  <img src="docs/assets/team.webp" alt="Asterline Team editor" width="100%">
-</p>
-
-In a normal conversation, send the first task to a member on the roster:
+In a normal conversation, type the task as plain text:
 
 ```text
-@builder audit this repository and fix the highest-risk defect
+audit this repository and fix the highest-risk defect
 ```
+
+Messages go to the agent whose view you are in; press `←` on an empty composer to open the agent list and switch agents. The main agent can open sub-agents on its own (parallel work, a second model's review) and their results return to it automatically; open any sub-agent from the same list to keep chatting with it.
 
 For structured work, open the mode picker first:
 
@@ -67,7 +65,7 @@ For structured work, open the mode picker first:
   <img src="docs/assets/mode.webp" alt="Asterline mode picker" width="100%">
 </p>
 
-Use `↑`/`↓` to highlight a mode, `Enter` to edit optional fields, and `s` to apply it to this conversation. `/mode review` still works as a direct shortcut. After selecting `review`, `plan`, `brainstorm`, or `team`, type the task as plain text — no `@member` prefix. A fresh `normal` conversation still needs an explicit target.
+Use `↑`/`↓` to highlight a mode, `Enter` to edit optional fields, and `s` to apply it to this conversation. `/mode review` still works as a direct shortcut. After selecting `review`, `plan`, `brainstorm`, or `team`, type the task as plain text — no `@member` prefix.
 
 ```text
 /mode review
@@ -140,7 +138,7 @@ A team can mix providers or use the same backend more than once. Each member can
 
 Asterline does not replace provider authentication, billing, model access, or usage limits.
 
-Reopening Asterline resumes the last conversation by default. `/new` and `/clear` both start a clean conversation and keep the mode settings. `/resume` restores a saved transcript, roster, backend sessions, mode, and Runs. Project state lives in:
+Reopening Asterline resumes the last conversation by default. `/new` (optionally with a first prompt) and `/clear` both start a clean conversation and keep the mode settings. `/resume` picks a saved conversation in the Agents list and restores its transcript, roster, backend sessions, mode, and Runs. Project state lives in:
 
 ```text
 <workspace>/.asterline/
@@ -159,16 +157,16 @@ Codex tool asks are approved automatically unless you pass `--manual-approvals` 
 
 ## Essential commands
 
-| Command                | Purpose                             |
-| ---------------------- | ----------------------------------- |
-| `@<member> <message>`  | Send a task to one member           |
-| `@all <message>`       | Broadcast to the roster             |
-| `/mode`                | Open the mode picker                |
-| `/runs`                | Inspect work state and next actions |
-| `/team`                | Edit the live roster                |
-| `/resume`              | Restore a saved conversation        |
-| `/approve` / `/reject` | Resolve a pending approval          |
-| `/help`                | Open the command palette            |
+| Command                | Purpose                                              |
+| ---------------------- | ---------------------------------------------------- |
+| `@<member> <message>`  | Optional: send to one member without switching views |
+| `@all <message>`       | Optional: broadcast to the roster                    |
+| `/mode`                | Open the mode picker                                 |
+| `/runs`                | Inspect work state and next actions                  |
+| `/team`                | Edit the live roster                                 |
+| `/resume`              | Pick a saved conversation in the Agents list         |
+| `/approve` / `/reject` | Resolve a pending approval                           |
+| `/help`                | Open the command palette                             |
 
 See the [complete command and keyboard reference](docs/commands.md) for drawers, Run steps, targeted skills, logs, search, and diffs.
 

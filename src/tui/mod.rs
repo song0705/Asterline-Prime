@@ -2,6 +2,7 @@
 //! composer, and overlay drawers (logs / team / command palette). State is
 //! driven entirely by `RuntimeEvent`s; no string matching.
 
+pub mod agents_view;
 pub mod app_state;
 pub mod attach;
 pub mod chat_view;
@@ -11,6 +12,7 @@ mod clipboard_image;
 pub mod commands;
 pub mod completion;
 pub mod composer;
+mod composer_wrap;
 pub mod drawer_view;
 pub mod drawers;
 mod file_diff;
@@ -20,6 +22,7 @@ mod import_io;
 pub mod keymap;
 pub mod markdown;
 pub mod mode_editor;
+pub mod model_picker;
 pub mod notify;
 pub mod rollout_import;
 pub mod runs_view;
@@ -268,11 +271,15 @@ fn run_loop(
     let mut last_layout = None;
     let mut dirty = true;
     loop {
-        state.poll_team_editor_catalog();
+        if state.poll_team_editor_catalog() {
+            dirty = true;
+        }
         if drain_runtime_events(state, events, notify_enabled) {
             dirty = true;
         }
-        state.warm_model_catalog_once();
+        if state.warm_model_catalog_once() {
+            dirty = true;
+        }
         if let Some(member) = state.take_attach_release_pending()
             && !handle.finish_attach(member, Vec::new())
         {
@@ -286,6 +293,7 @@ fn run_loop(
             })?;
             if let Some(layout) = last_layout.as_ref() {
                 state.set_chat_page_rows(layout.area.height.saturating_sub(1) as usize);
+                state.set_composer_wrap(layout.composer_wrap);
                 state.clamp_scroll(layout.max_scroll());
             }
             dirty = false;
@@ -308,12 +316,21 @@ fn run_loop(
                 }
                 Event::Mouse(mouse) => {
                     handle_mouse(mouse, state, last_layout.as_ref());
+                    send_pending_command(state, handle);
                 }
                 Event::Paste(text) => {
                     if !state.runtime_available() {
                         continue;
                     }
-                    if !state.insert_team_editor_text(&text)
+                    if state.drawer() == Some(drawers::Drawer::Agents) {
+                        if state.agents_rename().is_some() {
+                            state.agents_rename_paste(&text);
+                        } else {
+                            state.agents_query_paste(&text);
+                        }
+                    } else if state.model_picker_open() {
+                        state.model_filter_paste(&text);
+                    } else if !state.insert_team_editor_text(&text)
                         && !state.insert_mode_editor_text(&text)
                     {
                         if text.trim().is_empty() {
@@ -340,7 +357,10 @@ fn run_loop(
             match result {
                 Ok(outcome) => {
                     if let Some(notice) = outcome.notice {
-                        state.apply(RuntimeEvent::Notice(notice));
+                        state.apply(RuntimeEvent::MemberNotice {
+                            member: member.clone(),
+                            text: notice,
+                        });
                     }
                     if !handle.finish_attach_with_session(member, outcome.session, outcome.items) {
                         state.mark_runtime_unavailable();
@@ -363,7 +383,11 @@ fn run_loop(
 fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_view::ChatLayout>) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            if state.drawer().is_some() {
+            if state.drawer() == Some(drawers::Drawer::Agents) {
+                state.select_previous_agent();
+            } else if state.model_picker_open() {
+                state.select_previous_model();
+            } else if state.drawer().is_some() {
                 state.drawer_scroll_by(-WHEEL_SCROLL_LINES);
             } else if state.completion().is_some() {
                 for _ in 0..WHEEL_SCROLL_LINES {
@@ -374,7 +398,11 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::ScrollDown => {
-            if state.drawer().is_some() {
+            if state.drawer() == Some(drawers::Drawer::Agents) {
+                state.select_next_agent();
+            } else if state.model_picker_open() {
+                state.select_next_model();
+            } else if state.drawer().is_some() {
                 state.drawer_scroll_by(WHEEL_SCROLL_LINES);
             } else if state.completion().is_some() {
                 for _ in 0..WHEEL_SCROLL_LINES {
@@ -385,6 +413,10 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if state.drawer() == Some(drawers::Drawer::Agents) {
+                state.click_agent_row(mouse.row);
+                return;
+            }
             if state.drawer().is_some() {
                 return;
             }
@@ -424,6 +456,15 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
                 return;
             }
             if let (Some(layout), Some(selection)) = (layout, state.chat_selection()) {
+                // A press and release on the same cell is a click, not a
+                // drag. On a tool group title it folds or unfolds the group.
+                if selection.is_empty()
+                    && let Some(first) = layout.tool_group_at_line(selection.start.0)
+                {
+                    state.clear_chat_selection();
+                    state.toggle_tool_group(first);
+                    return;
+                }
                 let text = layout.selected_text(selection);
                 if text.trim().is_empty() {
                     state.clear_chat_selection();
@@ -715,8 +756,48 @@ fn attach_exit_hint() -> &'static str {
 }
 
 fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
+    handle_action_inner(action, state, handle);
+    send_pending_command(state, handle);
+}
+
+/// Send the command a selection queued without a handle in reach (an Inactive
+/// row opened from the Agents list).
+fn send_pending_command(state: &mut AppState, handle: &RuntimeHandle) {
+    if let Some(command) = state.take_pending_command() {
+        send_runtime(state, handle, command);
+    }
+}
+
+/// Ask the runtime for the saved chats, the Agents list's Inactive rows. The
+/// answer arrives as an event; a busy queue just leaves the last list in place.
+fn request_saved_chats(state: &mut AppState, handle: &RuntimeHandle) {
+    match handle.try_send(UiCommand::RequestSavedChats) {
+        RuntimeCommandSend::Sent | RuntimeCommandSend::Full => {}
+        RuntimeCommandSend::Disconnected => state.mark_runtime_unavailable(),
+    }
+}
+
+/// Open the Agents list (closing it if open) and refresh its saved chats.
+fn toggle_agents_list(state: &mut AppState, handle: &RuntimeHandle) {
+    state.toggle_drawer(drawers::Drawer::Agents);
+    if state.drawer() == Some(drawers::Drawer::Agents) {
+        request_saved_chats(state, handle);
+    }
+}
+
+fn handle_action_inner(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
     if action != Action::Interrupt {
         state.disarm_quit();
+    }
+    // The inline model selector owns the keyboard while it is open.
+    if state.model_picker_open() {
+        handle_model_picker_action(action, state, handle);
+        return;
+    }
+    // The full-screen Agents list owns the keyboard while it is open.
+    if state.drawer() == Some(drawers::Drawer::Agents) && action != Action::Interrupt {
+        handle_agents_action(action, state);
+        return;
     }
     // Reverse history search (Ctrl+R) captures input until accepted/cancelled.
     if state.in_history_search() {
@@ -754,12 +835,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state,
                 handle,
                 UiCommand::EditQueuedPrompt {
-                    member: state.last_resolvable_message_target().and_then(
-                        |target| match target {
+                    member: state
+                        .focused_message_target()
+                        .or_else(|| state.last_resolvable_message_target())
+                        .and_then(|target| match target {
                             crate::domain::event::MessageTarget::Member(id) => Some(id),
                             _ => None,
-                        },
-                    ),
+                        }),
                 },
             );
         }
@@ -768,6 +850,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 state.select_older_run();
             } else if state.header_selected().is_some() {
                 state.select_prev_member();
+            } else if state.drawer().is_none()
+                && state.completion().is_none()
+                && state.composer().is_empty()
+                && !state.members().is_empty()
+            {
+                // Nothing to move the cursor through: ← opens the agent list.
+                toggle_agents_list(state, handle);
             } else {
                 state.cursor_left();
             }
@@ -784,9 +873,7 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::Home => state.cursor_home(),
         Action::End => state.cursor_end(),
         Action::ScrollUp => {
-            if state.drawer() == Some(drawers::Drawer::Resume) {
-                state.select_previous_resume();
-            } else if state.drawer().is_some() {
+            if state.drawer().is_some() {
                 state.drawer_scroll_up();
             } else if state.completion().is_some() {
                 state.popup_up();
@@ -795,9 +882,7 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Action::ScrollDown => {
-            if state.drawer() == Some(drawers::Drawer::Resume) {
-                state.select_next_resume();
-            } else if state.drawer().is_some() {
+            if state.drawer().is_some() {
                 state.drawer_scroll_down();
             } else if state.completion().is_some() {
                 state.popup_down();
@@ -810,8 +895,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_previous_run_step() {
                     state.select_newer_run();
                 }
-            } else if state.drawer() == Some(drawers::Drawer::Resume) {
-                state.select_previous_resume();
             } else if state.drawer().is_some() {
                 state.drawer_scroll_up();
             } else if state.completion().is_some() {
@@ -826,8 +909,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_next_run_step() {
                     state.select_older_run();
                 }
-            } else if state.drawer() == Some(drawers::Drawer::Resume) {
-                state.select_next_resume();
             } else if state.drawer().is_some() {
                 state.drawer_scroll_down();
             } else if state.completion().is_some() {
@@ -845,6 +926,8 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::ToggleTools => state.toggle_tools_expansion(),
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
+        // Ctrl+X only means something inside the Agents list.
+        Action::DeleteItem => {}
         Action::Complete => {
             if state.drawer() == Some(drawers::Drawer::Runs) && state.stage_selected_run_dispatch()
             {
@@ -878,13 +961,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
         }
         Action::Submit => {
-            if state.drawer() == Some(drawers::Drawer::Resume) {
-                if let Some(command) = state.selected_resume_command() {
-                    state.close_drawer();
-                    send_runtime(state, handle, command);
-                }
-                return;
-            }
             if state.drawer() == Some(drawers::Drawer::Runs) && state.stage_selected_run_action() {
                 return;
             }
@@ -924,6 +1000,95 @@ fn abort_active_work(state: &mut AppState, handle: &RuntimeHandle) -> bool {
     true
 }
 
+/// Keys for the full-screen Agents list: typing edits the search, ↑/↓, Home/End
+/// and the page keys move the highlight, Enter or → opens the highlighted
+/// agent, ← closes (only while the search is empty), Esc clears the search and
+/// then closes. Ctrl+R renames the highlighted chat and Ctrl+X (twice) deletes
+/// a saved one. Anything else is ignored so it cannot reach the composer.
+fn handle_agents_action(action: Action, state: &mut AppState) {
+    if state.agents_rename().is_some() {
+        handle_agents_rename_action(action, state);
+        return;
+    }
+    // Only a second Ctrl+X in a row deletes; every other key disarms it.
+    if action != Action::DeleteItem {
+        state.disarm_agents_delete();
+    }
+    match action {
+        Action::InsertChar(ch) => state.agents_query_push(ch),
+        Action::Backspace => state.agents_query_pop(),
+        Action::DeleteWord => state.agents_query_delete_word(),
+        Action::ClearLine => state.agents_query_clear(),
+        Action::HistoryPrev => state.select_previous_agent(),
+        Action::HistoryNext => state.select_next_agent(),
+        Action::ScrollUp => state.select_agent_page(false),
+        Action::ScrollDown => state.select_agent_page(true),
+        Action::Home => state.select_first_agent(),
+        Action::End => state.select_last_agent(),
+        Action::Submit | Action::CursorRight => {
+            state.apply_selected_agent();
+        }
+        // Ctrl+N: start a new chat and leave the list.
+        Action::NextMember => {
+            state.queue_command_and_close(UiCommand::NewSession { prompt: None });
+        }
+        // Ctrl+R: rename the highlighted chat.
+        Action::HistorySearch => state.begin_agents_rename(),
+        // Ctrl+X: arm, then confirm, the deletion of a saved chat.
+        Action::DeleteItem => state.press_agents_delete(),
+        Action::CursorLeft if state.agents_query().is_empty() => state.close_drawer(),
+        Action::CloseOverlay => state.escape_agents(),
+        _ => {}
+    }
+}
+
+/// Keys while the Agents list's rename editor is open: typing edits the name,
+/// Enter saves it (an empty name clears it) and Esc cancels.
+fn handle_agents_rename_action(action: Action, state: &mut AppState) {
+    match action {
+        Action::InsertChar(ch) => state.agents_rename_push(ch),
+        Action::Backspace => state.agents_rename_pop(),
+        Action::DeleteWord => state.agents_rename_delete_word(),
+        Action::ClearLine => state.agents_rename_clear(),
+        Action::Submit => state.commit_agents_rename(),
+        Action::CloseOverlay => state.cancel_agents_rename(),
+        _ => {}
+    }
+}
+
+/// Keys for the inline `/model` selector: typing edits the search, ↑/↓ move,
+/// ←/→ change the effort, Enter applies, Esc (or Ctrl+C) closes. Anything
+/// else is ignored so it cannot reach the composer behind it.
+fn handle_model_picker_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
+    match action {
+        Action::InsertChar(ch) => state.model_filter_push(ch),
+        Action::Backspace => state.model_filter_pop(),
+        Action::ClearLine | Action::DeleteWord => state.model_filter_clear(),
+        Action::HistoryPrev | Action::ScrollUp => state.select_previous_model(),
+        Action::HistoryNext | Action::ScrollDown => state.select_next_model(),
+        Action::CursorLeft => state.cycle_model_effort(false),
+        Action::CursorRight => state.cycle_model_effort(true),
+        Action::Submit => {
+            let target = state.model_picker_target();
+            if let Some((command, notice)) = state.selected_model_command()
+                && send_runtime(state, handle, command)
+            {
+                state.close_model_picker();
+                state.apply(match target {
+                    Some(member) => RuntimeEvent::MemberNotice {
+                        member,
+                        text: notice,
+                    },
+                    None => RuntimeEvent::Notice(notice),
+                });
+                state.expect_model_switch_confirmation();
+            }
+        }
+        Action::CloseOverlay | Action::Interrupt => state.close_model_picker(),
+        _ => {}
+    }
+}
+
 /// Handle keys while a reverse history search (Ctrl+R) is active.
 fn handle_search_action(action: Action, state: &mut AppState) {
     match action {
@@ -941,6 +1106,16 @@ fn handle_search_action(action: Action, state: &mut AppState) {
 
 /// Capture staged and unstaged working-tree changes, including untracked files
 /// (mirrors codex's `/diff`). Returns a human-readable message on failure.
+/// A clean tree or a git failure has nothing to show in the diff panel; say
+/// so in one line instead. `None` when `diff` is a real diff.
+fn git_diff_notice(diff: &str) -> Option<String> {
+    if diff.trim().is_empty() {
+        return Some("working tree clean — no changes".to_string());
+    }
+    let is_diff = diff.contains("diff --git") || diff.contains("Untracked files:");
+    (!is_diff).then(|| diff.trim().to_string())
+}
+
 fn compute_git_diff(workspace: &str) -> String {
     const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
     const MAX_UNTRACKED_BYTES: usize = 256 * 1024;
@@ -1175,9 +1350,29 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             // `/diff` captures the live working-tree diff just before opening.
             if drawer == drawers::Drawer::Diff && state.drawer() != Some(drawers::Drawer::Diff) {
                 let diff = compute_git_diff(state.workspace());
+                if let Some(notice) = git_diff_notice(&diff) {
+                    // Nothing to review: one line, not an empty panel.
+                    state.apply(RuntimeEvent::Notice(notice));
+                    return;
+                }
                 state.set_diff(diff);
             }
-            state.toggle_drawer(drawer);
+            if drawer == drawers::Drawer::Agents {
+                toggle_agents_list(state, handle);
+            } else {
+                state.toggle_drawer(drawer);
+            }
+        }
+        Submission::ResumeList => {
+            state.record_submission(&text);
+            state.take_composer();
+            state.open_agents_on_saved_chats();
+            request_saved_chats(state, handle);
+        }
+        Submission::Model(filter) => {
+            state.record_submission(&text);
+            state.take_composer();
+            state.open_model_picker(&filter);
         }
         Submission::ApproveFirst(decision) => match state.first_pending_approval() {
             Some(id) => {
@@ -1202,37 +1397,23 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
         }
         Submission::Invalid(message) => state.apply(RuntimeEvent::Notice(message)),
         Submission::NeedsTarget => {
-            if state.active_mode() != TerminalMode::Normal {
-                let body = text.trim().to_string();
-                if send_runtime(
-                    state,
-                    handle,
-                    UiCommand::UserMessage {
-                        target: crate::domain::event::MessageTarget::Default,
-                        body: body.clone(),
-                    },
-                ) {
-                    state.record_submission(&body);
-                    state.take_composer();
-                }
-            } else if let Some((target, body)) = state.inherited_user_message(&text) {
-                if send_runtime(
-                    state,
-                    handle,
-                    UiCommand::UserMessage {
-                        target: target.clone(),
-                        body: body.clone(),
-                    },
-                ) {
-                    state.record_submission(&body);
-                    state.take_composer();
-                    state.remember_user_message_target(&target);
-                }
-            } else {
-                state.apply(RuntimeEvent::Notice(
-                    "message needs a target prefix: @member, @all, /ask, or /all (draft kept)"
-                        .to_string(),
-                ));
+            // Plain text goes to the member being viewed, or to the team's
+            // default member(s) in the "All" view. No `@member` prefix is
+            // added. Other modes always use the default target so the text
+            // starts the mode.
+            let target = plain_text_target(state);
+            let body = text.trim().to_string();
+            if send_runtime(
+                state,
+                handle,
+                UiCommand::UserMessage {
+                    target: target.clone(),
+                    body: body.clone(),
+                },
+            ) {
+                state.record_submission(&body);
+                state.take_composer();
+                state.remember_user_message_target(&target);
             }
         }
         Submission::Empty => {
@@ -1285,20 +1466,23 @@ fn paste_clipboard_image(state: &mut AppState) {
     }
 }
 
+/// Where text with no explicit target goes. In Normal mode that is the
+/// focused member; the "All" view and the other modes use the default target.
+fn plain_text_target(state: &AppState) -> crate::domain::event::MessageTarget {
+    if state.active_mode() == TerminalMode::Normal {
+        state.focused_message_target()
+    } else {
+        None
+    }
+    .unwrap_or(crate::domain::event::MessageTarget::Default)
+}
+
 fn submit_image_only(state: &mut AppState, handle: &RuntimeHandle, text: &str) {
     let (target, body) = if let Some(target) = commands::parse_target_only(text) {
         let body = image_only_user_body(&target);
         (target, body)
-    } else if state.active_mode() != TerminalMode::Normal {
-        (crate::domain::event::MessageTarget::Default, String::new())
-    } else if let Some(target) = state.last_resolvable_message_target() {
-        let body = image_only_user_body(&target);
-        (target, body)
     } else {
-        state.apply(RuntimeEvent::Notice(
-            "image needs a target prefix: @member, @all, /ask, or /all (draft kept)".to_string(),
-        ));
-        return;
+        (plain_text_target(state), String::new())
     };
     if send_runtime(
         state,
@@ -1353,11 +1537,13 @@ fn handle_approval_keys(action: Action, state: &mut AppState, handle: &RuntimeHa
         Action::InsertChar('n' | 'N') => {
             resolve_selected_approval(state, handle, ApprovalDecision::Reject)
         }
-        Action::CursorLeft => {
+        // With a single approval there is nothing to switch to, so ← stays
+        // free to open the agent list.
+        Action::CursorLeft if state.pending_approvals().len() > 1 => {
             state.select_prev_pending_approval();
             true
         }
-        Action::CursorRight => {
+        Action::CursorRight if state.pending_approvals().len() > 1 => {
             state.select_next_pending_approval();
             true
         }
@@ -1527,6 +1713,7 @@ mod tests {
             composer_area: None,
             composer_wrap: 0,
             composer_text_origin: 0,
+            tool_titles: Vec::new(),
         };
         let mut state = AppState::new(Vec::new());
         state.begin_chat_selection((0, 0));
@@ -1546,6 +1733,7 @@ mod tests {
             composer_area: None,
             composer_wrap: 0,
             composer_text_origin: 0,
+            tool_titles: Vec::new(),
         };
         let mut blank = AppState::new(Vec::new());
         blank.begin_chat_selection((0, 0));
@@ -1555,6 +1743,181 @@ mod tests {
         let mut empty = AppState::new(Vec::new());
         empty.begin_chat_selection((0, 0));
         assert_eq!(active_selection_text(&mut empty, Some(&layout)), None);
+    }
+
+    fn tool_call(member: &str, summary: &str) -> ChatItem {
+        ChatItem::Tool {
+            member: MemberId::new(member),
+            name: "Read".to_string(),
+            summary: summary.to_string(),
+            detail: String::new(),
+            ok: Some(true),
+        }
+    }
+
+    /// Two five-call groups with a long reply between them, so a short
+    /// viewport has to scroll to reach each title.
+    fn two_group_state(paragraphs: usize) -> AppState {
+        let mut chat: Vec<ChatItem> = (0..5)
+            .map(|n| tool_call("builder", &format!("a{n}.rs")))
+            .collect();
+        chat.push(ChatItem::Agent {
+            member: MemberId::new("builder"),
+            display_name: "Builder".to_string(),
+            backend: BackendKind::Codex,
+            text: (0..paragraphs)
+                .map(|n| format!("paragraph {n}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        });
+        chat.extend((0..5).map(|n| tool_call("builder", &format!("b{n}.rs"))));
+        AppState::new(chat)
+    }
+
+    fn paint(
+        terminal: &mut Terminal<ratatui::backend::TestBackend>,
+        state: &AppState,
+    ) -> chat_view::ChatLayout {
+        let mut layout = None;
+        terminal
+            .draw(|frame| layout = chat_view::render(frame, state))
+            .unwrap();
+        layout.expect("chat layout")
+    }
+
+    /// Screen `(column, row)` of the tool title that opens group `key`.
+    fn title_cell(layout: &chat_view::ChatLayout, key: usize) -> Option<(u16, u16)> {
+        let (line, _) = layout.tool_titles.iter().find(|(_, group)| *group == key)?;
+        Some((
+            layout.area.x + 6,
+            layout.area.y + (line - layout.first_line) as u16,
+        ))
+    }
+
+    fn click(state: &mut AppState, layout: &chat_view::ChatLayout, cell: (u16, u16)) {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: cell.0,
+                    row: cell.1,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                state,
+                Some(layout),
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_a_tool_title_toggles_that_group_only() {
+        let mut state = two_group_state(2);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let cell = title_cell(&layout, 0).expect("first title on screen");
+
+        click(&mut state, &layout, cell);
+        assert!(state.tool_group_expanded(0));
+        assert!(!state.tool_group_expanded(6));
+        assert_eq!(state.chat_selection(), None);
+
+        let layout = paint(&mut terminal, &state);
+        let view = format!("{}", terminal.backend());
+        assert!(view.contains("▾ ⚒ tools"), "{view}");
+        assert!(view.contains("a3.rs"), "{view}");
+
+        let cell = title_cell(&layout, 0).expect("expanded title");
+        click(&mut state, &layout, cell);
+        assert!(!state.tool_group_expanded(0));
+        assert!(!state.tool_group_expanded(6));
+    }
+
+    #[test]
+    fn a_tool_title_click_still_lands_after_scrolling() {
+        let mut state = two_group_state(10);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
+        let bottom = paint(&mut terminal, &state);
+        assert!(
+            title_cell(&bottom, 0).is_none(),
+            "the first title starts above the viewport"
+        );
+
+        state.scroll_by(bottom.total_lines as i32);
+        let top = paint(&mut terminal, &state);
+        let first = title_cell(&top, 0).expect("first title after scrolling up");
+        click(&mut state, &top, first);
+        assert!(state.tool_group_expanded(0));
+
+        // Scroll back down by a few rows; the second title keeps working.
+        state.clamp_scroll(top.max_scroll());
+        let mut seen = None;
+        for back in (0..=top.max_scroll()).rev() {
+            state.reset_scroll();
+            state.scroll_by(back as i32);
+            let layout = paint(&mut terminal, &state);
+            if let Some(cell) = title_cell(&layout, 6) {
+                seen = Some((layout, cell));
+                break;
+            }
+        }
+        let (layout, cell) = seen.expect("second title scrolls into view");
+        click(&mut state, &layout, cell);
+        assert!(state.tool_group_expanded(6));
+        assert!(state.tool_group_expanded(0), "the first group stays open");
+    }
+
+    #[test]
+    fn dragging_across_a_tool_title_selects_text_instead_of_toggling() {
+        let mut state = two_group_state(2);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let (column, row) = title_cell(&layout, 0).expect("first title");
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), column),
+            (MouseEventKind::Drag(MouseButton::Left), column + 8),
+        ] {
+            handle_mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                &mut state,
+                Some(&layout),
+            );
+        }
+        assert!(
+            state
+                .chat_selection()
+                .is_some_and(|selection| !selection.is_empty())
+        );
+        // Releasing copies the text and leaves the group folded.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: column + 8,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &mut state,
+            Some(&layout),
+        );
+        assert!(!state.tool_group_expanded(0));
+    }
+
+    #[test]
+    fn a_click_on_other_chat_text_does_not_toggle_a_group() {
+        let mut state = two_group_state(2);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let (column, row) = title_cell(&layout, 0).expect("first title");
+        click(&mut state, &layout, (column, row.saturating_sub(1)));
+        assert!(!state.tool_group_expanded(0));
+        assert!(!state.tool_group_expanded(6));
     }
 
     #[test]
@@ -1855,6 +2218,7 @@ mod tests {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             }],
         });
         state.insert_text("@Builder /attach");
@@ -1910,6 +2274,7 @@ mod tests {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             }],
         });
         state.insert_text("@builder /not-a-native-command");
@@ -1919,7 +2284,7 @@ mod tests {
         assert_eq!(state.composer().text(), "@builder /not-a-native-command");
         assert!(matches!(
             state.chat().last(),
-            Some(ChatItem::Notice { text }) if text.contains("not a discovered prompt-invocable skill")
+            Some(ChatItem::Notice { text, .. }) if text.contains("not a discovered prompt-invocable skill")
         ));
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
@@ -1950,7 +2315,7 @@ mod tests {
         assert_eq!(state.composer().text(), "/retry");
         assert!(matches!(
             state.chat().last(),
-            Some(ChatItem::Notice { text }) if text.contains("queue is busy")
+            Some(ChatItem::Notice { text, .. }) if text.contains("queue is busy")
         ));
 
         assert_eq!(
@@ -1973,20 +2338,21 @@ mod tests {
             None,
         );
         let mut state = AppState::new(vec![ChatItem::Notice {
+            member: None,
             text: "existing chat".to_string(),
         }]);
         state.apply(RuntimeEvent::ModeChanged {
             mode: TerminalMode::Plan,
         });
-        state.insert_text("/new accidental");
+        state.insert_text("/clear accidental");
 
         submit(&mut state, &handle);
 
         assert_eq!(state.active_mode(), TerminalMode::Plan);
-        assert_eq!(state.composer().text(), "/new accidental");
+        assert_eq!(state.composer().text(), "/clear accidental");
         assert!(matches!(
             state.chat().last(),
-            Some(ChatItem::Notice { text }) if text.contains("does not accept arguments")
+            Some(ChatItem::Notice { text, .. }) if text == "Usage: /clear"
         ));
 
         handle.send(UiCommand::Shutdown);
@@ -2114,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn untargeted_text_keeps_the_draft() {
+    fn untargeted_text_needs_no_prefix() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
             TeamConfig::new("test", "/tmp/ws"),
@@ -2132,11 +2498,13 @@ mod tests {
 
         submit(&mut state, &handle);
 
-        assert_eq!(state.composer().text(), "build the parser");
-        assert!(state.chat().iter().any(|item| matches!(
+        assert!(state.composer().is_empty());
+        assert!(!state.chat().iter().any(|item| matches!(
             item,
-            ChatItem::Notice { text } if text.contains("draft kept")
+            ChatItem::Notice { text, .. } if text.contains("draft kept")
         )));
+        state.history_prev();
+        assert_eq!(state.composer().text(), "build the parser");
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
@@ -2168,7 +2536,7 @@ mod tests {
         assert_eq!(state.active_mode(), TerminalMode::Review);
         assert!(!state.chat().iter().any(|item| matches!(
             item,
-            ChatItem::Notice { text } if text.contains("draft kept")
+            ChatItem::Notice { text, .. } if text.contains("draft kept")
         )));
 
         handle.send(UiCommand::Shutdown);
@@ -2188,6 +2556,7 @@ mod tests {
             None,
         );
         let mut state = AppState::new(vec![ChatItem::Notice {
+            member: None,
             text: "existing chat".to_string(),
         }]);
 
@@ -2240,8 +2609,100 @@ mod tests {
         let _ = join.join();
     }
 
+    /// Type `line` into a fresh state and press Enter once.
+    fn enter_once(line: &str) -> AppState {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: None,
+            runs: Vec::new(),
+            members: vec![crate::domain::event::MemberSummary {
+                id: crate::domain::team::MemberId::new("main"),
+                display_name: "Main".to_string(),
+                backend: BackendKind::Codex,
+                role: "general".to_string(),
+                status: crate::domain::event::MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: crate::domain::team::SandboxPolicy::ReadOnly,
+                permission_mode: None,
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
+                session_policy: crate::domain::team::SessionPolicy::Resume,
+                parent: None,
+            }],
+        });
+        state.insert_text(line);
+        handle_action(Action::Submit, &mut state, &handle);
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+        state
+    }
+
     #[test]
-    fn untargeted_text_reuses_previous_target() {
+    fn one_enter_submits_a_complete_command_line() {
+        // An argument that exactly matches its only candidate is complete.
+        let state = enter_once("/mode review");
+        assert!(state.composer().is_empty(), "/mode review stayed typed");
+
+        let state = enter_once("/mode team");
+        assert!(state.composer().is_empty(), "/mode team stayed typed");
+
+        let state = enter_once("/logs main");
+        assert!(state.composer().is_empty(), "/logs main stayed typed");
+        assert_eq!(
+            state.drawer(),
+            Some(Drawer::MemberLogs(crate::domain::team::MemberId::new(
+                "main"
+            )))
+        );
+
+        // A free-form argument has nothing to complete.
+        let state = enter_once("/model gpt");
+        assert!(state.composer().is_empty(), "/model gpt stayed typed");
+        assert!(state.model_picker_open());
+    }
+
+    #[test]
+    fn enter_still_completes_a_strict_prefix_of_the_candidate() {
+        let state = enter_once("/mode rev");
+        assert_eq!(state.composer().text(), "/mode review ");
+
+        let state = enter_once("/logs ma");
+        assert_eq!(state.composer().text(), "/logs main ");
+    }
+
+    #[test]
+    fn an_empty_or_failed_diff_is_a_notice_not_a_panel() {
+        assert_eq!(
+            git_diff_notice("  \n").as_deref(),
+            Some("working tree clean — no changes")
+        );
+        assert_eq!(
+            git_diff_notice("not a git repository (or git is unavailable)").as_deref(),
+            Some("not a git repository (or git is unavailable)")
+        );
+        assert_eq!(git_diff_notice("diff --git a/x b/x\n+hi\n"), None);
+        assert_eq!(git_diff_notice("\nUntracked files:\n  new.rs\n"), None);
+    }
+
+    #[test]
+    fn untargeted_text_goes_to_the_viewed_member() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
             TeamConfig::new("test", "/tmp/ws"),
@@ -2275,6 +2736,7 @@ mod tests {
                 permission_mode: None,
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: crate::domain::team::SessionPolicy::Resume,
+                parent: None,
             }],
         });
 
@@ -2289,21 +2751,21 @@ mod tests {
 
         assert!(state.composer().is_empty());
         assert_eq!(
-            state.inherited_user_message("one more"),
-            Some((
-                crate::domain::event::MessageTarget::Member(crate::domain::team::MemberId::new(
-                    "builder"
-                )),
-                "@builder one more".to_string()
+            state.last_resolvable_message_target(),
+            Some(crate::domain::event::MessageTarget::Member(
+                crate::domain::team::MemberId::new("builder")
             ))
         );
+        // History keeps what was typed; no routing prefix is added.
+        state.history_prev();
+        assert_eq!(state.composer().text(), "now add tests");
 
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
     }
 
     #[test]
-    fn new_session_clears_inherited_target() {
+    fn plain_text_after_a_new_session_goes_to_the_default_target() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
             TeamConfig::new("test", "/tmp/ws"),
@@ -2337,6 +2799,7 @@ mod tests {
                 permission_mode: None,
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: crate::domain::team::SessionPolicy::Resume,
+                parent: None,
             }],
         });
 
@@ -2349,15 +2812,18 @@ mod tests {
         }
         submit(&mut state, &handle);
         state.apply(RuntimeEvent::SessionReset);
+        state.set_focus(None);
         for ch in "now add tests".chars() {
             state.insert_char(ch);
         }
         submit(&mut state, &handle);
 
-        assert_eq!(state.composer().text(), "now add tests");
-        assert!(state.chat().iter().any(|item| matches!(
+        // No target prefix is required any more: the "All" view sends to the
+        // team's default member(s).
+        assert!(state.composer().is_empty());
+        assert!(!state.chat().iter().any(|item| matches!(
             item,
-            ChatItem::Notice { text } if text.contains("draft kept")
+            ChatItem::Notice { text, .. } if text.contains("draft kept")
         )));
 
         handle.send(UiCommand::Shutdown);
@@ -2550,7 +3016,28 @@ mod tests {
             runs: Vec::new(),
             members: Vec::new(),
         });
+        // With no run there is no panel to open (just a notice).
         state.toggle_drawer(Drawer::Runs);
+        assert_eq!(state.drawer(), None);
+        state.apply(RuntimeEvent::RunUpdated {
+            run: RunSummary {
+                id: RunId(1),
+                number: 0,
+                goal: "ship parser".to_string(),
+                status: RunStatus::Done,
+                coordinator: None,
+                verification: None,
+                created_at: "2026-08-09 10:00:00".to_string(),
+                updated_at: "2026-08-09 10:00:00".to_string(),
+                attempt: 1,
+                events: Vec::new(),
+                steps: Vec::new(),
+                mode: None,
+                legacy_mode: None,
+            },
+        });
+        state.toggle_drawer(Drawer::Runs);
+        assert_eq!(state.drawer(), Some(Drawer::Runs));
 
         assert!(!state.runs_detail());
         handle_action(Action::InsertChar('x'), &mut state, &handle);
@@ -2592,5 +3079,800 @@ mod tests {
             other => panic!("expected user message, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn focus_test_state(approvals: usize) -> AppState {
+        let member = |id: &str, name: &str, backend| crate::domain::event::MemberSummary {
+            id: MemberId::new(id),
+            display_name: name.to_string(),
+            backend,
+            role: "role".to_string(),
+            status: MemberStatus::Idle,
+            session: None,
+            cwd: String::new(),
+            model: None,
+            effort: None,
+            sandbox: SandboxPolicy::WorkspaceWrite,
+            permission_mode: None,
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
+            session_policy: SessionPolicy::Resume,
+            parent: None,
+        };
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            modes: Default::default(),
+            mode_overrides: Default::default(),
+            suggested_verify: None,
+            team: "mixed".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member("builder", "Builder", BackendKind::Codex),
+                member("reviewer", "Reviewer", BackendKind::Claude),
+            ],
+        });
+        for id in 0..approvals {
+            state.apply(RuntimeEvent::ApprovalRequested {
+                id: crate::domain::event::ApprovalId(id as u64 + 1),
+                member: Some(MemberId::new("builder")),
+                action: "shell".to_string(),
+                body: "cargo test".to_string(),
+            });
+        }
+        state
+    }
+
+    /// The event receiver must outlive the test, or the runtime stops.
+    fn focus_test_runtime() -> (
+        RuntimeHandle,
+        thread::JoinHandle<()>,
+        mpsc::Receiver<RuntimeEvent>,
+    ) {
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        (handle, join, evt_rx)
+    }
+
+    #[test]
+    fn left_on_an_empty_composer_opens_the_agents_list() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+
+        handle_action(Action::CursorLeft, &mut state, &handle);
+
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        assert_eq!(
+            state.selected_agent(),
+            Some(crate::tui::app_state::AgentChoice::Member(MemberId::new(
+                "builder"
+            )))
+        );
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn left_with_text_moves_the_cursor_instead() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.insert_text("abc");
+
+        handle_action(Action::CursorLeft, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.composer().cursor(), 2);
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn left_with_a_selected_header_member_keeps_cycling_members() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.select_next_member();
+
+        handle_action(Action::CursorLeft, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.header_selected(), Some(1));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn left_still_switches_between_several_pending_approvals() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(2);
+
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+
+        let mut single = focus_test_state(1);
+        handle_action(Action::CursorLeft, &mut single, &handle);
+        assert_eq!(single.drawer(), Some(Drawer::Agents));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn agents_list_keys_choose_focus_and_close() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        handle_action(Action::HistoryNext, &mut state, &handle);
+        handle_action(Action::CursorRight, &mut state, &handle);
+        assert_eq!(state.focus(), Some(&MemberId::new("reviewer")));
+        assert_eq!(state.drawer(), None);
+
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        handle_action(Action::HistoryPrev, &mut state, &handle);
+        handle_action(Action::HistoryPrev, &mut state, &handle);
+        handle_action(Action::Submit, &mut state, &handle);
+        assert_eq!(state.focus(), None);
+        assert_eq!(state.drawer(), None);
+
+        // ← closes the list without changing the focus; so does Esc.
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        handle_action(Action::HistoryNext, &mut state, &handle);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.focus(), None);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+        assert_eq!(state.focus(), None);
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn untargeted_text_goes_to_the_focused_member_without_a_prefix() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.set_focus(Some(MemberId::new("reviewer")));
+
+        state.insert_text("  look at the parser ");
+        submit(&mut state, &handle);
+
+        assert!(state.composer().is_empty());
+        assert_eq!(
+            state.last_resolvable_message_target(),
+            Some(crate::domain::event::MessageTarget::Member(MemberId::new(
+                "reviewer"
+            )))
+        );
+        state.history_prev();
+        assert_eq!(state.composer().text(), "look at the parser");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn untargeted_text_in_the_all_view_uses_the_default_target() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.set_focus(None);
+
+        state.insert_text("hello team");
+        submit(&mut state, &handle);
+
+        assert!(state.composer().is_empty());
+        assert!(!state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::Notice { text, .. } if text.contains("target")
+        )));
+        // Default never becomes a remembered target.
+        assert_eq!(state.last_resolvable_message_target(), None);
+        state.history_prev();
+        assert_eq!(state.composer().text(), "hello team");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn plain_text_target_follows_focus_and_mode() {
+        let mut state = focus_test_state(0);
+        assert_eq!(
+            plain_text_target(&state),
+            crate::domain::event::MessageTarget::Member(MemberId::new("builder"))
+        );
+        state.set_focus(None);
+        assert_eq!(
+            plain_text_target(&state),
+            crate::domain::event::MessageTarget::Default
+        );
+        state.set_focus(Some(MemberId::new("reviewer")));
+        state.apply(RuntimeEvent::ModeChanged {
+            mode: TerminalMode::Plan,
+        });
+        assert_eq!(
+            plain_text_target(&state),
+            crate::domain::event::MessageTarget::Default
+        );
+    }
+
+    #[test]
+    fn image_only_send_follows_the_focus() {
+        let dir = std::env::temp_dir().join(format!("asterline-focus-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.set_focus(Some(MemberId::new("reviewer")));
+        let image = crate::adapter::prompt_images::PromptImage::from_path(&path).unwrap();
+        state.attach_pending_image(image).unwrap();
+
+        submit_image_only(&mut state, &handle, "");
+
+        assert!(state.composer().is_empty());
+        assert_eq!(
+            state.last_resolvable_message_target(),
+            Some(crate::domain::event::MessageTarget::Member(MemberId::new(
+                "reviewer"
+            )))
+        );
+        // No "@reviewer" body was recorded in the prompt history.
+        state.history_prev();
+        assert_eq!(state.composer().text(), "");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_left_edits_the_focused_members_queue() {
+        let (handle, join, events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.set_focus(Some(MemberId::new("reviewer")));
+
+        handle_action(Action::EditQueued, &mut state, &handle);
+
+        // The runtime has no such member, so it reports it by name.
+        let seen = std::iter::from_fn(|| events.recv_timeout(Duration::from_secs(5)).ok())
+            .take(8)
+            .any(|event| match event {
+                RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. } => {
+                    text.contains("reviewer")
+                }
+                _ => false,
+            });
+        assert!(seen, "EditQueued must name the focused member");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn explicit_prefix_overrides_the_focus() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        assert_eq!(state.focus(), Some(&MemberId::new("builder")));
+
+        state.insert_text("@reviewer check");
+        submit(&mut state, &handle);
+
+        assert_eq!(
+            state.last_resolvable_message_target(),
+            Some(crate::domain::event::MessageTarget::Member(MemberId::new(
+                "reviewer"
+            )))
+        );
+        assert_eq!(state.focus(), Some(&MemberId::new("builder")));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    /// Wait for the first runtime event `pick` accepts.
+    fn wait_for_event<T>(
+        events: &mpsc::Receiver<RuntimeEvent>,
+        pick: impl Fn(&RuntimeEvent) -> Option<T>,
+    ) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = events
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("the expected runtime event; saw {seen:?}"));
+            if let Some(found) = pick(&event) {
+                return found;
+            }
+            seen.push(event);
+        }
+    }
+
+    #[test]
+    fn opening_the_agents_list_asks_for_the_saved_chats() {
+        let (handle, join, events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SavedChats { .. }).then_some(())
+        });
+
+        // `/agents` and `/resume` ask too; closing and reopening asks again.
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        state.insert_text("/agents");
+        submit(&mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SavedChats { .. }).then_some(())
+        });
+
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        state.insert_text("/resume");
+        submit(&mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SavedChats { .. }).then_some(())
+        });
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn ctrl_n_in_the_agents_list_starts_a_new_chat_and_closes_the_list() {
+        let (handle, join, events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        handle_action(Action::NextMember, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SessionReset).then_some(())
+        });
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    fn saved_chat_row(id: i64, name: Option<&str>) -> crate::domain::event::ConversationSummary {
+        crate::domain::event::ConversationSummary {
+            id,
+            created_at: "2026-03-10 11:00:00".to_string(),
+            updated_at: "2026-03-10 11:00:00".to_string(),
+            preview: "a saved question".to_string(),
+            name: name.map(str::to_string),
+            message_count: 1,
+            member_count: 1,
+            main_backend: Some(BackendKind::Codex),
+            main_model: None,
+            main_effort: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_x_twice_deletes_a_saved_chat_and_any_other_key_disarms() {
+        let (handle, join, events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SavedChats { .. }).then_some(())
+        });
+        state.apply(RuntimeEvent::SavedChats {
+            conversations: vec![saved_chat_row(77, None)],
+        });
+        handle_action(Action::End, &mut state, &handle);
+        assert!(state.agents_can_delete());
+
+        // Arm, disarm by another key, arm again: nothing is sent yet.
+        handle_action(Action::DeleteItem, &mut state, &handle);
+        assert!(state.agents_delete_armed());
+        handle_action(Action::HistoryPrev, &mut state, &handle);
+        handle_action(Action::End, &mut state, &handle);
+        assert!(!state.agents_delete_armed());
+        handle_action(Action::DeleteItem, &mut state, &handle);
+        handle_action(Action::Backspace, &mut state, &handle);
+        assert!(!state.agents_delete_armed());
+        // (Backspace on an empty search re-selects the viewed agent.)
+        handle_action(Action::End, &mut state, &handle);
+
+        // Two presses in a row send the delete; the runtime answers with a
+        // refreshed list (chat 77 never existed, so also says so).
+        handle_action(Action::DeleteItem, &mut state, &handle);
+        assert!(state.agents_delete_armed());
+        handle_action(Action::DeleteItem, &mut state, &handle);
+        assert!(!state.agents_delete_armed());
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SavedChats { conversations } if conversations.is_empty())
+                .then_some(())
+        });
+        // The composer was never touched and the list is still open.
+        assert!(state.composer().is_empty());
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn ctrl_r_in_the_agents_list_renames_with_enter_and_cancels_with_esc() {
+        let (handle, join, events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SavedChats { .. }).then_some(())
+        });
+        state.apply(RuntimeEvent::SavedChats {
+            conversations: vec![saved_chat_row(77, Some("Old"))],
+        });
+        handle_action(Action::End, &mut state, &handle);
+
+        handle_action(Action::HistorySearch, &mut state, &handle);
+        assert_eq!(state.agents_rename(), Some("Old"));
+        // Typing edits the name, not the search or the composer.
+        handle_action(Action::InsertChar('!'), &mut state, &handle);
+        assert_eq!(state.agents_rename(), Some("Old!"));
+        assert_eq!(state.agents_query(), "");
+        assert!(state.composer().is_empty());
+        // Esc cancels only the editor; the list stays.
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        assert_eq!(state.agents_rename(), None);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        handle_action(Action::HistorySearch, &mut state, &handle);
+        handle_action(Action::ClearLine, &mut state, &handle);
+        handle_action(Action::Submit, &mut state, &handle);
+        assert_eq!(state.agents_rename(), None);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::Notice(text) if text.contains("no longer available"))
+                .then_some(())
+        });
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn enter_on_an_inactive_row_resumes_that_chat() {
+        let (evt_tx, events) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws").with_member(TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+            )),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = focus_test_state(0);
+        // Make a saved chat for real: say something (the member has no
+        // runner, so the turn ends at once), then start another chat.
+        state.insert_text("remember this question");
+        submit(&mut state, &handle);
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::TurnFinished { .. }).then_some(())
+        });
+        handle.send(UiCommand::NewSession { prompt: None });
+        wait_for_event(&events, |event| {
+            matches!(event, RuntimeEvent::SessionReset).then_some(())
+        });
+        state.apply(RuntimeEvent::SessionReset);
+
+        state.insert_text("/resume");
+        submit(&mut state, &handle);
+        let chats = wait_for_event(&events, |event| match event {
+            RuntimeEvent::SavedChats { conversations } => Some(conversations.clone()),
+            _ => None,
+        });
+        state.apply(RuntimeEvent::SavedChats {
+            conversations: chats.clone(),
+        });
+        assert_eq!(chats.len(), 1);
+        assert_eq!(
+            state.selected_agent(),
+            Some(crate::tui::app_state::AgentChoice::Saved(chats[0].id))
+        );
+
+        handle_action(Action::Submit, &mut state, &handle);
+
+        assert_eq!(state.drawer(), None);
+        wait_for_event(&events, |event| {
+            matches!(
+                event,
+                RuntimeEvent::ConversationResumed { conversation, .. }
+                    if *conversation == chats[0].id
+            )
+            .then_some(())
+        });
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn agents_list_owns_the_keyboard_and_esc_clears_the_search_first() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        // Typing goes to the search, never the composer.
+        for ch in "rev".chars() {
+            handle_action(Action::InsertChar(ch), &mut state, &handle);
+        }
+        assert_eq!(state.agents_query(), "rev");
+        assert!(state.composer().is_empty());
+        handle_action(Action::Backspace, &mut state, &handle);
+        assert_eq!(state.agents_query(), "re");
+        // Unrelated actions cannot open overlays behind the list.
+        handle_action(Action::TogglePalette, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        // ← does not close while a query is typed.
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        assert_eq!(state.agents_query(), "re");
+
+        // Esc clears the query first, then closes.
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        assert_eq!(state.agents_query(), "");
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+
+        // With an empty query ← closes, and a reopened list starts clean.
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn agents_list_keys_move_the_highlight_and_open_the_match() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+
+        handle_action(Action::End, &mut state, &handle);
+        assert_eq!(state.agents_selected(), 2);
+        handle_action(Action::Home, &mut state, &handle);
+        assert_eq!(state.agents_selected(), 0);
+        state.note_drawer_viewport(10);
+        handle_action(Action::ScrollDown, &mut state, &handle);
+        assert_eq!(state.agents_selected(), 2);
+        handle_action(Action::ScrollUp, &mut state, &handle);
+        assert_eq!(state.agents_selected(), 0);
+
+        // The best match is highlighted as the query changes; Enter opens it.
+        for ch in "rev".chars() {
+            handle_action(Action::InsertChar(ch), &mut state, &handle);
+        }
+        handle_action(Action::Submit, &mut state, &handle);
+        assert_eq!(state.focus(), Some(&MemberId::new("reviewer")));
+        assert_eq!(state.drawer(), None);
+
+        // Enter with no match keeps the list open.
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        handle_action(Action::InsertChar('z'), &mut state, &handle);
+        handle_action(Action::InsertChar('z'), &mut state, &handle);
+        handle_action(Action::Submit, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn agents_list_takes_mouse_clicks_and_wheel_steps() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = chat_view::render(frame, &state);
+            })
+            .unwrap();
+        let rows: Vec<String> = {
+            let buffer = terminal.backend().buffer();
+            (0..30u16)
+                .map(|y| {
+                    (0..100u16)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect()
+                })
+                .collect()
+        };
+        let reviewer = rows
+            .iter()
+            .position(|row| row.contains("Reviewer"))
+            .unwrap();
+
+        // The wheel steps the highlight; it never scrolls the hidden chat.
+        let wheel = |state: &mut AppState, kind| {
+            handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 5,
+                    row: 5,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                state,
+                None,
+            )
+        };
+        wheel(&mut state, MouseEventKind::ScrollUp);
+        assert_eq!(state.agents_selected(), 0);
+        wheel(&mut state, MouseEventKind::ScrollDown);
+        assert_eq!(state.agents_selected(), 1);
+
+        // A click on a row opens it; a click elsewhere does nothing.
+        let click = |state: &mut AppState, row: u16| {
+            handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 10,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                state,
+                None,
+            )
+        };
+        click(&mut state, 0);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        click(&mut state, reviewer as u16);
+        assert_eq!(state.focus(), Some(&MemberId::new("reviewer")));
+        assert_eq!(state.drawer(), None);
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn agents_command_opens_the_list() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.insert_text("/agents");
+
+        submit(&mut state, &handle);
+
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+        assert!(state.composer().is_empty());
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn model_command_opens_the_selector_with_the_search_prefilled() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.set_focus(Some(MemberId::new("reviewer")));
+        state.insert_text("/model opus");
+
+        submit(&mut state, &handle);
+
+        assert!(state.model_picker_open());
+        assert!(state.composer().is_empty());
+        assert_eq!(state.drawer(), None);
+        let view = state.model_picker_view().unwrap();
+        assert_eq!(view.target, "Reviewer");
+        assert_eq!(view.filter, "opus");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn selector_owns_the_keyboard_while_open() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.open_model_picker("");
+
+        // ← changes the effort instead of opening the Agents list.
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+        // Typing goes to the search box, not the composer.
+        handle_action(Action::InsertChar('c'), &mut state, &handle);
+        handle_action(Action::InsertChar('x'), &mut state, &handle);
+        assert!(state.composer().is_empty());
+        assert_eq!(state.model_picker_view().unwrap().filter, "cx");
+        handle_action(Action::Backspace, &mut state, &handle);
+        assert_eq!(state.model_picker_view().unwrap().filter, "c");
+        // Other actions cannot reach the composer or open overlays.
+        handle_action(Action::TogglePalette, &mut state, &handle);
+        assert_eq!(state.drawer(), None);
+
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+        assert!(!state.model_picker_open());
+        // With it closed, ← opens the Agents list again.
+        handle_action(Action::CursorLeft, &mut state, &handle);
+        assert_eq!(state.drawer(), Some(Drawer::Agents));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn enter_applies_the_selection_and_records_a_notice() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.set_focus(Some(MemberId::new("reviewer")));
+        state.seed_installed_models(BackendKind::Claude, vec!["opus".into()]);
+        state.open_model_picker("");
+
+        handle_action(Action::Submit, &mut state, &handle);
+
+        assert!(!state.model_picker_open());
+        assert!(state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::Notice { text, member: Some(member) }
+                if text == "Model: Reviewer → claude · opus" && member.as_str() == "reviewer"
+        )));
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn mouse_wheel_moves_the_selector_selection() {
+        let mut state = focus_test_state(0);
+        state.seed_installed_models(BackendKind::Codex, vec!["gpt-a".into(), "gpt-b".into()]);
+        state.open_model_picker("");
+        let before = state.model_picker_view().unwrap().selected_row;
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &mut state,
+            None,
+        );
+
+        assert_ne!(state.model_picker_view().unwrap().selected_row, before);
+        assert_eq!(state.scroll(), 0);
+    }
+
+    #[test]
+    fn one_enter_on_a_typed_model_command_opens_the_selector() {
+        let (handle, join, _events) = focus_test_runtime();
+        let mut state = focus_test_state(0);
+        state.insert_text("/model");
+        assert!(state.completion().is_some());
+
+        handle_action(Action::Submit, &mut state, &handle);
+
+        assert!(state.model_picker_open());
+        assert!(state.composer().is_empty());
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
     }
 }

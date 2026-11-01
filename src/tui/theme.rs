@@ -32,6 +32,13 @@ struct Palette {
     text: Color,
     emphasis: Color,
     user: Color,
+    /// Background band behind the user's messages: barely off the terminal
+    /// background, like prime-agent's `userMessageBg`.
+    user_band: Color,
+    /// Quieter than `muted`: placeholders, ages and hints that should recede.
+    dim: Color,
+    /// Full-width band behind the selected row of a list view.
+    selection_bg: Color,
     selection_text: Color,
     chat_selection_bg: Color,
     chat_selection_fg: Color,
@@ -52,6 +59,9 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             text: Color::Rgb(212, 212, 216),
             emphasis: Color::Rgb(250, 250, 250),
             user: Color::Rgb(134, 239, 172),
+            user_band: Color::Rgb(48, 48, 48),
+            dim: Color::Rgb(113, 113, 122),
+            selection_bg: Color::Rgb(58, 58, 66),
             selection_text: Color::Black,
             chat_selection_bg: Color::Rgb(63, 63, 70),
             chat_selection_fg: Color::Rgb(244, 244, 245),
@@ -65,6 +75,9 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             text: Color::Rgb(63, 63, 70),
             emphasis: Color::Rgb(24, 24, 27),
             user: Color::Rgb(22, 101, 52),
+            user_band: Color::Rgb(232, 232, 232),
+            dim: Color::Rgb(113, 113, 122),
+            selection_bg: Color::Rgb(220, 220, 228),
             selection_text: Color::White,
             chat_selection_bg: Color::Rgb(212, 212, 216),
             chat_selection_fg: Color::Rgb(24, 24, 27),
@@ -102,6 +115,25 @@ pub fn emphasis_color() -> Color {
 
 pub fn user_color() -> Color {
     palette().user
+}
+
+/// Background of the full-width band behind a user message.
+pub fn user_band_bg() -> Color {
+    palette().user_band
+}
+
+/// Background of the selected row in a full-screen list: a subtle neutral
+/// that stays distinct from `user_band_bg`.
+pub fn selection_bg() -> Color {
+    palette().selection_bg
+}
+
+pub fn dim_color() -> Color {
+    palette().dim
+}
+
+pub fn dim() -> Style {
+    Style::default().fg(dim_color())
 }
 
 pub fn text() -> Style {
@@ -356,6 +388,29 @@ pub fn status_color(status: MemberStatus) -> Color {
     }
 }
 
+/// Style of a member's status dot where the dot's brightness is the signal:
+/// an active (queued, running or waiting) member is lit in the brightest text
+/// colour, bold; an idle member is the same dot in the dim colour. A member
+/// that needs approval is yellow and a failed one red.
+pub fn member_dot_style(status: MemberStatus) -> Style {
+    match status {
+        MemberStatus::Queued | MemberStatus::Running | MemberStatus::Waiting => dot_lit(),
+        MemberStatus::Idle => dot_dark(),
+        MemberStatus::NeedsApproval => Style::default().fg(warning_color()),
+        MemberStatus::Failed => Style::default().fg(error_color()),
+    }
+}
+
+/// A lit status dot: brightest text colour, bold.
+pub fn dot_lit() -> Style {
+    emphasis().add_modifier(Modifier::BOLD)
+}
+
+/// A dark status dot: the dim colour.
+pub fn dot_dark() -> Style {
+    dim()
+}
+
 pub fn status_label(status: MemberStatus) -> &'static str {
     match status {
         MemberStatus::Idle => "idle",
@@ -436,6 +491,22 @@ pub fn clip_width(text: &str, max: usize) -> String {
     out
 }
 
+/// Truncate from the left to at most `max` display columns, putting `…` first
+/// when the text was cut, so the tail (a path's project folder) stays visible.
+pub fn clip_width_start(text: &str, max: usize) -> String {
+    let max = max.max(1);
+    let total = display_width(text);
+    if total <= max {
+        return text.to_string();
+    }
+    let mut tail = slice_display_cols(text, total - (max - 1), total);
+    // A wide character straddling the cut can leave the tail a column long.
+    while display_width(&tail) > max - 1 {
+        tail.remove(0);
+    }
+    format!("…{tail}")
+}
+
 /// Truncate then right-pad with spaces to exactly `width` display columns.
 pub fn pad_width(text: &str, width: usize) -> String {
     let mut out = clip_width(text, width);
@@ -498,6 +569,44 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::UNDERLINED)
         );
+    }
+
+    #[test]
+    fn user_band_is_a_neutral_grey_that_keeps_the_text_readable() {
+        fn channels(color: Color) -> (u8, u8, u8) {
+            match color {
+                Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("expected an RGB colour, got {other:?}"),
+            }
+        }
+        fn luminance(color: Color) -> f64 {
+            let (r, g, b) = channels(color);
+            let lin = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.03928 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        }
+        fn contrast(a: Color, b: Color) -> f64 {
+            let (hi, lo) = (
+                luminance(a).max(luminance(b)),
+                luminance(a).min(luminance(b)),
+            );
+            (hi + 0.05) / (lo + 0.05)
+        }
+
+        let dark = palette_for(ThemeVariant::Dark);
+        let light = palette_for(ThemeVariant::Light);
+        assert_eq!(channels(dark.user_band), (48, 48, 48));
+        assert_eq!(channels(light.user_band), (232, 232, 232));
+        // Clearly lighter than a #1e1e1e terminal; the text stays readable.
+        assert!(luminance(dark.user_band) > luminance(Color::Rgb(30, 30, 30)) * 1.5);
+        assert!(contrast(dark.emphasis, dark.user_band) > 7.0);
+        assert!(contrast(light.emphasis, light.user_band) > 7.0);
     }
 
     #[test]

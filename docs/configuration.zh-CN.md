@@ -10,9 +10,14 @@
 启动时，Asterline 按下列顺序选择 roster：
 
 1. `--team <PATH>` 加载指定 JSON 文件。
-2. 除非设置 `--pick-team`，否则复用 `<workspace>/.asterline/team.json`。
-3. 在 `PATH` 检测受支持后端可执行文件，并打开 Team builder。
+2. 若 `<workspace>/.asterline/team.json` 存在则复用。
+3. 否则在 `PATH` 检测受支持后端可执行文件，并直接进入聊天：只有一个通用的 `main` Agent，
+   使用找到的第一个 CLI（Codex、Claude、Grok、Agy 的顺序），模型用该 CLI 自己的默认值，
+   权限用其默认预设，并把 roster 保存到 `team.json`。
 4. 若没有已保存团队且没有受支持可执行文件，启动会显示设置提示后停止。
+
+没有设置界面。用 `/model` 修改当前查看的 Agent 的模型，选择会被保存。隐藏的 `--pick-team`
+参数会忽略已保存的 roster，从第 3 步重新开始。
 
 用 `/team` 修改正在运行的 roster。Asterline 在启动时一次性加载已安装 Agent CLI 与它们的
 模型目录；之后打开 `/team` 会复用缓存。同一次查询也会读取非 Codex CLI 的本地权限默认值
@@ -129,13 +134,28 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
 Plan 的 `builder` 和 `reviewer` 外，省略的角色字段会从成员 role 和 `default_target` 推导（Review 的
 builder ≈ 默认目标或第一位非 reviewer；reviewer ≈ role 含 `review`；leader ≈ role 含
 `plan` 或 `lead`，否则为第一位 participant；participants = 完整 roster）。Plan 的
-`builder` 是必填项且不会自动推导。`reviewer` 可省略，省略后可执行 checklist 会直接交给
+`builder` 默认就是 leader（先做计划再自己执行 checklist）。`reviewer` 可省略，省略后可执行 checklist 会直接交给
 Builder。`auto_execute` 默认 `true`；设为 `false` 时，最终 checklist 会等待 `/approve` 后才派给
 Builder。预算默认值为：`max_iterations = 3`、`generation_rounds = 3`、
 `ideas_per_round = 4`、`auto_execute = true`。Brainstorm 至少要求两位
 不同的已解析 participant；重复 ID 或同一成员同时以 ID 和显示名引用都会被拒绝。
 `/mode` 面板里 `s` 选择当前模式并应用其 pending 覆盖，`w` 把当前模式的本对话覆盖写入
 `team.json`。
+
+只有 `main` 一个成员时每种模式照样能跑。某个角色没有合适的、不同于别人的顶层成员，
+且没有显式绑定时，运行开始时 Asterline 会在 `main` 名下开一个[子 Agent](#子-agent)，名字就是角色名，
+CLI、模型、强度与 `main` 相同，同一对话里的下一次运行复用它（所以你用 `/model` 给它换过的模型会保留）：
+
+- Review：reviewer 没有不同的成员时，开一个 `reviewer` 子 Agent。
+- Plan：leader（默认 `main`）同时担任 builder，不需要子 Agent。
+- Brainstorm：未设置 `participants` 时所有顶层成员参加。只有一个成员时补足到
+  `participant_count`（默认 3），补的是 `ideator-1`、`ideator-2`……；成员已经更多时按现有名册，
+  除非 `participant_count` 要求更多。显式的 `participants` 原样使用，忽略 `participant_count`。
+- Team：`main` 是协调者，可按需 `@@spawn`；不为它自动开子 Agent。
+
+名字已被其他成员占用时顺延到下一个空后缀（`reviewer-2`）。子 Agent 计入每个对话 8 个的上限；
+运行需要的名额不够时整个运行不启动，并给出说明。显式绑定始终优先（把 `reviewer` 绑成和 builder
+同一人仍会被拒绝）。
 
 Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向每位 participant 展示轮转的
 匿名同伴样本，用于构建、合并、变异和延展想法。早期贡献留在已持久化的 idea set 中。
@@ -145,10 +165,11 @@ Brainstorm 将发散与收敛分开。第一轮收集独立种子；后续轮向
 
 | 字段 | 模式 | 含义 |
 | --- | --- | --- |
-| `builder` | review/plan | Review 中实现更改的成员；Plan 中必填，负责执行最终 checklist |
+| `builder` | review/plan | Review 中实现更改的成员；Plan 中负责执行最终 checklist（默认是 leader） |
 | `reviewer` | review/plan | 发出 `@@review` verdict；Plan 中可选，仅审核 checklist |
 | `leader` | plan | 编写并修订 checklist 的成员 |
-| `participants` | brainstorm | 所有生成轮的 roster |
+| `participants` | brainstorm | 所有生成轮的 roster（默认全部成员） |
+| `participant_count` | brainstorm | 未设置 `participants` 时的参与人数：2–9，只有一个成员时默认 3；不足的部分开子 Agent |
 | `generation_rounds` | brainstorm | 种子/构建/延展轮预算（默认 3，最少 2） |
 | `ideas_per_round` | brainstorm | 每位成员/每轮固定输出的 idea card（默认 4，最少 3）。多出来的卡片会被丢掉。 |
 | `coordinator` | team | 协调整个团队 Run 的成员 |
@@ -285,7 +306,7 @@ cache。没有配置模型或启用 gateway discovery 时，它有意不虚构 C
 Agy 本地 `~/.gemini/antigravity-cli/settings.json` 的 `model` 值常是人类可读标签而非 CLI ID。
 Asterline 将它与 `agy models` 返回的 ID/label 对匹配，再将该配置模型显示为启动默认值。
 
-首次运行的 Team builder 也会立即加载每个已安装 CLI 的目录；`/team` 复用 `ast` 启动时加载
+启动时会立即加载每个已安装 CLI 的目录；`/model` 与 `/team` 复用 `ast` 启动时加载
 一次的目录。Agent 字段列出四个支持的 CLI，包含安装状态和发现的 model/effort 摘要，并禁用缺失
 CLI。打开成员的 `model` 字段即可浏览已在加载的目录。输入可按显示名、model ID 或 description
 过滤，使用 `↑` / `↓` 选择模型。只有所选模型明确报告 effort 设置时才显示 `←` / `→`；
@@ -343,7 +364,7 @@ checklist、timeline 和验证结果。
 `Esc` 并等待取消。`--no-restore` 跳过启动 replay，不删除数据。`--db <PATH>` 将数据库移出
 workspace。
 
-`/resume` 打开已保存聊天的 picker。恢复聊天也会恢复该聊天所属的 roster、完整成员配置和
+`/resume` 打开 Agents 列表并停在已保存的聊天（**Inactive** 分组）上；`/new <prompt>` 开新对话并发送该提示。恢复聊天也会恢复该聊天所属的 roster、完整成员配置和
 每位成员的原生后端 session ID。
 
 ## 终端颜色主题
@@ -405,7 +426,43 @@ Agent 可请求缺失的专长：
 
 Asterline 校验重复 ID 与名称、启动 runner、保存 roster 并广播更新团队。未写
 `sandbox` / `permission_mode` 时用该后端的写入默认（Agy：`accept-edits`，沙箱
-off）。Agent envelope 可以添加成员但不能删除；删除仍然是 `/team` 操作。
+off）。Agent envelope 可以添加成员但不能删除；删除仍然是 `/team` 操作。短期帮手更适合用
+[`@@spawn`](#子-agent)，它不会改动 `team.json`。
+
+### 子 Agent
+
+顶层成员（`normal` 或 `team` 模式下）可以为旁支任务开一个子 Agent，例如独立评审或
+可并行的工作：
+
+```text
+@@spawn {"name":"reviewer","task":"Review the diff and list real bugs.","backend":"claude","model":"opus","effort":"high","role":"review"}
+```
+
+`name` 和 `task` 必填。省略的 `backend`、`model`、`effort` 与开它的成员相同；换了
+`backend` 就用该后端的默认权限，同一后端则沿用父成员的权限。子 Agent 的 id 是
+name 转小写（空格变 `-`），显示名是 name 中每个以 `-`/`_` 分隔的部分首字母大写的形式（`reviewer` 显示为
+`Reviewer`，`test-writer` 显示为 `Test-Writer`，按名字路由时不区分大小写），`task` 会作为父成员发来的消息交给它。它完成一轮针对父成员
+的任务后，最终回复会自动作为交接消息送回父成员；若该轮失败或没有文字，父成员收到
+一行说明。你自己发给子 Agent 的消息（在 Agents 列表里用 `←` 打开它）只回复给你。
+父成员可以再用同名 `@@spawn` 或 `@@team_message` 给已有子 Agent 派活。
+
+子 Agent 应按职责命名（`reviewer`、`test-writer`、`researcher`），不要用模型或 CLI
+的名字：Agents 列表本来就显示模型，而且 `/model` 之后模型名会过时。如果 name 只是
+后端名（`codex`、`claude`、`grok`、`agy`）或模型用词（如 `gpt-6.1-sol` 对应的
+`sol`、`opus`、`gpt-6-1-sol`），Asterline 会改用 `helper`（已占用则依次 `helper-2`、
+`helper-3`……），并只向父成员说明一次实际名字。带职责的名字（如 `opus-reviewer`）
+会保留；已属于该父成员的子 Agent 的名字仍然会路由到它。
+
+限制：每个对话最多 8 个子 Agent，子 Agent 不能再开子 Agent。`/mode team` 里沿用
+`allow_add_members` 的限制；review、plan、brainstorm 运行不接受 `@@spawn`。被拒绝
+的请求会显示通知，并给父成员发一条简短说明；交接和拒绝说明都和其他自动转交一样
+计入 `max_auto_relays`。
+
+子 Agent 只属于当前对话：不会写入 `.asterline/team.json`（`/model` 或 `/team` 修改
+之后也一样），随对话一起保存，所以 `/resume` 和正常重启都会连同会话一起恢复，
+`/new` 会移除它们。对正在查看的子 Agent 用 `/model` 只会改它自己。`/team` 编辑器
+只列顶层成员；删掉某个父成员时，它的子 Agent 一并删除。成员字段 `parent` 标记子
+Agent，只写入对话快照。
 
 ### Run checklist 更新
 
@@ -425,8 +482,7 @@ off）。Agent envelope 可以添加成员但不能删除；删除仍然是 `/te
 
 | 参数 | 描述 |
 | --- | --- |
-| `--team <PATH>` | 加载 JSON 团队并跳过 builder |
-| `--pick-team` | 忽略已保存 roster 并打开 builder |
+| `--team <PATH>` | 加载 JSON 团队，而不是已保存的团队 |
 | `--workspace <PATH>` | 设置 workspace；默认当前目录 |
 | `--db <PATH>` | 设置 SQLite 数据库路径 |
 | `--no-restore` | 启动时不 replay 已持久化聊天 |
@@ -440,7 +496,6 @@ off）。Agent envelope 可以添加成员但不能删除；删除仍然是 `/te
 
 ```bash
 asterline --workspace ~/code/api
-asterline --pick-team
 asterline --team ./team.json --db ~/.local/share/asterline/api.sqlite3
 asterline --fake --no-restore
 ```
@@ -459,7 +514,7 @@ asterline --fake --no-restore
 
 ### 打开了错误 roster
 
-运行 `asterline --pick-team` 重建保存的 roster，或使用 `/team` 后按 `s` 应用更改。
+编辑 `.asterline/team.json`，用 `/model` 修改模型，或使用 `/team` 后按 `s` 应用 roster 更改。删除 `team.json` 后下次启动会重新从默认的 `main` Agent 开始。
 
 ### 不加载之前的 transcript 启动
 

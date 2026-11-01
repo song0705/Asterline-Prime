@@ -2,7 +2,7 @@
 //! [`AppState::apply`]; the renderer reads it and the key handler mutates the
 //! composer / drawer / scroll. No state is inferred from matching strings.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -16,7 +16,7 @@ use crate::adapter::parser::{append_bounded_text, bounded_text, summarize};
 use crate::adapter::prompt_images::{
     MAX_IMAGE_BYTES, MAX_PROMPT_IMAGES, PromptImage, image_placeholder, mime_from_bytes,
 };
-use crate::domain::config::{DetectedBackends, detect_backends};
+use crate::domain::config::{DetectedBackends, MAIN_MEMBER_ID, detect_backends};
 use crate::domain::event::{
     AgentSessionId, ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId,
     MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
@@ -27,21 +27,20 @@ use crate::domain::team::{
     SandboxPolicy, SessionPolicy, TeamMember,
 };
 
+use crate::runtime::context_recap::NOT_CARRIED_OVER;
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, AgentSkill, Completion};
 
-const RESUME_LIST_HEADER_LINES: usize = 2;
-const RESUME_CHOICE_LINES: usize = 3;
-
-fn resume_choice_line(index: usize) -> usize {
-    RESUME_LIST_HEADER_LINES + index.saturating_mul(RESUME_CHOICE_LINES)
-}
 use crate::tui::composer::{Composer, MAX_COMPOSER_BYTES};
 use crate::tui::drawers::Drawer;
 use crate::tui::mode_editor::{ModeEditor, ModeEditorOutcome};
+use crate::tui::model_picker::{
+    self, ModelEntry, ModelKey, ModelPicker, PickerRow, PickerRowView, PickerView,
+};
 use crate::tui::skills::SkillInfo;
-use crate::tui::team_builder::ModelCatalog;
+use crate::tui::team_builder::{CatalogView, ModelCatalog};
 use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
+use crate::tui::tool_display;
 use uuid::Uuid;
 
 const MAX_LOGS: usize = 4_000;
@@ -148,6 +147,105 @@ pub struct MemberView {
     pub permission_mode: Option<PermissionMode>,
     pub approvals_reviewer: CodexApprovalsReviewer,
     pub session_policy: SessionPolicy,
+    /// The member that opened this sub-agent; `None` for top-level members.
+    pub parent: Option<MemberId>,
+}
+
+/// One selectable choice in the Agents drawer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentChoice {
+    /// The interleaved view of every member.
+    All,
+    Member(MemberId),
+    /// A saved chat (an Inactive row), by conversation id.
+    Saved(i64),
+}
+
+/// The Agents list's rename editor: which chat it renames (`None` is the
+/// current chat) and the text typed so far.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentsRename {
+    conversation: Option<i64>,
+    text: String,
+}
+
+/// One row of the Agents list: the "All" choice, a member at a nesting
+/// depth (0 for a top-level member, 1 for a sub-agent under its parent), or a
+/// saved chat. Members are indexes into `members()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRow {
+    All,
+    Member {
+        index: usize,
+        depth: usize,
+    },
+    /// A saved chat: an index into `saved_chats()`.
+    Saved {
+        index: usize,
+    },
+}
+
+/// How a focused member's window shows one chat item. `/find` uses the same
+/// rule, so it only matches what is on screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FocusRow {
+    /// Rendered exactly as in the "All" view.
+    Full,
+    Hidden,
+}
+
+pub(crate) fn focus_row(state: &AppState, item: &ChatItem) -> FocusRow {
+    let Some(focus) = state.focus() else {
+        return FocusRow::Full;
+    };
+    let own = |member: &MemberId| {
+        if member == focus {
+            FocusRow::Full
+        } else {
+            FocusRow::Hidden
+        }
+    };
+    match item {
+        ChatItem::Agent { member, .. }
+        | ChatItem::Thinking { member, .. }
+        | ChatItem::Tool { member, .. }
+        | ChatItem::Diff { member, .. }
+        | ChatItem::Verdict { member, .. } => own(member),
+        ChatItem::Error { member, .. } => member.as_ref().map_or(FocusRow::Full, own),
+        // A notice about one member belongs to that member's window; a
+        // general one (mode change, `/new`, team update) shows everywhere.
+        ChatItem::Notice { member, .. } => member.as_ref().map_or(FocusRow::Full, own),
+        ChatItem::User { targets, .. } => {
+            // Legacy rows have no recorded targets; keep them visible. A
+            // prompt sent to someone else is not part of this conversation.
+            if targets.is_empty() || targets.contains(focus) {
+                FocusRow::Full
+            } else {
+                FocusRow::Hidden
+            }
+        }
+        // An agent-to-agent row is shown to the member it leaves or reaches.
+        ChatItem::Route { from, to, .. } => {
+            if from == focus || route_reaches(state, focus, to) {
+                FocusRow::Full
+            } else {
+                FocusRow::Hidden
+            }
+        }
+        // The parent sees that it opened a sub-agent; the sub-agent's own
+        // window starts at the task it received.
+        ChatItem::Spawn { parent, .. } => own(parent),
+    }
+}
+
+/// A route names its recipients by id or display name, or `all`.
+fn route_reaches(state: &AppState, member: &MemberId, to: &[String]) -> bool {
+    let display = state.member_display(member);
+    to.iter().any(|name| {
+        name.eq_ignore_ascii_case("all")
+            || name.eq_ignore_ascii_case(member.as_str())
+            || name.eq_ignore_ascii_case(&display)
+    })
 }
 
 /// A pending approval awaiting a decision.
@@ -224,6 +322,9 @@ pub struct AppState {
     drawer: Option<Drawer>,
     scroll: usize,
     chat_page_rows: usize,
+    /// Wrap width of the composer text as last drawn; Up/Down move by these
+    /// wrapped rows. `usize::MAX` (nothing drawn yet) moves by logical line.
+    composer_wrap: usize,
     popup_selected: usize,
     popup_dismissed: bool,
     should_quit: bool,
@@ -232,12 +333,44 @@ pub struct AppState {
     thinking_expanded: bool,
     diffs_expanded: bool,
     tools_expanded: bool,
+    /// Long tool groups the user opened with a click, keyed by the chat index
+    /// of the group's first item. Ctrl+O (`tools_expanded`) overrides it.
+    expanded_tool_groups: HashSet<usize>,
+    /// Bumps on every change to `expanded_tool_groups`, for the paint cache.
+    tool_groups_revision: u64,
     active_reasoning: HashMap<MemberId, String>,
     reasoning_buffers: HashMap<MemberId, String>,
     /// Legacy/imported thinking cells that still need an elapsed-time closeout.
     open_thinking: HashMap<MemberId, usize>,
     thinking_started: HashMap<MemberId, Instant>,
     last_message_target: Option<MessageTarget>,
+    /// Member whose conversation fills the main window; `None` is the
+    /// interleaved "All" view. Not persisted.
+    focus: Option<MemberId>,
+    /// True once the focus holds a deliberate value (the roster default or a
+    /// user pick, including "All"), so a repeated `Ready` keeps it.
+    focus_initialized: bool,
+    /// Highlighted Agents row, kept by identity: rows reorder as member
+    /// statuses change while the drawer is open.
+    agents_choice: AgentChoice,
+    /// Position `agents_choice` last had, used if that member leaves the
+    /// roster.
+    agents_fallback: usize,
+    /// Search text typed into the Agents list; empty shows every agent in
+    /// status sections.
+    agents_query: String,
+    /// The saved chat whose deletion Ctrl+X armed (a second Ctrl+X on the same
+    /// row deletes it; any other key disarms).
+    agents_delete_armed: Option<i64>,
+    /// The rename editor that replaces the search line (Ctrl+R).
+    agents_rename: Option<AgentsRename>,
+    /// The name of the chat being viewed, if it has one.
+    chat_name: Option<String>,
+    /// Screen rows of the Agents list's selectable entries, noted by the last
+    /// paint so a mouse click can find its row.
+    agents_click_rows: RefCell<Vec<(u16, AgentChoice)>>,
+    /// When each member last finished a reply, for the Agents list's age.
+    last_reply_at: HashMap<MemberId, Instant>,
     header_selected: Option<usize>,
     attach_pending: Option<MemberId>,
     attach_request: Option<AttachRequest>,
@@ -260,9 +393,10 @@ pub struct AppState {
     find: Option<FindState>,
     /// Vertical scroll offset for the open drawer (logs / team / diff).
     drawer_scroll: usize,
-    /// Last painted drawer body height. Resume selection uses it so we only
-    /// scroll when the highlighted chat would leave the viewport.
+    /// Last painted list height; the Agents list pages by it.
     drawer_viewport: Cell<usize>,
+    /// Furthest the open drawer can scroll, noted by the renderer.
+    drawer_max_scroll: Cell<usize>,
     /// Captured working-tree diff text for the diff drawer (`/diff`).
     diff_text: Option<String>,
     /// Editable draft shown by the `/team` drawer.
@@ -273,6 +407,12 @@ pub struct AppState {
     /// transient editor borrows it by ownership while open, then returns it on
     /// close so reopening `/team` does not rerun CLI discovery every time.
     model_catalog: ModelCatalog,
+    /// Installed backends, known once the startup check finishes.
+    detected_backends: Option<DetectedBackends>,
+    /// The inline `/model` selector, while open.
+    model_picker: Option<ModelPicker>,
+    /// A `/model` roster change is in flight; see `Notice` handling.
+    model_switch_pending: bool,
     /// Backend availability is checked asynchronously at startup so every
     /// installed CLI's workspace catalog can warm without blocking the TUI.
     model_catalog_detection: Option<Receiver<DetectedBackends>>,
@@ -281,8 +421,18 @@ pub struct AppState {
     /// changes.
     model_catalog_warmed: bool,
     skills: Vec<SkillInfo>,
-    resume_choices: Vec<ConversationSummary>,
-    selected_resume: usize,
+    /// Saved (not live) chats, newest first: the Agents list's Inactive rows.
+    /// Refreshed by the runtime each time the list opens.
+    saved_chats: Vec<ConversationSummary>,
+    /// `/resume` opened the Agents list and the saved chats may still be on
+    /// their way: highlight the first one when they arrive, unless the user
+    /// has moved the highlight by then.
+    agents_select_inactive: bool,
+    /// A command raised by a selection that has no handle to send it (an
+    /// Inactive row opened by Enter or a click); the key loop sends it.
+    pending_command: Option<UiCommand>,
+    /// Test clock for the Agents list's relative ages (Unix seconds).
+    clock_override: Option<i64>,
     /// Drag-select range in flattened chat-line coordinates, if any.
     chat_selection: Option<ChatSelection>,
     composer_dragging: bool,
@@ -336,6 +486,7 @@ impl AppState {
             drawer: None,
             scroll: 0,
             chat_page_rows: 10,
+            composer_wrap: usize::MAX,
             popup_selected: 0,
             popup_dismissed: false,
             should_quit: false,
@@ -344,11 +495,23 @@ impl AppState {
             thinking_expanded: false,
             diffs_expanded: true,
             tools_expanded: false,
+            expanded_tool_groups: HashSet::new(),
+            tool_groups_revision: 0,
             active_reasoning: HashMap::new(),
             reasoning_buffers: HashMap::new(),
             open_thinking: HashMap::new(),
             thinking_started: HashMap::new(),
             last_message_target: None,
+            focus: None,
+            focus_initialized: false,
+            agents_choice: AgentChoice::All,
+            agents_fallback: 0,
+            agents_query: String::new(),
+            agents_delete_armed: None,
+            agents_rename: None,
+            chat_name: None,
+            agents_click_rows: RefCell::new(Vec::new()),
+            last_reply_at: HashMap::new(),
             header_selected: None,
             attach_pending: None,
             attach_request: None,
@@ -361,15 +524,21 @@ impl AppState {
             find: None,
             drawer_scroll: 0,
             drawer_viewport: Cell::new(0),
+            drawer_max_scroll: Cell::new(0),
             diff_text: None,
-            team_editor: None,
             mode_editor: None,
+            team_editor: None,
             model_catalog: ModelCatalog::default(),
+            detected_backends: None,
+            model_picker: None,
+            model_switch_pending: false,
             model_catalog_detection: None,
             model_catalog_warmed: false,
             skills: Vec::new(),
-            resume_choices: Vec::new(),
-            selected_resume: 0,
+            saved_chats: Vec::new(),
+            agents_select_inactive: false,
+            pending_command: None,
+            clock_override: None,
             chat_selection: None,
             composer_dragging: false,
             queued_prompts: HashMap::new(),
@@ -431,11 +600,14 @@ impl AppState {
                         permission_mode: m.permission_mode,
                         approvals_reviewer: m.approvals_reviewer,
                         session_policy: m.session_policy,
+                        parent: m.parent,
                     })
                     .collect();
                 let member_ids: std::collections::HashSet<MemberId> =
                     self.members.iter().map(|m| m.id.clone()).collect();
                 self.running_since
+                    .retain(|member, _| member_ids.contains(member));
+                self.last_reply_at
                     .retain(|member, _| member_ids.contains(member));
                 for member in &self.members {
                     if member_status_is_active(member.status) {
@@ -451,6 +623,7 @@ impl AppState {
                 {
                     self.header_selected = self.members.len().checked_sub(1);
                 }
+                self.sync_focus_with_roster();
                 if self.drawer == Some(Drawer::Team) {
                     self.open_team_editor();
                 }
@@ -571,6 +744,8 @@ impl AppState {
             RuntimeEvent::MessageCompleted { msg, text } => {
                 if let Some(cell) = self.message_index.remove(&msg) {
                     self.close_thinking(&cell.member);
+                    self.last_reply_at
+                        .insert(cell.member.clone(), Instant::now());
                     let streamed = cell.index.and_then(|idx| match self.chat.get(idx) {
                         Some(ChatItem::Agent { text, member, .. })
                             if member == &cell.member && !text.is_empty() =>
@@ -742,6 +917,17 @@ impl AppState {
             RuntimeEvent::Route { from, to, body, .. } => {
                 self.push(ChatItem::Route { from, to, body });
             }
+            RuntimeEvent::SubAgentSpawned {
+                parent,
+                child,
+                summary,
+            } => {
+                self.push(ChatItem::Spawn {
+                    parent,
+                    child,
+                    summary,
+                });
+            }
             RuntimeEvent::FileChange { member, files, ok } => {
                 self.push(ChatItem::Diff { member, files, ok });
             }
@@ -766,6 +952,7 @@ impl AppState {
             } => {
                 self.paused_routes = queued;
                 self.push(ChatItem::Notice {
+                    member: None,
                     text: format!(
                         "route paused {from} → {}: {reason} (queued {queued}; /retry to resume)",
                         to.join(", ")
@@ -784,6 +971,7 @@ impl AppState {
                 let expected = self.attach_pending.take();
                 if expected.as_ref() != Some(&member) {
                     self.push(ChatItem::Notice {
+                        member: None,
                         text: format!("could not attach: unexpected grant for member {member}"),
                     });
                     self.attach_release_pending = Some(member);
@@ -803,6 +991,7 @@ impl AppState {
                     })
                 else {
                     self.push(ChatItem::Notice {
+                        member: None,
                         text: format!("could not attach: runtime granted unknown member {member}"),
                     });
                     self.attach_release_pending = Some(member);
@@ -828,6 +1017,7 @@ impl AppState {
                     self.attach_pending = None;
                 }
                 self.push(ChatItem::Notice {
+                    member: Some(member.clone()),
                     text: format!("could not attach to {member}: {reason}"),
                 });
             }
@@ -851,6 +1041,7 @@ impl AppState {
                 self.pending_approvals.retain(|a| a.id != id);
                 self.clamp_selected_approval();
                 self.push(ChatItem::Notice {
+                    member: None,
                     text: format!("approval {}", decision.as_str()),
                 });
             }
@@ -884,9 +1075,30 @@ impl AppState {
             RuntimeEvent::Log(entry) => {
                 self.push_log(entry);
             }
+            RuntimeEvent::MemberNotice { member, text } => {
+                if !self.should_skip_notice(&text, Some(&member)) {
+                    self.push(ChatItem::Notice {
+                        text,
+                        member: Some(member),
+                    });
+                }
+            }
             RuntimeEvent::Notice(text) => {
-                if !self.should_skip_notice(&text) {
-                    self.push(ChatItem::Notice { text });
+                // `/model` records its own `Model: …` row, so the runtime's
+                // generic roster confirmation for that one change is noise.
+                // Any other notice (say, a rejection) ends the wait.
+                let from_model_switch = std::mem::take(&mut self.model_switch_pending);
+                if from_model_switch && text.starts_with("team updated:") {
+                    // The runtime adds the suffix to its confirmation when
+                    // the switch left part of the conversation behind; show
+                    // it on the `Model: …` row the user just saw.
+                    if text.ends_with(NOT_CARRIED_OVER) {
+                        self.mark_last_model_notice_truncated();
+                    }
+                    return;
+                }
+                if !self.should_skip_notice(&text, None) {
+                    self.push(ChatItem::Notice { text, member: None });
                 }
             }
             RuntimeEvent::SessionReset => {
@@ -895,7 +1107,12 @@ impl AppState {
                 // the previous conversation and remain reachable via /resume.
                 self.active_mode = TerminalMode::Normal;
                 self.mode_editor = None;
+                self.saved_chats.clear();
+                self.chat_name = None;
+                self.agents_delete_armed = None;
+                self.agents_rename = None;
                 self.chat.clear();
+                self.clear_tool_group_expansion();
                 self.touch_chat();
                 self.message_index.clear();
                 self.tool_index.clear();
@@ -926,16 +1143,24 @@ impl AppState {
                     member.status = MemberStatus::Idle;
                 }
             }
-            RuntimeEvent::ResumeChoices { conversations } => {
-                self.resume_choices = conversations;
-                self.selected_resume = 0;
-                self.drawer = Some(Drawer::Resume);
-                self.drawer_scroll = 0;
-                self.stash_team_editor_catalog();
+            RuntimeEvent::ConversationRenamed { name } => {
+                self.chat_name = name.filter(|name| !name.trim().is_empty());
+            }
+            RuntimeEvent::SavedChats { conversations } => {
+                self.saved_chats = conversations;
+                if self.agents_select_inactive && self.drawer == Some(Drawer::Agents) {
+                    self.select_first_inactive();
+                }
             }
             RuntimeEvent::ConversationResumed { chat, .. } => {
+                // The chat being viewed changed, so the saved list is stale.
+                self.saved_chats.clear();
+                self.chat_name = None;
+                self.agents_delete_armed = None;
+                self.agents_rename = None;
                 self.chat = chat;
                 trim_initial_chat(&mut self.chat);
+                self.clear_tool_group_expansion();
                 self.touch_chat();
                 self.message_index.clear();
                 self.tool_index.clear();
@@ -960,11 +1185,14 @@ impl AppState {
         }
     }
 
-    fn should_skip_notice(&self, text: &str) -> bool {
+    fn should_skip_notice(&self, text: &str, member: Option<&MemberId>) -> bool {
         for item in self.chat.iter().rev() {
             match item {
-                ChatItem::Notice { text: last } => {
-                    return notices_are_redundant(last, text);
+                ChatItem::Notice {
+                    text: last,
+                    member: last_member,
+                } => {
+                    return last_member.as_ref() == member && notices_are_redundant(last, text);
                 }
                 ChatItem::Agent { text, .. } if text.trim().is_empty() => {}
                 _ => return false,
@@ -1310,15 +1538,6 @@ impl AppState {
         self.remember_message_target(target);
     }
 
-    pub fn inherited_user_message(&self, text: &str) -> Option<(MessageTarget, String)> {
-        let target = self.last_resolvable_message_target()?;
-        let body = text.trim();
-        if body.is_empty() {
-            return None;
-        }
-        Some((target.clone(), format_inherited_user_body(&target, body)))
-    }
-
     pub fn last_resolvable_message_target(&self) -> Option<MessageTarget> {
         let target = self.last_message_target.clone()?;
         if self.resolve_local_targets(&target).is_empty() {
@@ -1455,21 +1674,6 @@ impl AppState {
         &self.members
     }
 
-    /// A live member's effective model label. Model discovery is deliberately
-    /// display-only: it must not pin a CLI default into team.json, but the
-    /// activity line should still show the model and effort the CLI reported
-    /// instead of two misleading `default` placeholders.
-    pub(crate) fn member_runtime_profile(&self, view: &MemberView) -> String {
-        let member = self.view_to_member(view);
-        let workspace = PathBuf::from(&self.workspace);
-        let model = self
-            .team_editor
-            .as_ref()
-            .map(|editor| editor.model_catalog().model_label(&member, &workspace))
-            .unwrap_or_else(|| self.model_catalog.model_label(&member, &workspace));
-        format!("model: {model}")
-    }
-
     pub fn chat(&self) -> &[ChatItem] {
         &self.chat
     }
@@ -1595,6 +1799,11 @@ impl AppState {
 
     pub fn set_chat_page_rows(&mut self, rows: usize) {
         self.chat_page_rows = rows.max(1);
+    }
+    /// Record the composer's drawn wrap width so cursor movement follows the
+    /// same wrapped rows as the screen.
+    pub fn set_composer_wrap(&mut self, width: usize) {
+        self.composer_wrap = width.max(1);
     }
     pub fn composer(&self) -> &Composer {
         &self.composer
@@ -1739,6 +1948,7 @@ impl AppState {
         self.disarm_quit();
         if !self.runtime_available {
             self.push(ChatItem::Notice {
+                member: None,
                 text: "Cannot attach because the runtime has stopped.".to_string(),
             });
             self.header_selected = None;
@@ -1746,13 +1956,14 @@ impl AppState {
         }
         if self.attach_pending.is_some() || self.attach_request.is_some() {
             self.push(ChatItem::Notice {
+                member: None,
                 text: "An attach request is already pending.".to_string(),
             });
             self.header_selected = None;
             return None;
         }
         if self.has_cancelable_work() {
-            self.push(ChatItem::Notice {
+            self.push(ChatItem::Notice { member: None,
                 text: "Cannot attach while member work, verification, routing, or approval is active — press Esc to cancel it or resolve it first."
                     .to_string(),
             });
@@ -1779,6 +1990,7 @@ impl AppState {
             .or_else(|| self.attach_request.take().map(|request| request.member));
         if let Some(member) = &member {
             self.push(ChatItem::Notice {
+                member: Some(member.clone()),
                 text: format!("cancelled attach request for {member}"),
             });
         }
@@ -1963,7 +2175,10 @@ impl AppState {
             match result.and_then(|image| self.attach_pending_image(image)) {
                 Ok(()) => {}
                 Err(err) => {
-                    self.push(ChatItem::Notice { text: err });
+                    self.push(ChatItem::Notice {
+                        member: None,
+                        text: err,
+                    });
                 }
             }
             return;
@@ -1987,10 +2202,11 @@ impl AppState {
         if !fully_inserted
             && !matches!(
                 self.chat.last(),
-                Some(ChatItem::Notice { text }) if text == COMPOSER_INPUT_TRUNCATED
+                Some(ChatItem::Notice { text, .. }) if text == COMPOSER_INPUT_TRUNCATED
             )
         {
             self.push(ChatItem::Notice {
+                member: None,
                 text: COMPOSER_INPUT_TRUNCATED.to_string(),
             });
         }
@@ -2009,7 +2225,7 @@ impl AppState {
     /// already on the first line (so the caller recalls history instead).
     pub fn composer_up(&mut self) -> bool {
         self.disarm_quit();
-        let moved = self.composer.up();
+        let moved = self.composer.up(self.composer_wrap);
         self.snap_cursor_around_image(None);
         moved
     }
@@ -2017,7 +2233,7 @@ impl AppState {
     /// already on the last line.
     pub fn composer_down(&mut self) -> bool {
         self.disarm_quit();
-        let moved = self.composer.down();
+        let moved = self.composer.down(self.composer_wrap);
         self.snap_cursor_around_image(None);
         moved
     }
@@ -2129,8 +2345,25 @@ impl AppState {
             return false;
         };
         self.disarm_quit();
+        // A command already typed in full (and needing no argument) has
+        // nothing left to complete: let Enter submit it.
+        let typed: String = self
+            .composer
+            .head()
+            .chars()
+            .skip(completion.token_start)
+            .collect();
+        if completion::command_is_complete(&typed) {
+            return false;
+        }
         let index = self.popup_selected.min(completion.items.len() - 1);
         let insert = completion.items[index].insert.clone();
+        // An argument that already spells the highlighted candidate exactly
+        // (`/mode review`, `/logs main`) is a complete line: Enter submits it.
+        // Enter accepts a completion only for a strict prefix of the candidate.
+        if completion.token_start > 0 && typed.eq_ignore_ascii_case(insert.trim_end()) {
+            return false;
+        }
         let before = self.composer.text();
         self.composer.replace_token(completion.token_start, &insert);
         self.reconcile_pending_images();
@@ -2333,14 +2566,7 @@ impl AppState {
             self.find = None;
             return;
         }
-        let needle = query.to_lowercase();
-        let matches: Vec<usize> = self
-            .chat
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| chat_item_search_text(item).to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect();
+        let matches = self.find_matches(query);
         let current = matches.len().saturating_sub(1);
         self.find = Some(FindState {
             query: query.to_string(),
@@ -2350,6 +2576,25 @@ impl AppState {
         if let Some(idx) = self.find_current_chat_index() {
             self.scroll_to_chat_item(idx);
         }
+    }
+
+    /// Chat indices whose text contains `query`, limited to items the current
+    /// focus renders so n/p never jump to a hidden row.
+    fn find_matches(&self, query: &str) -> Vec<usize> {
+        let needle = query.to_lowercase();
+        self.chat
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| focus_row(self, item) != FocusRow::Hidden)
+            .filter(|(_, item)| {
+                let text = match item {
+                    ChatItem::User { body, targets, .. } => self.displayed_user_body(body, targets),
+                    _ => chat_item_search_text(item),
+                };
+                text.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     pub fn find_next(&mut self) {
@@ -2402,10 +2647,43 @@ impl AppState {
         if idx >= self.chat.len() {
             return;
         }
-        self.scroll = self.chat[idx.saturating_add(1)..]
-            .iter()
-            .map(estimate_item_lines)
-            .sum();
+        self.reveal_tool_group(idx);
+        let mut below = 0usize;
+        // A folded group is one title row; its other calls add nothing.
+        let mut run: Option<(usize, bool)> = None;
+        for j in idx.saturating_add(1)..self.chat.len() {
+            let item = &self.chat[j];
+            if focus_row(self, item) == FocusRow::Hidden {
+                continue;
+            }
+            if matches!(item, ChatItem::Tool { .. }) {
+                let continues = j > 0
+                    && matches!(self.chat[j - 1], ChatItem::Tool { .. })
+                    && work_item_member(&self.chat[j - 1]) == work_item_member(item);
+                let start = match run {
+                    Some((known, _)) if continues => known,
+                    _ => self.work_run_start(j).unwrap_or(j),
+                };
+                let folded = match run {
+                    Some((known, folded)) if known == start => folded,
+                    _ => {
+                        let folded = self.work_run_tool_rows(start)
+                            > tool_display::TOOL_GROUP_COLLAPSE_ABOVE
+                            && !self.tool_group_expanded(start);
+                        run = Some((start, folded));
+                        folded
+                    }
+                };
+                if folded {
+                    if j == start {
+                        below += 2;
+                    }
+                    continue;
+                }
+            }
+            below += estimate_item_lines(item);
+        }
+        self.scroll = below;
     }
 
     /// Newest history entry containing `query` (case-insensitive) strictly older
@@ -2426,6 +2704,553 @@ impl AppState {
             .find(|&i| self.prompt_history[i].to_lowercase().contains(&needle))
     }
 
+    // --- focus ----------------------------------------------------------
+
+    /// The member whose conversation fills the main window, or `None` for the
+    /// interleaved "All" view.
+    pub fn focus(&self) -> Option<&MemberId> {
+        self.focus.as_ref()
+    }
+
+    /// A prompt as the chat shows it. Rows saved by older versions begin with
+    /// the `@member` / `@all` routing prefix the TUI used to add; drop it when
+    /// it names one of the row's own targets. Stored data is left alone.
+    pub(crate) fn displayed_user_body(&self, body: &str, targets: &[MemberId]) -> String {
+        let shown = crate::adapter::prompt_images::display_prompt_images(body);
+        let Some(rest) = shown.trim_start().strip_prefix('@') else {
+            return shown;
+        };
+        let Some(split) = rest.find(char::is_whitespace) else {
+            return shown;
+        };
+        let token = &rest[..split];
+        let names_target = token.eq_ignore_ascii_case("all")
+            || targets.iter().any(|target| {
+                token.eq_ignore_ascii_case(target.as_str())
+                    || token.eq_ignore_ascii_case(&self.member_display(target))
+            });
+        if names_target {
+            rest[split..].trim().to_string()
+        } else {
+            shown
+        }
+    }
+
+    /// Sub-agents in the roster.
+    pub fn sub_agent_count(&self) -> usize {
+        self.members
+            .iter()
+            .filter(|member| member.parent.is_some())
+            .count()
+    }
+
+    /// Name shown for the current focus: the member's display name, or "All".
+    pub fn focus_display(&self) -> String {
+        match &self.focus {
+            Some(member) => self.member_display(member),
+            None => "All".to_string(),
+        }
+    }
+
+    /// Switch the main window to one member (`Some`) or back to "All"
+    /// (`None`). Unknown members are ignored. The view returns to the bottom
+    /// and any chat selection is dropped, since its lines no longer exist.
+    pub fn set_focus(&mut self, focus: Option<MemberId>) {
+        let focus = match focus {
+            Some(requested) => match self.resolve_member_id(&requested) {
+                Some(member) => Some(member),
+                None => return,
+            },
+            None => None,
+        };
+        self.disarm_quit();
+        self.assign_focus(focus);
+    }
+
+    fn assign_focus(&mut self, focus: Option<MemberId>) {
+        self.focus_initialized = true;
+        if self.focus != focus {
+            self.focus = focus;
+            self.scroll = 0;
+            self.chat_selection = None;
+            // The visible rows changed, so redo any active search.
+            if let Some(query) = self.find.as_ref().map(|find| find.query.clone()) {
+                let matches = self.find_matches(&query);
+                let current = matches.len().saturating_sub(1);
+                self.find = Some(FindState {
+                    query,
+                    matches,
+                    current,
+                });
+            }
+        }
+    }
+
+    /// Keep the focus valid after a roster refresh. The first roster picks the
+    /// default target's member (else the first member). Afterwards the focus is
+    /// left alone, including a deliberate "All", unless the focused member left
+    /// the roster, which starts over from the default. An empty roster has no
+    /// focus.
+    fn sync_focus_with_roster(&mut self) {
+        if self.members.is_empty() {
+            self.focus = None;
+            self.focus_initialized = false;
+            self.agents_choice = AgentChoice::All;
+            self.agents_fallback = 0;
+            return;
+        }
+        if let Some(focus) = &self.focus
+            && !self.members.iter().any(|member| &member.id == focus)
+        {
+            self.focus_initialized = false;
+        }
+        if !self.focus_initialized {
+            let default = match &self.default_target {
+                Some(DefaultTarget::Member(id)) => self.resolve_member_id(id),
+                _ => None,
+            }
+            .or_else(|| self.members.first().map(|member| member.id.clone()));
+            self.assign_focus(default);
+        }
+    }
+
+    /// Target for plain text while a member is focused; `None` in the "All"
+    /// view, where plain text goes to the team's default member(s).
+    pub fn focused_message_target(&self) -> Option<MessageTarget> {
+        let member = self.resolve_member_id(self.focus.as_ref()?)?;
+        Some(MessageTarget::Member(member))
+    }
+
+    /// Agents list rows in display order: "All", then the members by status
+    /// section (each top-level member followed by its sub-agents). A search
+    /// query replaces that with a flat list ranked by relevance.
+    pub fn agents_rows(&self) -> Vec<AgentRow> {
+        crate::tui::agents_view::rows(self)
+    }
+
+    /// Selectable Agents list choices in display order.
+    pub fn agents_choices(&self) -> Vec<AgentChoice> {
+        self.agents_rows()
+            .into_iter()
+            .map(|row| match row {
+                AgentRow::All => AgentChoice::All,
+                AgentRow::Member { index, .. } => {
+                    AgentChoice::Member(self.members[index].id.clone())
+                }
+                AgentRow::Saved { index } => AgentChoice::Saved(self.saved_chats[index].id),
+            })
+            .collect()
+    }
+
+    /// Saved chats other than the current one, newest first.
+    pub fn saved_chats(&self) -> &[ConversationSummary] {
+        &self.saved_chats
+    }
+
+    /// Open the Agents list for `/resume` with the highlight on the first
+    /// saved chat. The list may still be on its way from the runtime; the
+    /// highlight moves when it arrives, unless the user moved it first.
+    pub fn open_agents_on_saved_chats(&mut self) {
+        if self.drawer != Some(Drawer::Agents) {
+            self.toggle_drawer(Drawer::Agents);
+        }
+        self.select_first_inactive();
+        self.agents_select_inactive = true;
+    }
+
+    fn select_first_inactive(&mut self) {
+        let first = self
+            .agents_choices()
+            .iter()
+            .position(|choice| matches!(choice, AgentChoice::Saved(_)));
+        if let Some(position) = first {
+            self.select_agent_at(position);
+        }
+        self.agents_select_inactive = false;
+    }
+
+    /// The command a selection raised that only the key loop can send.
+    pub fn take_pending_command(&mut self) -> Option<UiCommand> {
+        self.pending_command.take()
+    }
+
+    /// Queue `command` for the key loop and close the Agents list.
+    pub fn queue_command_and_close(&mut self, command: UiCommand) {
+        self.pending_command = Some(command);
+        self.close_drawer();
+    }
+
+    /// Now, in Unix seconds, for the Agents list's relative ages.
+    pub(crate) fn clock_unix_secs(&self) -> i64 {
+        self.clock_override.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs() as i64)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock_unix_secs(&mut self, now: i64) {
+        self.clock_override = Some(now);
+    }
+
+    /// The Model cell of a saved chat: its main member's backend, then the
+    /// model and effort the way a live member's cell reads.
+    pub fn saved_chat_model(&self, chat: &ConversationSummary) -> String {
+        let Some(backend) = chat.main_backend else {
+            return String::new();
+        };
+        let mut model = backend.as_str().to_string();
+        if let Some(summary) = self.model_catalog.effective_summary(
+            backend,
+            chat.main_model.as_deref(),
+            chat.main_effort,
+            Path::new(&self.workspace),
+        ) {
+            model.push_str(" · ");
+            model.push_str(&summary);
+        }
+        model
+    }
+
+    /// Current position of the highlighted agent among `agents_choices()`.
+    /// If the highlighted member left the list, the nearest valid position.
+    pub fn agents_selected(&self) -> usize {
+        let choices = self.agents_choices();
+        choices
+            .iter()
+            .position(|choice| choice == &self.agents_choice)
+            .unwrap_or_else(|| self.agents_fallback.min(choices.len().saturating_sub(1)))
+    }
+
+    pub fn selected_agent(&self) -> Option<AgentChoice> {
+        self.agents_choices()
+            .into_iter()
+            .nth(self.agents_selected())
+    }
+
+    fn select_agent_at(&mut self, position: usize) {
+        // Any move of the highlight settles where it is.
+        self.agents_select_inactive = false;
+        self.agents_delete_armed = None;
+        if let Some(choice) = self.agents_choices().into_iter().nth(position) {
+            self.agents_choice = choice;
+            self.agents_fallback = position;
+        }
+    }
+
+    pub fn select_previous_agent(&mut self) {
+        self.select_agent_at(self.agents_selected().saturating_sub(1));
+    }
+
+    pub fn select_next_agent(&mut self) {
+        let next = self.agents_selected() + 1;
+        if next < self.agents_choices().len() {
+            self.select_agent_at(next);
+        }
+    }
+
+    pub fn select_first_agent(&mut self) {
+        self.select_agent_at(0);
+    }
+
+    pub fn select_last_agent(&mut self) {
+        self.select_agent_at(self.agents_choices().len().saturating_sub(1));
+    }
+
+    /// Move the highlight by a page (`down` picks the direction), at least
+    /// one row, clamped to the list.
+    pub fn select_agent_page(&mut self, down: bool) {
+        let step = self.drawer_viewport.get().saturating_sub(1).max(1);
+        let last = self.agents_choices().len().saturating_sub(1);
+        let current = self.agents_selected();
+        let target = if down {
+            current.saturating_add(step).min(last)
+        } else {
+            current.saturating_sub(step)
+        };
+        self.select_agent_at(target);
+    }
+
+    /// Open the highlighted Agents row and close the list: focus an agent, or
+    /// queue the resume of a saved chat. With nothing highlighted (the search
+    /// matches nothing) the list stays open.
+    pub fn apply_selected_agent(&mut self) -> bool {
+        if self.drawer != Some(Drawer::Agents) {
+            return false;
+        }
+        match self.selected_agent() {
+            Some(AgentChoice::All) => self.set_focus(None),
+            Some(AgentChoice::Member(member)) => self.set_focus(Some(member)),
+            Some(AgentChoice::Saved(conversation)) => {
+                self.queue_command_and_close(UiCommand::ResumeConversation { conversation });
+                return true;
+            }
+            None => return true,
+        }
+        self.close_drawer();
+        true
+    }
+
+    /// Highlight the row of the current focus when the list opens.
+    fn preselect_focused_agent(&mut self) {
+        let choices = self.agents_choices();
+        let position = self
+            .focus
+            .as_ref()
+            .and_then(|focus| {
+                choices
+                    .iter()
+                    .position(|choice| matches!(choice, AgentChoice::Member(id) if id == focus))
+            })
+            .unwrap_or(0);
+        self.select_agent_at(position);
+    }
+
+    pub fn agents_query(&self) -> &str {
+        &self.agents_query
+    }
+
+    /// The name of the chat being viewed, if it has one.
+    pub fn chat_name(&self) -> Option<&str> {
+        self.chat_name.as_deref()
+    }
+
+    /// Whether the selected Agents row can be renamed with Ctrl+R: an
+    /// Inactive row, or the Main row (the current chat). Only without a
+    /// search, as the rename editor takes the search line's place.
+    pub fn agents_can_rename(&self) -> bool {
+        self.agents_rename_target().is_some()
+    }
+
+    /// Whether the selected Agents row can be deleted with Ctrl+X: an
+    /// Inactive row only, never the current chat or a live member.
+    pub fn agents_can_delete(&self) -> bool {
+        self.agents_query.trim().is_empty()
+            && matches!(self.selected_agent(), Some(AgentChoice::Saved(_)))
+    }
+
+    /// Whether Ctrl+X has armed the deletion of the selected row.
+    pub fn agents_delete_armed(&self) -> bool {
+        match (self.agents_delete_armed, self.selected_agent()) {
+            (Some(armed), Some(AgentChoice::Saved(selected))) => {
+                armed == selected && self.agents_can_delete()
+            }
+            _ => false,
+        }
+    }
+
+    /// Any key other than Ctrl+X puts the armed deletion away.
+    pub fn disarm_agents_delete(&mut self) {
+        self.agents_delete_armed = None;
+    }
+
+    /// Ctrl+X in the Agents list: the first press on an Inactive row arms its
+    /// deletion, a second one on the same row queues it.
+    pub fn press_agents_delete(&mut self) {
+        let Some(AgentChoice::Saved(conversation)) = self.selected_agent() else {
+            self.agents_delete_armed = None;
+            return;
+        };
+        if !self.agents_can_delete() {
+            self.agents_delete_armed = None;
+        } else if self.agents_delete_armed == Some(conversation) {
+            self.agents_delete_armed = None;
+            self.pending_command = Some(UiCommand::DeleteConversation { conversation });
+        } else {
+            self.agents_delete_armed = Some(conversation);
+        }
+    }
+
+    /// The chat Ctrl+R would rename (`None` inside is the current chat) and
+    /// the name it has now.
+    fn agents_rename_target(&self) -> Option<(Option<i64>, String)> {
+        if !self.agents_query.trim().is_empty() {
+            return None;
+        }
+        match self.selected_agent()? {
+            AgentChoice::Saved(id) => {
+                let name = self
+                    .saved_chats
+                    .iter()
+                    .find(|chat| chat.id == id)
+                    .and_then(|chat| chat.name.clone())
+                    .unwrap_or_default();
+                Some((Some(id), name))
+            }
+            AgentChoice::Member(id) if id.as_str() == MAIN_MEMBER_ID => {
+                let is_main = self
+                    .members
+                    .iter()
+                    .any(|member| member.id == id && member.parent.is_none());
+                is_main.then(|| (None, self.chat_name.clone().unwrap_or_default()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Ctrl+R in the Agents list: open the rename editor, prefilled with the
+    /// selected chat's name.
+    pub fn begin_agents_rename(&mut self) {
+        self.agents_delete_armed = None;
+        if let Some((conversation, text)) = self.agents_rename_target() {
+            self.agents_rename = Some(AgentsRename { conversation, text });
+        }
+    }
+
+    /// The text of the open rename editor.
+    pub fn agents_rename(&self) -> Option<&str> {
+        self.agents_rename.as_ref().map(|edit| edit.text.as_str())
+    }
+
+    pub fn agents_rename_push(&mut self, ch: char) {
+        if let Some(edit) = &mut self.agents_rename
+            && !ch.is_control()
+        {
+            edit.text.push(ch);
+        }
+    }
+
+    pub fn agents_rename_paste(&mut self, text: &str) {
+        if let Some(edit) = &mut self.agents_rename {
+            edit.text.extend(
+                text.chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch }),
+            );
+        }
+    }
+
+    pub fn agents_rename_pop(&mut self) {
+        if let Some(edit) = &mut self.agents_rename {
+            edit.text.pop();
+        }
+    }
+
+    /// Delete the last word of the name (and the spaces before it).
+    pub fn agents_rename_delete_word(&mut self) {
+        if let Some(edit) = &mut self.agents_rename {
+            let kept = edit.text.trim_end().len();
+            edit.text.truncate(kept);
+            let start = edit
+                .text
+                .rfind(char::is_whitespace)
+                .map_or(0, |index| index + 1);
+            edit.text.truncate(start);
+        }
+    }
+
+    pub fn agents_rename_clear(&mut self) {
+        if let Some(edit) = &mut self.agents_rename {
+            edit.text.clear();
+        }
+    }
+
+    /// Enter in the rename editor: queue the new name. An empty or
+    /// whitespace-only name clears the chat's name.
+    pub fn commit_agents_rename(&mut self) {
+        if let Some(edit) = self.agents_rename.take() {
+            let name = edit.text.trim();
+            self.pending_command = Some(UiCommand::RenameConversation {
+                conversation: edit.conversation,
+                name: (!name.is_empty()).then(|| name.to_string()),
+            });
+        }
+    }
+
+    /// Esc in the rename editor.
+    pub fn cancel_agents_rename(&mut self) {
+        self.agents_rename = None;
+    }
+
+    pub fn agents_query_push(&mut self, ch: char) {
+        if !ch.is_control() {
+            self.agents_query.push(ch);
+        }
+        self.after_agents_query_change();
+    }
+
+    /// Pasted text goes into the search as one line.
+    pub fn agents_query_paste(&mut self, text: &str) {
+        self.agents_query.extend(
+            text.chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch }),
+        );
+        self.after_agents_query_change();
+    }
+
+    pub fn agents_query_pop(&mut self) {
+        self.agents_query.pop();
+        self.after_agents_query_change();
+    }
+
+    /// Delete the last word of the search (and the spaces before it).
+    pub fn agents_query_delete_word(&mut self) {
+        let kept = self.agents_query.trim_end().len();
+        self.agents_query.truncate(kept);
+        let start = self
+            .agents_query
+            .rfind(char::is_whitespace)
+            .map_or(0, |index| index + 1);
+        self.agents_query.truncate(start);
+        self.after_agents_query_change();
+    }
+
+    pub fn agents_query_clear(&mut self) {
+        self.agents_query.clear();
+        self.after_agents_query_change();
+    }
+
+    /// A changed search highlights its best match (the first row); an emptied
+    /// one returns to the viewed agent.
+    fn after_agents_query_change(&mut self) {
+        self.disarm_quit();
+        if self.agents_query.trim().is_empty() {
+            self.preselect_focused_agent();
+        } else {
+            self.select_agent_at(0);
+        }
+    }
+
+    /// Esc in the Agents list: clear a typed search first, then close.
+    pub fn escape_agents(&mut self) {
+        if self.agents_query.is_empty() {
+            self.close_drawer();
+        } else {
+            self.agents_query_clear();
+        }
+    }
+
+    /// The painter notes where each selectable row landed on screen.
+    pub(crate) fn set_agents_click_rows(&self, rows: Vec<(u16, AgentChoice)>) {
+        *self.agents_click_rows.borrow_mut() = rows;
+    }
+
+    /// Mouse click on screen row `y` of the Agents list: highlight that row
+    /// and open it. Returns whether a row was hit.
+    pub fn click_agent_row(&mut self, y: u16) -> bool {
+        if self.drawer != Some(Drawer::Agents) {
+            return false;
+        }
+        let choice = self
+            .agents_click_rows
+            .borrow()
+            .iter()
+            .find(|(row, _)| *row == y)
+            .map(|(_, choice)| choice.clone());
+        let Some(choice) = choice else {
+            return false;
+        };
+        self.agents_choice = choice;
+        self.apply_selected_agent()
+    }
+
+    /// Seconds since `member` last finished a reply this session, if it has.
+    pub fn member_reply_age_secs(&self, member: &MemberId) -> Option<u64> {
+        self.last_reply_at
+            .get(member)
+            .map(|at| at.elapsed().as_secs())
+    }
+
     // --- UI actions -----------------------------------------------------
 
     pub fn toggle_drawer(&mut self, drawer: Drawer) {
@@ -2435,6 +3260,13 @@ impl AppState {
             self.mode_editor = None;
             None
         } else {
+            // Nothing to show: say so in one line instead of opening a panel.
+            if drawer == Drawer::Runs && self.runs.is_empty() {
+                self.apply(RuntimeEvent::Notice(
+                    "no runs yet — select /mode plan, then send a goal".to_string(),
+                ));
+                return;
+            }
             self.stash_team_editor_catalog();
             if drawer != Drawer::Mode {
                 self.mode_editor = None;
@@ -2445,11 +3277,21 @@ impl AppState {
                 Drawer::Runs => {
                     self.ensure_selected_run();
                 }
+                Drawer::Agents => {
+                    self.agents_query.clear();
+                    self.agents_delete_armed = None;
+                    self.agents_rename = None;
+                    self.preselect_focused_agent();
+                }
                 _ => {}
             }
             Some(drawer)
         };
         self.drawer_scroll = 0;
+        // Logs read oldest first like the transcript and open on the newest.
+        if matches!(self.drawer, Some(Drawer::Logs | Drawer::MemberLogs(_))) {
+            self.drawer_scroll = usize::MAX;
+        }
     }
 
     #[cfg(test)]
@@ -2522,58 +3364,22 @@ impl AppState {
         }
     }
 
-    pub fn resume_choices(&self) -> &[ConversationSummary] {
-        &self.resume_choices
-    }
-
-    pub fn selected_resume(&self) -> usize {
-        self.selected_resume
-    }
-
-    pub fn select_previous_resume(&mut self) {
-        self.selected_resume = self.selected_resume.saturating_sub(1);
-        self.reveal_selected_resume();
-    }
-
-    pub fn select_next_resume(&mut self) {
-        if self.selected_resume + 1 < self.resume_choices.len() {
-            self.selected_resume += 1;
-            self.reveal_selected_resume();
-        }
-    }
-
     pub fn note_drawer_viewport(&self, height: usize) {
         self.drawer_viewport.set(height);
     }
 
-    /// Keep the highlighted resume chat in view. Scroll only when it would
-    /// leave the top or bottom of the drawer, not on every selection change.
-    fn reveal_selected_resume(&mut self) {
-        let viewport = self.drawer_viewport.get();
-        if viewport == 0 {
-            return;
-        }
-        let start = resume_choice_line(self.selected_resume);
-        let end = start.saturating_add(RESUME_CHOICE_LINES);
-        if end > self.drawer_scroll.saturating_add(viewport) {
-            self.drawer_scroll = end.saturating_sub(viewport);
-        }
-        if start < self.drawer_scroll {
-            self.drawer_scroll = start;
-        }
-    }
-
-    pub fn selected_resume_command(&self) -> Option<UiCommand> {
-        (self.drawer == Some(Drawer::Resume))
-            .then(|| self.resume_choices.get(self.selected_resume))
-            .flatten()
-            .map(|conversation| UiCommand::ResumeConversation {
-                conversation: conversation.id,
-            })
+    pub fn note_drawer_max_scroll(&self, max: usize) {
+        self.drawer_max_scroll.set(max);
     }
 
     pub fn close_drawer(&mut self) {
         self.disarm_quit();
+        if self.drawer == Some(Drawer::Agents) {
+            self.agents_query.clear();
+            self.agents_select_inactive = false;
+            self.agents_delete_armed = None;
+            self.agents_rename = None;
+        }
         self.drawer = None;
         self.drawer_scroll = 0;
         self.stash_team_editor_catalog();
@@ -2751,6 +3557,9 @@ impl AppState {
     }
     pub fn drawer_scroll_by(&mut self, delta: i32) {
         self.disarm_quit();
+        // A drawer opened "at the bottom" holds an out-of-range offset; settle
+        // it on the real end before moving.
+        self.drawer_scroll = self.drawer_scroll.min(self.drawer_max_scroll.get());
         if delta >= 0 {
             self.drawer_scroll = self.drawer_scroll.saturating_add(delta as usize);
         } else {
@@ -2800,6 +3609,8 @@ impl AppState {
     }
 
     fn open_mode_editor(&mut self) {
+        // Sub-agents come along so the panel can tell an existing seat from
+        // one a run would open; the pickers list only top-level members.
         let members = self
             .members
             .iter()
@@ -2839,22 +3650,30 @@ impl AppState {
             .is_some_and(|editor| editor.insert_edit_text(text))
     }
 
-    pub(crate) fn poll_team_editor_catalog(&mut self) {
+    /// Returns whether a model list landed while something that shows models
+    /// is on screen (the `/model` selector, the welcome page, the Agents
+    /// list), so the frame needs redrawing even though nothing was typed.
+    pub(crate) fn poll_team_editor_catalog(&mut self) -> bool {
         if let Some(editor) = self.team_editor.as_mut() {
             editor.poll_agent_catalog();
+            false
         } else {
             // A model worker may still be completing after its picker closed.
-            // Poll it here so the next `/team` open can use the ready result.
-            self.model_catalog.poll();
+            // Poll it here so the next `/team` or `/model` open can use the
+            // ready result.
+            self.model_catalog.poll()
+                && (self.model_picker.is_some()
+                    || self.chat.is_empty()
+                    || self.drawer == Some(Drawer::Agents))
         }
     }
 
     /// Warm every installed backend for the startup workspace. Detection and
     /// model discovery both stay asynchronous: opening Asterline never waits
-    /// for a slow CLI, while a later `/team` reuses the same keyed cache.
-    pub(crate) fn warm_model_catalog_once(&mut self) {
+    /// for a slow CLI, while a later `/team` or `/model` reuses the same keyed cache.
+    pub(crate) fn warm_model_catalog_once(&mut self) -> bool {
         if self.model_catalog_warmed || self.workspace.trim().is_empty() {
-            return;
+            return false;
         }
         if self.model_catalog_detection.is_none() {
             let (tx, rx) = mpsc::channel();
@@ -2862,7 +3681,7 @@ impl AppState {
                 let _ = tx.send(detect_backends());
             });
             self.model_catalog_detection = Some(rx);
-            return;
+            return false;
         }
         let detected = match self
             .model_catalog_detection
@@ -2870,7 +3689,7 @@ impl AppState {
             .map(Receiver::try_recv)
         {
             Some(Ok(detected)) => detected,
-            Some(Err(TryRecvError::Empty)) | None => return,
+            Some(Err(TryRecvError::Empty)) | None => return false,
             Some(Err(TryRecvError::Disconnected)) => DetectedBackends {
                 codex: false,
                 claude: false,
@@ -2880,6 +3699,7 @@ impl AppState {
         };
         self.model_catalog_detection = None;
         let workspace = PathBuf::from(&self.workspace);
+        self.detected_backends = Some(detected);
         if let Some(editor) = self.team_editor.as_mut() {
             editor.preload_installed_model_catalogs(detected);
         } else {
@@ -2896,12 +3716,16 @@ impl AppState {
             self.model_catalog.freeze();
         }
         self.model_catalog_warmed = true;
+        // Installed backends are now known; an open selector gains rows.
+        self.model_picker.is_some() || self.chat.is_empty()
     }
 
     fn open_team_editor(&mut self) {
+        // The editor owns the top-level roster; sub-agents belong to the chat.
         let members = self
             .members
             .iter()
+            .filter(|view| view.parent.is_none())
             .map(|view| self.view_to_member(view))
             .collect();
         let model_catalog = std::mem::take(&mut self.model_catalog);
@@ -2920,6 +3744,522 @@ impl AppState {
         if let Some(editor) = self.team_editor.take() {
             self.model_catalog = editor.into_model_catalog();
         }
+    }
+
+    // --- /model selector -------------------------------------------------
+
+    /// The member `/model` changes: the one being viewed, else (in the "All"
+    /// view) the default target's member, else the first member.
+    fn model_target_index(&self) -> Option<usize> {
+        if let Some(focus) = &self.focus
+            && let Some(index) = self.members.iter().position(|member| member.id == *focus)
+        {
+            return Some(index);
+        }
+        if let Some(DefaultTarget::Member(id)) = &self.default_target
+            && let Some(index) = self.members.iter().position(|member| member.id == *id)
+        {
+            return Some(index);
+        }
+        (!self.members.is_empty()).then_some(0)
+    }
+
+    /// `<Display name> · <effort>` for what `member` effectively runs: its
+    /// pinned values, else the CLI's configured ones, else the catalog default.
+    /// `None` until a model catalog says (the caller falls back to the backend).
+    pub fn member_model_summary(&self, member: &MemberView) -> Option<String> {
+        self.model_catalog.effective_summary(
+            member.backend,
+            member.model.as_deref(),
+            member.effort,
+            Path::new(&self.workspace),
+        )
+    }
+
+    /// The model line of the welcome page: the viewed agent (else the first)
+    /// as `<Display name> · <effort>`. Until a catalog names the model it is
+    /// the backend, with the effort when one is known.
+    pub fn welcome_model_summary(&self) -> Option<String> {
+        let member = self
+            .focus
+            .as_ref()
+            .and_then(|focus| self.members.iter().find(|member| member.id == *focus))
+            .or_else(|| self.members.first())?;
+        let effective = self.model_catalog.effective_model(
+            member.backend,
+            member.model.as_deref(),
+            member.effort,
+            Path::new(&self.workspace),
+        );
+        let name = effective
+            .name
+            .or(effective.id)
+            .unwrap_or_else(|| member.backend.as_str().to_string());
+        Some(match effective.effort {
+            Some(effort) => format!("{name} · {}", effort.as_str()),
+            None => name,
+        })
+    }
+
+    /// Test hook: pretend `backend` is installed and its models are known.
+    #[cfg(test)]
+    pub(crate) fn seed_installed_models(&mut self, backend: BackendKind, models: Vec<String>) {
+        use crate::adapter::{DiscoveredCatalog, DiscoveredModel};
+        let models = models
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut model = DiscoveredModel::simple(id);
+                model.is_default = index == 0;
+                model
+            })
+            .collect();
+        self.seed_installed_catalog(
+            backend,
+            DiscoveredCatalog {
+                models,
+                native_permission: None,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Test hook: pretend `backend` is installed with this catalog.
+    #[cfg(test)]
+    pub(crate) fn seed_installed_catalog(
+        &mut self,
+        backend: BackendKind,
+        catalog: crate::adapter::DiscoveredCatalog,
+    ) {
+        let mut detected = self.detected_backends.unwrap_or(DetectedBackends {
+            codex: false,
+            claude: false,
+            grok: false,
+            agy: false,
+        });
+        match backend {
+            BackendKind::Codex => detected.codex = true,
+            BackendKind::Claude => detected.claude = true,
+            BackendKind::Grok => detected.grok = true,
+            BackendKind::Agy => detected.agy = true,
+        }
+        self.detected_backends = Some(detected);
+        self.model_catalog
+            .seed_catalog(backend, Path::new(&self.workspace), catalog);
+    }
+
+    pub fn model_picker_open(&self) -> bool {
+        self.model_picker.is_some()
+    }
+
+    /// Open the inline model selector for the agent being viewed, with the
+    /// search box prefilled. Does nothing (but says why) with no agents.
+    pub fn open_model_picker(&mut self, filter: &str) {
+        let Some(index) = self.model_target_index() else {
+            self.apply(RuntimeEvent::Notice(
+                "no agent to change the model of".to_string(),
+            ));
+            return;
+        };
+        self.close_drawer();
+        self.header_selected = None;
+        self.disarm_quit();
+        let target = &self.members[index];
+        let (target_id, target_backend) = (target.id.clone(), target.backend);
+        let workspace = PathBuf::from(&self.workspace);
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            if backend == target_backend
+                || self.detected_backends.is_some_and(|d| d.contains(backend))
+            {
+                self.model_catalog.ensure(backend, &workspace);
+            }
+        }
+        self.model_picker = Some(ModelPicker::new(target_id, filter.trim().to_string()));
+        // Start on the current model when it is listed; else the first row.
+        let current = self.model_target_current_key();
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.selected = current;
+        }
+        // Pin the first row down by identity too, so catalogs that land later
+        // cannot slide a different model under the highlight.
+        let listed = self
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.selected.as_ref())
+            .is_some_and(|key| self.model_picker_entries().iter().any(|e| &e.key == key));
+        if !listed {
+            self.select_model_at(0);
+        }
+    }
+
+    /// The model id the target runs: its pinned model, else the one the CLI's
+    /// configuration selects when the catalog lists it.
+    fn target_model_id(&self) -> Option<String> {
+        let target = self.model_target()?;
+        if let Some(model) = &target.model {
+            return Some(model.clone());
+        }
+        match self
+            .model_catalog
+            .view(target.backend, Path::new(&self.workspace))
+        {
+            CatalogView::Ready(catalog) => catalog
+                .native_model
+                .clone()
+                .filter(|native| catalog.models.iter().any(|model| model.matches_id(native))),
+            _ => None,
+        }
+    }
+
+    /// The row the target agent currently sits on.
+    fn model_target_current_key(&self) -> Option<ModelKey> {
+        let target = self.model_target()?;
+        model_picker::current_key(
+            target.backend,
+            target.model.as_deref(),
+            &self.model_catalog,
+            Path::new(&self.workspace),
+        )
+    }
+
+    /// Append ` · earlier messages not carried over` to the newest `Model: …`
+    /// row (once).
+    fn mark_last_model_notice_truncated(&mut self) {
+        let suffix = format!(" · {NOT_CARRIED_OVER}");
+        let found = self.chat.iter_mut().rev().find_map(|item| match item {
+            ChatItem::Notice { text, .. } if text.starts_with("Model: ") => Some(text),
+            _ => None,
+        });
+        if let Some(text) = found
+            && !text.ends_with(&suffix)
+        {
+            text.push_str(&suffix);
+            self.touch_chat();
+        }
+    }
+
+    /// The agent the open `/model` selector will change.
+    pub fn model_picker_target(&self) -> Option<MemberId> {
+        self.model_picker
+            .as_ref()
+            .map(|picker| picker.target.clone())
+    }
+
+    /// Note that a `/model` change was just sent, so the runtime's
+    /// `team updated` confirmation can be dropped. Call after pushing the
+    /// `Model: …` notice.
+    pub fn expect_model_switch_confirmation(&mut self) {
+        self.model_switch_pending = true;
+    }
+
+    pub fn close_model_picker(&mut self) {
+        self.disarm_quit();
+        self.model_picker = None;
+    }
+
+    fn model_picker_rows(&self) -> Vec<PickerRow> {
+        let Some(picker) = &self.model_picker else {
+            return Vec::new();
+        };
+        let Some(target) = self.model_target() else {
+            return Vec::new();
+        };
+        let detected = self.detected_backends.unwrap_or(DetectedBackends {
+            codex: false,
+            claude: false,
+            grok: false,
+            agy: false,
+        });
+        model_picker::build_rows(
+            detected,
+            target.backend,
+            &self.model_catalog,
+            Path::new(&self.workspace),
+            &picker.filter,
+        )
+    }
+
+    fn model_picker_entries(&self) -> Vec<ModelEntry> {
+        self.model_picker_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                PickerRow::Entry(entry) => Some(entry),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Position of the highlighted model among the selectable rows. If it no
+    /// longer matches the filter, the nearest valid position.
+    fn model_picker_position(&self) -> usize {
+        let Some(picker) = &self.model_picker else {
+            return 0;
+        };
+        let entries = self.model_picker_entries();
+        picker
+            .selected
+            .as_ref()
+            .and_then(|key| entries.iter().position(|entry| &entry.key == key))
+            .unwrap_or_else(|| picker.fallback.min(entries.len().saturating_sub(1)))
+    }
+
+    fn selected_model_entry(&self) -> Option<ModelEntry> {
+        self.model_picker_entries()
+            .into_iter()
+            .nth(self.model_picker_position())
+    }
+
+    fn model_target(&self) -> Option<&MemberView> {
+        let picker = self.model_picker.as_ref()?;
+        self.members
+            .iter()
+            .find(|member| member.id == picker.target)
+    }
+
+    /// The level shown for an entry: the one the user cycled to, else its
+    /// seeded level. `None` for models without effort levels.
+    fn model_picker_effort(&self, entry: &ModelEntry) -> Option<Effort> {
+        let picker = self.model_picker.as_ref()?;
+        if let Some(effort) = picker.efforts.get(&entry.key) {
+            return Some(*effort);
+        }
+        let is_current = self.model_target_current_key().as_ref() == Some(&entry.key);
+        // A merged row of effort-suffixed siblings starts on the variant the
+        // target runs; the level lives in the model id, not in `effort`.
+        if !entry.variants.is_empty() {
+            let running = self.target_model_id().filter(|_| is_current);
+            let variant = running.and_then(|id| {
+                entry
+                    .variants
+                    .iter()
+                    .find(|(_, variant_id)| *variant_id == id)
+                    .map(|(effort, _)| *effort)
+            });
+            return model_picker::seed_level(entry, variant, None);
+        }
+        let members_effort = self
+            .model_target()
+            .filter(|_| is_current)
+            .and_then(|target| target.effort);
+        let native = match self
+            .model_catalog
+            .view(entry.key.backend, Path::new(&self.workspace))
+        {
+            CatalogView::Ready(catalog) => catalog.native_efforts.for_model(&entry.key.model),
+            _ => None,
+        };
+        model_picker::seed_level(entry, members_effort, native)
+    }
+
+    fn select_model_at(&mut self, position: usize) {
+        let entry = self.model_picker_entries().into_iter().nth(position);
+        if let (Some(picker), Some(entry)) = (self.model_picker.as_mut(), entry) {
+            picker.selected = Some(entry.key);
+            picker.fallback = position;
+            picker.notice = None;
+        }
+    }
+
+    pub fn select_previous_model(&mut self) {
+        self.select_model_at(self.model_picker_position().saturating_sub(1));
+    }
+
+    pub fn select_next_model(&mut self) {
+        let next = self.model_picker_position() + 1;
+        if next < self.model_picker_entries().len() {
+            self.select_model_at(next);
+        }
+    }
+
+    pub fn model_filter_push(&mut self, ch: char) {
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.filter.push(ch);
+        }
+        self.after_model_filter_change();
+    }
+
+    /// Pasted text goes into the search box as one line.
+    pub fn model_filter_paste(&mut self, text: &str) {
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.filter.extend(
+                text.chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch }),
+            );
+        }
+        self.after_model_filter_change();
+    }
+
+    pub fn model_filter_pop(&mut self) {
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.filter.pop();
+        }
+        self.after_model_filter_change();
+    }
+
+    pub fn model_filter_clear(&mut self) {
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.filter.clear();
+        }
+        self.after_model_filter_change();
+    }
+
+    /// A selection the new filter hides moves to the first match.
+    fn after_model_filter_change(&mut self) {
+        self.disarm_quit();
+        let entries = self.model_picker_entries();
+        let still_listed = self
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.selected.as_ref())
+            .is_some_and(|key| entries.iter().any(|entry| &entry.key == key));
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.notice = None;
+        }
+        if !still_listed {
+            self.select_model_at(0);
+        }
+    }
+
+    /// Step the highlighted model's effort through the levels it supports.
+    /// Models without levels have nothing to change.
+    pub fn cycle_model_effort(&mut self, forward: bool) {
+        self.disarm_quit();
+        let Some(entry) = self.selected_model_entry() else {
+            return;
+        };
+        if entry.levels.is_empty() {
+            return;
+        }
+        let next = model_picker::cycle_level(&entry, self.model_picker_effort(&entry), forward);
+        if let (Some(picker), Some(next)) = (self.model_picker.as_mut(), next) {
+            picker.efforts.insert(entry.key, next);
+            picker.notice = None;
+        }
+    }
+
+    /// Everything the renderer needs, or `None` when the selector is closed.
+    pub(crate) fn model_picker_view(&self) -> Option<PickerView> {
+        let picker = self.model_picker.as_ref()?;
+        let target = self.model_target()?;
+        let current = self.model_target_current_key();
+        let rows = self.model_picker_rows();
+        let selected_key = self.selected_model_entry().map(|entry| entry.key);
+        let mut views = Vec::new();
+        let mut selected_row = None;
+        let mut models = 0;
+        let mut selected_position = 0;
+        for row in &rows {
+            match row {
+                PickerRow::Entry(entry) => {
+                    models += 1;
+                    let selected = selected_key.as_ref() == Some(&entry.key);
+                    let level = self.model_picker_effort(entry);
+                    if selected {
+                        selected_row = Some(views.len());
+                        selected_position = models;
+                    }
+                    views.push(PickerRowView::Entry {
+                        name: entry.name.clone(),
+                        levels: entry.levels.clone(),
+                        level,
+                        trailing: if current.as_ref() == Some(&entry.key) {
+                            "current".to_string()
+                        } else {
+                            String::new()
+                        },
+                        selected,
+                    });
+                }
+                PickerRow::Heading(backend) => {
+                    views.push(PickerRowView::Heading(backend.as_str().to_string()))
+                }
+                PickerRow::Loading(_) => {
+                    views.push(PickerRowView::Note("loading models…".to_string()))
+                }
+                PickerRow::Failed(_, error) => views.push(PickerRowView::Note(format!(
+                    "model discovery failed: {error}"
+                ))),
+            }
+        }
+        Some(PickerView {
+            target: target.display_name.clone(),
+            filter: picker.filter.clone(),
+            rows: views,
+            selected_row,
+            selected_position,
+            total_models: models,
+            notice: picker.notice.clone(),
+        })
+    }
+
+    /// The roster update that switches the targeted agent to the highlighted
+    /// model, plus the notice to show once it is sent. `None` (with a notice)
+    /// when it cannot be applied now.
+    ///
+    /// Same backend: only `model` and `effort` change. A different backend
+    /// takes that CLI's default permission preset and drops the stored
+    /// session, so the new CLI starts fresh. Id, name, role and prompt stay.
+    pub fn selected_model_command(&mut self) -> Option<(UiCommand, String)> {
+        let entry = self.selected_model_entry()?;
+        let index = self.model_target_index()?;
+        let target = &self.members[index];
+        let busy = member_status_is_active(target.status)
+            || self.has_active_message(&target.id)
+            || !self.queued_prompts_for(&target.id).is_empty();
+        if busy {
+            let message = "Stop the running work before switching models (Esc).".to_string();
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.notice = Some(message.clone());
+            }
+            let member = target.id.clone();
+            self.apply(RuntimeEvent::MemberNotice {
+                member,
+                text: message,
+            });
+            return None;
+        }
+        // Picking a model always pins its id, and what the row shows is what
+        // is saved and sent: the level it displays (seeded or cycled to) is
+        // written as the effort. A model without levels gets none. For a
+        // merged row of effort variants the id itself carries the level, so
+        // no effort is written.
+        let level = self.model_picker_effort(&entry);
+        let pinned = entry.model_id(level);
+        let effort = if entry.variants.is_empty() {
+            level
+        } else {
+            None
+        };
+        let mut members: Vec<TeamMember> = self
+            .members
+            .iter()
+            .map(|view| self.view_to_member(view))
+            .collect();
+        let name = members[index].display_name.clone();
+        let main = &mut members[index];
+        if main.backend != entry.key.backend {
+            main.backend = entry.key.backend;
+            crate::domain::config::apply_backend_defaults(main);
+            main.session_id = None;
+        }
+        main.model = Some(pinned.clone());
+        main.effort = effort;
+        let mut notice = format!("Model: {name} → {} · {pinned}", entry.key.backend.as_str());
+        if let Some(effort) = effort {
+            notice.push_str(&format!(" · {}", effort.as_str()));
+        }
+        Some((
+            UiCommand::ReplaceTeam {
+                members,
+                default_target: self.default_target.clone(),
+            },
+            notice,
+        ))
     }
 
     fn view_to_member(&self, view: &MemberView) -> TeamMember {
@@ -2941,6 +4281,7 @@ impl AppState {
         member.session_policy = view.session_policy;
         member.session_id = view.session.clone();
         member.effort = view.effort;
+        member.parent = view.parent.clone();
         member
     }
 
@@ -3014,6 +4355,7 @@ impl AppState {
         } else {
             self.quit_armed = true;
             self.push(ChatItem::Notice {
+                member: None,
                 text: "press Ctrl+C again to quit".to_string(),
             });
         }
@@ -3044,6 +4386,75 @@ impl AppState {
     pub fn toggle_tools_expansion(&mut self) {
         self.disarm_quit();
         self.tools_expanded = !self.tools_expanded;
+    }
+
+    /// Whether the tool group starting at chat index `first` shows every row.
+    /// Ctrl+O opens all groups; otherwise only clicked ones are open.
+    pub fn tool_group_expanded(&self, first: usize) -> bool {
+        self.tools_expanded || self.expanded_tool_groups.contains(&first)
+    }
+
+    pub(crate) fn tool_groups_revision(&self) -> u64 {
+        self.tool_groups_revision
+    }
+
+    /// Flip one tool group between its one-line and full forms.
+    pub fn toggle_tool_group(&mut self, first: usize) {
+        self.disarm_quit();
+        if !self.expanded_tool_groups.remove(&first) {
+            self.expanded_tool_groups.insert(first);
+        }
+        self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
+    }
+
+    /// Forget every per-group choice (new chat, resumed chat).
+    fn clear_tool_group_expansion(&mut self) {
+        if !self.expanded_tool_groups.is_empty() {
+            self.expanded_tool_groups.clear();
+        }
+        self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
+    }
+
+    /// First chat index of the contiguous Tool/Diff run that contains `idx`.
+    fn work_run_start(&self, idx: usize) -> Option<usize> {
+        let member = work_item_member(self.chat.get(idx)?)?;
+        let mut start = idx;
+        while start > 0 && work_item_member(&self.chat[start - 1]) == Some(member) {
+            start -= 1;
+        }
+        Some(start)
+    }
+
+    /// Tool calls the run starting at `start` lists as rows. Successful file
+    /// edits become a diff block instead, as in the chat view.
+    fn work_run_tool_rows(&self, start: usize) -> usize {
+        let Some(member) = self.chat.get(start).and_then(work_item_member) else {
+            return 0;
+        };
+        self.chat[start..]
+            .iter()
+            .take_while(|item| work_item_member(item) == Some(member))
+            .filter(|item| match item {
+                ChatItem::Tool { name, ok, .. } => {
+                    *ok == Some(false) || !tool_display::is_file_change_tool_name(name)
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// `/find` landing inside a folded tool group opens it, so the match is
+    /// on screen instead of hidden behind a summary line.
+    fn reveal_tool_group(&mut self, idx: usize) {
+        let Some(start) = self.work_run_start(idx) else {
+            return;
+        };
+        if matches!(self.chat[idx], ChatItem::Tool { .. })
+            && self.work_run_tool_rows(start) > tool_display::TOOL_GROUP_COLLAPSE_ABOVE
+            && !self.tool_group_expanded(start)
+        {
+            self.toggle_tool_group(start);
+        }
     }
 
     pub fn active_reasoning(&self) -> &HashMap<MemberId, String> {
@@ -3148,14 +4559,6 @@ fn run_step_dispatch_command(run: &RunSummary, step: u32) -> Option<String> {
     ))
 }
 
-fn format_inherited_user_body(target: &MessageTarget, body: &str) -> String {
-    match target {
-        MessageTarget::All => format!("@all {body}"),
-        MessageTarget::Member(member) => format!("@{member} {body}"),
-        MessageTarget::Default | MessageTarget::Members(_) => body.to_string(),
-    }
-}
-
 /// Searchable text for one chat item (used by `/find`).
 fn chat_item_search_text(item: &ChatItem) -> String {
     match item {
@@ -3174,7 +4577,12 @@ fn chat_item_search_text(item: &ChatItem) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         ChatItem::Route { body, .. } => body.clone(),
-        ChatItem::Notice { text } => text.clone(),
+        ChatItem::Spawn {
+            parent,
+            child,
+            summary,
+        } => format!("spawn {parent} {child} {summary}"),
+        ChatItem::Notice { text, .. } => text.clone(),
         ChatItem::Error { message, .. } => message.clone(),
         ChatItem::Verdict { summary, .. } => summary.clone(),
     }
@@ -3199,14 +4607,24 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
         ChatItem::Tool { detail, .. } => 2 + usize::from(!detail.is_empty()),
         ChatItem::Diff { files, .. } => 1 + files.len(),
         ChatItem::Route { body, .. } => 1 + body.lines().count().max(1),
-        ChatItem::Notice { text } => text.lines().count().max(1),
+        ChatItem::Spawn { .. } => 2,
+        ChatItem::Notice { text, .. } => text.lines().count().max(1),
         ChatItem::Error { message, .. } => message.lines().count().max(1),
         ChatItem::Verdict { summary, .. } => 1 + summary.lines().count(),
     }
 }
 
+/// The member behind a tool call or diff, the items that share one work run.
+fn work_item_member(item: &ChatItem) -> Option<&MemberId> {
+    match item {
+        ChatItem::Tool { member, .. } | ChatItem::Diff { member, .. } => Some(member),
+        _ => None,
+    }
+}
+
 fn chat_truncation_notice() -> ChatItem {
     ChatItem::Notice {
+        member: None,
         text: "[asterline: chat item truncated]".to_string(),
     }
 }
@@ -3308,8 +4726,21 @@ fn bound_chat_item(item: ChatItem) -> ChatItem {
                 .saturating_add(to.iter().map(String::len).sum::<usize>());
             bounded_chat_field(body, fixed).map(|body| ChatItem::Route { from, to, body })
         }
-        ChatItem::Notice { text } => {
-            bounded_chat_field(text, 0).map(|text| ChatItem::Notice { text })
+        ChatItem::Spawn {
+            parent,
+            child,
+            summary,
+        } => {
+            let fixed = parent.as_str().len().saturating_add(child.as_str().len());
+            bounded_chat_field(summary, fixed).map(|summary| ChatItem::Spawn {
+                parent,
+                child,
+                summary,
+            })
+        }
+        ChatItem::Notice { text, member } => {
+            let fixed = member.as_ref().map_or(0, |member| member.as_str().len());
+            bounded_chat_field(text, fixed).map(|text| ChatItem::Notice { text, member })
         }
         ChatItem::Error { member, message } => {
             let fixed = member.as_ref().map_or(0, |member| member.as_str().len());
@@ -3371,7 +4802,14 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
         ChatItem::Route { from, to, body } => {
             from.as_str().len() + body.len() + to.iter().map(String::len).sum::<usize>()
         }
-        ChatItem::Notice { text } => text.len(),
+        ChatItem::Spawn {
+            parent,
+            child,
+            summary,
+        } => parent.as_str().len() + child.as_str().len() + summary.len(),
+        ChatItem::Notice { text, member } => {
+            text.len() + member.as_ref().map_or(0, |member| member.as_str().len())
+        }
         ChatItem::Error { member, message } => {
             member.as_ref().map_or(0, |member| member.as_str().len()) + message.len()
         }

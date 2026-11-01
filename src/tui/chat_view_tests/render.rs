@@ -37,12 +37,22 @@ fn renders_empty_state_quick_start() {
     let view = format!("{}", terminal.backend());
     eprintln!("\n{view}");
 
-    assert!(view.contains("Members:"));
-    assert!(view.contains("builder (codex, implementation)"));
-    assert!(view.contains("@builder <message>"));
-    assert!(view.contains("/mode"));
-    assert!(!view.contains("/mode plan"));
+    // Trimmed to a title, the model, and four things to try.
+    // The header already says "Asterline", so the welcome block starts at the
+    // model line.
+    assert!(!view.contains("Multi-Agent Coding Console"));
+    assert!(view.contains("Model: codex"));
+    assert!(!view.contains("Members:"));
+    assert!(!view.contains("builder (codex, implementation)"));
+    assert!(view.contains("<message>"));
+    assert!(view.contains("talk to Builder"));
+    assert!(view.contains("switch agent"));
+    assert!(!view.contains("sub-agent the main agent started"));
+    assert!(view.contains("/model"));
+    assert!(view.contains("switch model"));
     assert!(view.contains("/help"));
+    assert!(view.contains("all commands"));
+    assert!(!view.contains("collaboration mode"));
 }
 
 #[test]
@@ -84,12 +94,13 @@ fn ready_replaces_a_cached_team_loading_empty_state() {
         !view.contains("Team is loading..."),
         "stale loading view: {view}"
     );
-    assert!(view.contains("builder (codex, implementation)"));
+    assert!(view.contains("talk to Builder"));
 }
 
 #[test]
 fn session_reset_discards_the_painted_scrollback_cache() {
     let mut state = AppState::new(vec![ChatItem::Notice {
+        member: None,
         text: "history that /new must clear".to_string(),
     }]);
     let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
@@ -170,10 +181,55 @@ fn cached_working_indicator_moves_to_a_new_targeted_prompt() {
         .unwrap();
 
     let view = format!("{}", terminal.backend());
-    assert_eq!(view.matches("Working (").count(), 1, "{view}");
+    assert_eq!(view.matches("Working ·").count(), 1, "{view}");
     assert!(
-        view.find("new request") < view.find("Working ("),
+        view.find("new request") < view.find("Working ·"),
         "live status must belong to the current prompt: {view}"
+    );
+}
+
+#[test]
+fn working_row_is_just_the_state_and_the_time() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "demo".to_string(),
+        workspace: "/tmp".to_string(),
+        default_target: None,
+        runs: Vec::new(),
+        members: vec![member_summary(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "implementation",
+            MemberStatus::Running,
+        )],
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = render(frame, &state);
+        })
+        .unwrap();
+
+    let view = format!("{}", terminal.backend());
+    let row = view
+        .lines()
+        .find(|line| line.contains("Working"))
+        .unwrap_or_else(|| panic!("{view}"));
+    // `⠹ Working · 0s`: the spinner frame changes, the rest is fixed.
+    let at = row.find("Working").unwrap();
+    let rest = row[at..].trim_end_matches(['"', ' ']);
+    assert!(
+        rest.strip_prefix("Working · ")
+            .is_some_and(|time| time.ends_with('s')
+                && time
+                    .trim_end_matches('s')
+                    .chars()
+                    .all(|c| c.is_ascii_digit())),
+        "{row}"
     );
 }
 
@@ -288,10 +344,10 @@ fn cached_working_indicator_does_not_stick_to_a_prior_same_member_turn() {
         .unwrap();
 
     let view = format!("{}", terminal.backend());
-    assert_eq!(view.matches("Working (").count(), 1, "{view}");
+    assert_eq!(view.matches("Working ·").count(), 1, "{view}");
     let first = view.find("dispatched the plan to Planer").expect(&view);
     let implement = view.find("snake game/index.html").expect(&view);
-    let working = view.find("Working (").expect(&view);
+    let working = view.find("Working ·").expect(&view);
     assert!(
         first < implement && implement < working,
         "Working must follow the new turn, not the finished Builder reply: {view}"
@@ -330,6 +386,8 @@ fn cached_working_indicator_stays_on_prefix_when_only_others_continue() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![builder.clone()],
@@ -378,10 +436,10 @@ fn cached_working_indicator_stays_on_prefix_when_only_others_continue() {
         .unwrap();
 
     let view = format!("{}", terminal.backend());
-    assert_eq!(view.matches("Working (").count(), 2, "{view}");
+    assert_eq!(view.matches("Working ·").count(), 2, "{view}");
     let waiting = view.find("waiting on the plan").expect(&view);
     let drafting = view.find("planer still drafting").expect(&view);
-    let mut workings = view.match_indices("Working (").map(|(idx, _)| idx);
+    let mut workings = view.match_indices("Working ·").map(|(idx, _)| idx);
     let builder_working = workings.next().expect(&view);
     let planer_working = workings.next().expect(&view);
     assert!(
@@ -418,6 +476,8 @@ fn renders_a_clean_layout_snapshot() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::Notice("welcome to Asterline".to_string()));
     state.apply(RuntimeEvent::Route {
         turn: crate::domain::event::TurnId(1),
@@ -435,27 +495,25 @@ fn renders_a_clean_layout_snapshot() {
     let view = format!("{}", terminal.backend());
     eprintln!("\n{view}");
 
-    assert!(view.contains("Asterline"));
-    assert!(view.contains(env!("CARGO_PKG_VERSION")));
+    // No title row: the product name and version live in /help.
+    assert!(!view.contains(env!("CARGO_PKG_VERSION")));
     assert!(view.contains("Builder · codex"));
-    assert!(view.contains("builder → reviewer"));
+    assert!(view.contains("Builder → Reviewer"));
     // The running member surfaces a working indicator + interrupt hint.
     assert!(view.contains("Working"));
     assert!(view.contains("interrupt"));
-    // The composer is open (top/bottom rules only) — no enclosing box or
-    // rounded corners around the conversation or input.
+    // No enclosing box or rounded corners around the conversation or input.
     assert!(!view.contains('╭'));
 }
 
-#[test]
-fn composer_shows_mode_at_bottom_right_and_header_clips_workspace() {
+fn ready_in(workspace: &str) -> AppState {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
         modes: Default::default(),
         mode_overrides: Default::default(),
         suggested_verify: None,
         team: "t".to_string(),
-        workspace: "/Users/我/很长的项目路径名称超级超级长/子目录".to_string(),
+        workspace: workspace.to_string(),
         default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
         runs: Vec::new(),
         members: vec![member_summary(
@@ -466,33 +524,98 @@ fn composer_shows_mode_at_bottom_right_and_header_clips_workspace() {
             MemberStatus::Idle,
         )],
     });
+    state
+}
 
-    // Narrow terminal: the CJK path must clip by display width, not chars.
-    let mut terminal = Terminal::new(TestBackend::new(52, 10)).unwrap();
+/// The first row of a drawn view, without the backend's quoting.
+fn title_row(view: &str) -> String {
+    view.lines()
+        .next()
+        .and_then(|row| row.split('"').nth(1))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn draw_view(state: &AppState, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| {
-            let _ = render(frame, &state);
+            let _ = render(frame, state);
         })
         .unwrap();
-    let view = format!("{}", terminal.backend());
-    eprintln!("\n{view}");
+    format!("{}", terminal.backend())
+}
 
-    assert!(view.contains("Asterline"));
-    assert!(view.contains(env!("CARGO_PKG_VERSION")));
-    let rows = view.lines().collect::<Vec<_>>();
+#[test]
+fn the_mode_shows_as_a_chip_in_the_member_bar_not_as_a_composer_label() {
+    let mut state = ready_in("/tmp/ws");
+    let view = draw_view(&state, 60, 10);
     assert!(
-        !rows.first().is_some_and(|row| row.contains("mode:normal")),
-        "mode should not occupy the header: {view}"
+        !title_row(&view).contains("mode"),
+        "normal mode needs no chip: {view}"
     );
-    let mode_row = rows
-        .iter()
-        .position(|row| row.contains("mode:normal"))
-        .expect("mode label in composer");
+
+    state.apply(RuntimeEvent::ModeChanged {
+        mode: TerminalMode::Review,
+    });
+    let view = draw_view(&state, 60, 10);
+    assert!(!view.contains("mode:"), "{view}");
     assert!(
-        mode_row >= rows.len().saturating_sub(3),
-        "mode should render on the composer bottom border: {view}"
+        title_row(&view).contains(" review mode "),
+        "the chip belongs in the member bar: {view}"
     );
-    assert!(view.contains('…'));
+}
+
+#[test]
+fn the_path_is_dim_at_the_footer_end_and_clipped_from_the_left() {
+    // Narrow terminal: the CJK path must clip by display width, not chars,
+    // and lose its head (not the project folder).
+    let state = ready_in("/Users/我/很长的项目路径名称超级超级长/子目录");
+    let rows = draw_view(&state, 52, 10);
+    let footer = rows
+        .lines()
+        .rfind(|row| row.contains("Enter send"))
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert!(footer.starts_with("Enter send"), "{footer}");
+    assert!(footer.contains("  …"), "{footer}");
+    assert!(footer.trim_end().ends_with("子目录"), "{footer}");
+    assert!(!footer.contains("/Users"), "{footer}");
+
+    // A path that fits is shown whole, still apart from the hints.
+    let state = ready_in("/tmp/ws");
+    let rows = draw_view(&state, 52, 10);
+    let footer = rows
+        .lines()
+        .rfind(|row| row.contains("Enter send"))
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert!(footer.contains("/help  "), "{footer}");
+    assert!(footer.trim_end().ends_with("/tmp/ws"), "{footer}");
+}
+
+#[test]
+fn the_footer_path_abbreviates_the_home_directory() {
+    use crate::tui::header::display_workspace;
+    assert_eq!(
+        display_workspace("/home/me/proj", Some("/home/me")),
+        "~/proj"
+    );
+    assert_eq!(display_workspace("/home/me", Some("/home/me/")), "~");
+    assert_eq!(
+        display_workspace("/home/medium/proj", Some("/home/me")),
+        "/home/medium/proj",
+        "only whole path components are abbreviated"
+    );
+    assert_eq!(display_workspace("/tmp/x", Some("/home/me")), "/tmp/x");
+    assert_eq!(display_workspace("/tmp/x", None), "/tmp/x");
+    assert_eq!(display_workspace("/tmp/x", Some("")), "/tmp/x");
 }
 
 #[test]
@@ -528,15 +651,16 @@ fn renders_completion_popup() {
     let view = format!("{}", terminal.backend());
     eprintln!("\n{view}");
 
-    assert!(view.contains("/ask"));
-    assert!(view.contains("/all"));
+    assert!(view.contains("/approve"));
     assert!(view.contains("/attach"));
+    assert!(!view.contains("/ask"));
+    assert!(!view.contains("/all"));
     assert!(!view.contains("╭"));
     assert!(!view.contains("@member to send"));
-    assert!(view.contains("› /ask      send to one member"));
+    assert!(view.contains("› /approve  approve first pending"));
     assert_eq!(
         layout.and_then(|layout| layout.completion_area),
-        Some(Rect::new(0, 10, 70, 4))
+        Some(Rect::new(0, 8, 70, 2))
     );
 }
 
@@ -575,7 +699,7 @@ fn completion_popup_uses_text_only_selection() {
 }
 
 #[test]
-fn running_status_shows_model_and_effort() {
+fn running_status_leaves_the_model_and_interrupt_hint_to_other_places() {
     let mut builder = member_summary(
         "builder",
         "Builder",
@@ -604,14 +728,21 @@ fn running_status_shows_model_and_effort() {
         })
         .unwrap();
     let view = format!("{}", terminal.backend());
-    eprintln!("\n{view}");
 
-    // The activity line spells the profile out; the header stays compact.
-    assert!(view.contains("model: gpt-5-codex · high"));
+    // The activity line says only that the member works; the model lives in
+    // the Agents list and the interrupt keys in the footer.
+    let row = view
+        .lines()
+        .find(|line| line.contains("Working"))
+        .unwrap_or_else(|| panic!("{view}"));
+    assert!(!row.contains("gpt-5-codex"), "{row}");
+    assert!(!row.contains("high"), "{row}");
+    assert!(!row.contains("interrupt"), "{row}");
+    assert!(view.contains("Esc interrupt"), "{view}");
 }
 
 #[test]
-fn queued_waiting_and_approval_are_active_in_header_and_footer() {
+fn busy_states_are_not_spelled_out_in_the_footer() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
         modes: Default::default(),
@@ -654,17 +785,19 @@ fn queued_waiting_and_approval_are_active_in_header_and_footer() {
         .unwrap();
     let view = format!("{}", terminal.backend());
 
-    assert!(view.contains("Active 3 members"));
-    assert!(view.contains("Builder queued"));
-    assert!(view.contains("Reviewer waiting"));
-    assert!(view.contains("QA approval"));
-    assert!(!view.contains("○ Reviewer"));
-    assert!(!view.contains("@member first"));
+    // Busy states are never spelled out in the footer; the bar keeps glyphs
+    // and the viewed agent's live row (not shown here) carries the text.
+    assert!(!view.contains("Active 3 members"));
+    assert!(!view.contains("Builder queued"));
+    assert!(view.contains("Esc interrupt · ← agents · /help"));
+    assert!(!view.contains("Reviewer waiting"));
+    assert!(!view.contains("@member"));
 }
 
 #[test]
 fn queued_follow_up_is_previewed_above_the_composer() {
     let mut state = AppState::new(vec![ChatItem::Notice {
+        member: None,
         text: "existing chat".to_string(),
     }]);
     state.apply(RuntimeEvent::Ready {
@@ -779,7 +912,8 @@ fn renders_user_band_and_compact_tool() {
     let view = format!("{}", terminal.backend());
     eprintln!("\n{view}");
 
-    assert!(view.contains("◆ You"));
+    // A user message is a band: no name header, just the text.
+    assert!(!view.contains("◆ You"));
     assert!(view.contains("run the tests"));
     // The long command is truncated to a single line (ellipsis), not wrapped.
     assert!(view.contains('…'));
@@ -907,8 +1041,8 @@ fn failed_tool_only_colors_the_error_lines() {
         })
         .expect("error output");
 
-    assert_eq!(compiling.spans[2].style.fg, theme::muted().fg);
-    assert_eq!(error.spans[2].style.fg, theme::error().fg);
+    assert_eq!(compiling.spans[1].style.fg, theme::muted().fg);
+    assert_eq!(error.spans[1].style.fg, theme::error().fg);
 }
 
 #[test]
@@ -1045,6 +1179,7 @@ fn selected_text_joins_visible_chat_lines() {
         composer_area: None,
         composer_wrap: 0,
         composer_text_origin: 0,
+        tool_titles: Vec::new(),
     };
     let text = layout.selected_text(crate::tui::app_state::ChatSelection {
         start: (0, 0),
@@ -1429,6 +1564,108 @@ fn renders_multiline_composer() {
     assert!(view.contains("line two"));
 }
 
+fn paint_composer(
+    state: &AppState,
+    width: u16,
+    height: u16,
+) -> (String, Option<ChatLayout>, ratatui::layout::Position) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut layout = None;
+    terminal
+        .draw(|frame| {
+            layout = render(frame, state);
+        })
+        .unwrap();
+    let cursor = terminal.get_cursor_position().unwrap();
+    (format!("{}", terminal.backend()), layout, cursor)
+}
+
+#[test]
+fn composer_wraps_at_word_boundaries_and_keeps_the_cursor_on_the_text() {
+    let text = "adjust the parser to read the config file values and add tests for every new branch we touched here";
+    let mut state = AppState::new(Vec::new());
+    state.insert_text(text);
+
+    let (view, layout, cursor) = paint_composer(&state, 100, 24);
+    eprintln!("\n{view}");
+    // 98 columns of text: the break falls after "...touched" and the space
+    // stays on the upper row; no word is split.
+    assert!(view.contains("> adjust the parser"));
+    assert!(!view.contains("an\nd"), "{view}");
+    let layout = layout.expect("layout");
+    let area = layout.composer_area.expect("composer area");
+    assert_eq!(layout.composer_wrap, 98);
+    // Cursor is at the end of the last (second) row, right after "here".
+    let rows = state.composer().visual_lines_with_cursor(98).0;
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].ends_with(' ') && !rows[1].starts_with(' '));
+    assert_eq!(cursor.y, area.y + 1);
+    assert_eq!(cursor.x, area.x + 2 + rows[1].chars().count() as u16);
+}
+
+#[test]
+fn composer_wraps_a_long_word_and_cjk_without_overflowing() {
+    let mut state = AppState::new(Vec::new());
+    state.insert_text(&format!("{} 中文", "x".repeat(30)));
+    let (_, layout, cursor) = paint_composer(&state, 22, 16); // 20 text columns
+    let layout = layout.expect("layout");
+    let area = layout.composer_area.expect("composer area");
+    let rows = state.composer().visual_lines_with_cursor(20).0;
+    assert_eq!(
+        rows,
+        vec!["x".repeat(20), format!("{} 中文", "x".repeat(10))]
+    );
+    assert_eq!((cursor.x, cursor.y), (area.x + 2 + 15, area.y + 1));
+
+    let mut state = AppState::new(Vec::new());
+    state.insert_text(&"没有空格的很长中文句子".repeat(3));
+    let (view, layout, _) = paint_composer(&state, 22, 16);
+    let area = layout.expect("layout").composer_area.expect("area");
+    let rows = state.composer().visual_lines_with_cursor(20).0;
+    assert!(rows.len() > 1);
+    assert!(
+        rows.iter()
+            .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= 20)
+    );
+    assert_eq!(area.height as usize, rows.len());
+    assert!(view.contains(&rows[0]), "{view}");
+}
+
+#[test]
+fn tall_composer_scrolls_to_keep_the_cursor_row_visible() {
+    let mut state = AppState::new(Vec::new());
+    let words: Vec<String> = (0..40).map(|n| format!("word{n:02}")).collect();
+    state.insert_text(&words.join(" "));
+    // 20 text columns: three words per row, so 14 rows; only 8 fit.
+    let (view, layout, cursor) = paint_composer(&state, 22, 30);
+    let area = layout.expect("layout").composer_area.expect("area");
+    assert_eq!(area.height, 8);
+    assert!(view.contains("word39"));
+    assert!(!view.contains("word00"));
+    // The cursor stays on the last visible row, right after the last word.
+    assert_eq!(cursor.y, area.y + 7);
+    assert!(cursor.x > area.x + 2);
+}
+
+#[test]
+fn mouse_clicks_in_the_composer_use_the_wrapped_rows() {
+    let mut state = AppState::new(Vec::new());
+    state.insert_text("hello world again");
+    // 8 text columns: "hello " | "world " | "again".
+    let (_, layout, _) = paint_composer(&state, 10, 16);
+    let layout = layout.expect("layout");
+    let area = layout.composer_area.expect("area");
+    let at = |col: u16, row: u16| {
+        layout
+            .screen_to_composer_index(state.composer(), area.x + 2 + col, area.y + row)
+            .expect("inside composer")
+    };
+    assert_eq!(at(0, 0), 0);
+    assert_eq!(at(2, 1), 8);
+    assert_eq!(at(0, 2), 12);
+    assert_eq!(at(4, 2), 16);
+}
+
 #[test]
 fn renders_attached_image_inside_the_composer() {
     let dir = std::env::temp_dir().join(format!("asterline-composer-image-{}", std::process::id()));
@@ -1472,6 +1709,7 @@ fn screen_to_content_round_trip_edges() {
         composer_area: None,
         composer_wrap: 0,
         composer_text_origin: 0,
+        tool_titles: Vec::new(),
     };
     // Top-left of area → first_line, col 0.
     assert_eq!(
@@ -1497,6 +1735,7 @@ fn screen_to_content_round_trip_edges() {
 fn large_chat_is_trimmed_before_frame_flattening() {
     let chat = (0..crate::tui::app_state::MAX_CHAT_ITEMS + 200)
         .map(|index| ChatItem::Notice {
+            member: None,
             text: format!("notice {index}"),
         })
         .collect();

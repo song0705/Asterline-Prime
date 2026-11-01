@@ -6,6 +6,9 @@ use serde_json::Value;
 use crate::adapter::parser::tool_brief;
 use crate::domain::event::FileChangeItem;
 
+/// A group with more calls than this starts folded into one line.
+pub(crate) const TOOL_GROUP_COLLAPSE_ABOVE: usize = 3;
+
 /// Short verb for the subordinate tool row (`Read`, `Shell`, `Search`).
 pub(crate) fn tool_kind(name: &str) -> String {
     let raw = name.trim();

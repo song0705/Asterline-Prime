@@ -31,6 +31,8 @@ pub enum Action {
     ToggleTools,
     NextMember,
     PrevMember,
+    /// Ctrl+X: delete the highlighted item (only the Agents list uses it).
+    DeleteItem,
     /// Pull the last queued (not-yet-started) prompt back into the composer.
     EditQueued,
     /// Read a bitmap from the OS clipboard and attach it to the next send.
@@ -88,6 +90,7 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('e') if ctrl => Some(Action::End),
         KeyCode::Char('n') if ctrl => Some(Action::NextMember),
         KeyCode::Char('b') if ctrl => Some(Action::PrevMember),
+        KeyCode::Char('x') if ctrl => Some(Action::DeleteItem),
         KeyCode::Char(c) if !ctrl && !alt => Some(Action::InsertChar(c)),
         _ => None,
     }
@@ -206,10 +209,14 @@ mod tests {
 
     #[test]
     fn control_letters_are_not_inserted_as_text() {
-        // Ctrl+x is unbound, but must not be typed into the composer.
+        // Ctrl+z is unbound, but must not be typed into the composer.
+        assert_eq!(
+            resolve(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            None
+        );
         assert_eq!(
             resolve(key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
-            None
+            Some(Action::DeleteItem)
         );
     }
 

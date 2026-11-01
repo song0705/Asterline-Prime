@@ -3,72 +3,144 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::domain::event::MemberStatus;
+use crate::domain::mode::TerminalMode;
 use crate::tui::app_state::{AppState, MemberView, member_status_is_active};
 use crate::tui::runs_view::run_footer_hint;
-use crate::tui::status_indicator;
 use crate::tui::theme;
-use crate::tui::theme::{clip_width, display_width, truncate_width};
+use crate::tui::theme::{clip_width_start, display_width, truncate_width};
 
-/// Header: `Asterline 0.2.9    …    workspace`, one chip per member, and a
-/// thin rule that separates the header block from the conversation.
-pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let width = area.width as usize;
-    // Line 1: product and version. Team names and the active mode are
-    // metadata, not chrome.
-    let brand = " Asterline";
-    let version = format!(" {}", env!("CARGO_PKG_VERSION"));
-    let workspace = state.workspace().to_string();
-    let title_width = display_width(brand) + display_width(&version);
-    let space = width.saturating_sub(title_width).saturating_sub(1);
-    let workspace = if workspace.is_empty() || space < 8 {
-        String::new()
-    } else {
-        clip_width(&workspace, space)
+/// The workspace for the title row: `$HOME` abbreviated to `~`.
+pub(crate) fn display_workspace(workspace: &str, home: Option<&str>) -> String {
+    let Some(home) = home.map(|home| home.trim_end_matches(['/', '\\'])) else {
+        return workspace.to_string();
     };
-    let gap = width
-        .saturating_sub(title_width)
-        .saturating_sub(display_width(&workspace))
-        .saturating_sub(1);
-    let title_line = Line::from(vec![
-        Span::styled(brand, theme::accent_bold()),
-        Span::styled(version, theme::muted()),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(workspace, theme::muted()),
-    ]);
+    if home.is_empty() {
+        return workspace.to_string();
+    }
+    match workspace.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with(['/', '\\']) => format!("~{rest}"),
+        _ => workspace.to_string(),
+    }
+}
 
-    // Line 2: compact member chips. Runtime status belongs in the footer and
-    // run views, leaving this roster focused on names and backends.
-    let mut chips = vec![Span::raw(" ")];
+/// Columns kept clear between the key hints and the workspace path.
+const FOOTER_PATH_GAP: usize = 2;
+
+/// Header: one line of member chips (a status glyph, name and backend each),
+/// then the mode chip when a collaboration mode is active. No title row and no
+/// rule: the product name and version live in `/help`, the path in the footer.
+pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // Compact member chips, each led by a status glyph. The member
+    // shown in the main window is underlined. Sub-agents stay out of the bar
+    // (a count stands in for them) except the one being viewed or selected,
+    // which sits right after its parent.
+    let mut chips = vec![Span::raw("  ")];
+    let mut first = true;
+    let mut shown_children = Vec::new();
     for (i, member) in state.members().iter().enumerate() {
-        if i > 0 {
-            chips.push(Span::raw("  "));
+        if member.parent.is_some() {
+            continue;
         }
-        let name_style = if state.header_selected() == Some(i) {
-            theme::selection()
-        } else {
-            theme::backend_bold_shaded(member.backend, state.member_color_index(&member.id))
-        };
-        chips.push(Span::styled(member.display_name.clone(), name_style));
+        push_member_chip(&mut chips, state, i, member, &mut first);
+        for (child_index, child) in state.members().iter().enumerate() {
+            if child.parent.as_ref() == Some(&member.id)
+                && (state.focus() == Some(&child.id)
+                    || state.header_selected() == Some(child_index))
+            {
+                push_member_chip(&mut chips, state, child_index, child, &mut first);
+                shown_children.push(child_index);
+            }
+        }
+    }
+    // The active collaboration mode, as a chip right after the agents.
+    // Normal mode shows nothing.
+    if state.active_mode() != TerminalMode::Normal {
+        chips.push(Span::raw("  "));
         chips.push(Span::styled(
-            format!(" · {}", member.backend.as_str()),
-            theme::muted(),
+            format!(" {} mode ", state.active_mode()),
+            theme::bold(theme::accent_color()).bg(theme::user_band_bg()),
+        ));
+    }
+    // Count only the sub-agents the bar does not already show. A busy one
+    // tints the count; the bar carries no spinner or status text.
+    let hidden: Vec<&MemberView> = state
+        .members()
+        .iter()
+        .enumerate()
+        .filter(|(index, member)| member.parent.is_some() && !shown_children.contains(index))
+        .map(|(_, member)| member)
+        .collect();
+    if !hidden.is_empty() {
+        let busy = hidden
+            .iter()
+            .any(|member| member_status_is_active(member.status));
+        let label = format!(
+            "  +{} sub-agent{}",
+            hidden.len(),
+            if hidden.len() == 1 { "" } else { "s" }
+        );
+        chips.push(Span::styled(
+            label,
+            if busy {
+                theme::warning()
+            } else {
+                theme::muted()
+            },
         ));
     }
     if state.members().is_empty() {
         chips.push(Span::styled("starting…", theme::muted()));
     }
 
-    // Line 3: thin rule closing the header block.
-    let rule = Line::from(Span::styled("─".repeat(width.max(1)), theme::muted()));
+    frame.render_widget(Paragraph::new(Line::from(chips)), area);
+}
 
-    frame.render_widget(
-        Paragraph::new(vec![title_line, Line::from(chips), rule]),
-        area,
-    );
+fn push_member_chip(
+    chips: &mut Vec<Span<'static>>,
+    state: &AppState,
+    index: usize,
+    member: &MemberView,
+    first: &mut bool,
+) {
+    if !*first {
+        chips.push(Span::raw("  "));
+    }
+    *first = false;
+    chips.push(Span::styled(
+        format!("{} ", status_glyph(member.status)),
+        theme::member_dot_style(member.status),
+    ));
+    let mut name_style = if state.header_selected() == Some(index) {
+        theme::selection()
+    } else {
+        theme::backend_bold_shaded(member.backend, state.member_color_index(&member.id))
+    };
+    if state.focus() == Some(&member.id) {
+        name_style = name_style.add_modifier(Modifier::UNDERLINED);
+    }
+    chips.push(Span::styled(member.display_name.clone(), name_style));
+    chips.push(Span::styled(
+        format!(" · {}", member.backend.as_str()),
+        theme::muted(),
+    ));
+}
+
+/// Compact status marker for a member chip (styled by `theme::member_dot_style`: lit when active, dim when idle).
+pub(crate) fn status_glyph(status: MemberStatus) -> &'static str {
+    match status {
+        MemberStatus::Idle
+        | MemberStatus::Queued
+        | MemberStatus::Running
+        | MemberStatus::Waiting => "●",
+        MemberStatus::NeedsApproval => "!",
+        MemberStatus::Failed => "✗",
+    }
 }
 
 pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -141,59 +213,25 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
         ));
     }
 
-    let active_members: Vec<&MemberView> = state
-        .members()
-        .iter()
-        .filter(|member| member_status_is_active(member.status))
-        .collect();
-    let active = active_members.len();
-    if active > 0 {
+    // "Working" lives in one place only: the live row at the end of the viewed
+    // agent's transcript. The footer just says which keys apply meanwhile.
+    let viewed_busy = match state.focus() {
+        Some(focus) => state
+            .members()
+            .iter()
+            .any(|member| &member.id == focus && member_status_is_active(member.status)),
+        None => state
+            .members()
+            .iter()
+            .any(|member| member_status_is_active(member.status)),
+    };
+    if viewed_busy {
         if !parts.is_empty() {
             parts.push(Span::raw("   "));
         }
-        let elapsed = active_members
-            .iter()
-            .filter_map(|member| state.member_elapsed_secs(&member.id))
-            .max();
-        let mut names: Vec<String> = active_members
-            .iter()
-            .take(3)
-            .map(|member| {
-                if member.status == MemberStatus::Running {
-                    member.display_name.clone()
-                } else {
-                    format!(
-                        "{} {}",
-                        member.display_name,
-                        theme::status_label(member.status)
-                    )
-                }
-            })
-            .collect();
-        if active > names.len() {
-            names.push(format!("+{}", active - names.len()));
-        }
-        let text = if active_members
-            .iter()
-            .all(|member| member.status == MemberStatus::Running)
-        {
-            status_indicator::running_footer_text(
-                active,
-                elapsed,
-                &names,
-                status_indicator::spinner(),
-            )
-        } else {
-            status_indicator::active_footer_text(
-                active,
-                elapsed,
-                &names,
-                status_indicator::spinner(),
-            )
-        };
         parts.push(Span::styled(
-            text.unwrap_or_default(),
-            theme::warning_bold(),
+            "Esc interrupt · ← agents · /help",
+            theme::muted(),
         ));
         let queued = state.queued_prompt_count();
         if queued > 0 {
@@ -211,8 +249,32 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     } else if parts.is_empty() {
         // Idle: one short, faint key-hint line.
         parts.push(Span::styled(
-            "@member first · Enter send · /help",
+            "Enter send · ← agents · /help",
             theme::muted(),
+        ));
+    }
+
+    // The workspace, `~`-abbreviated and clipped from the left so the project
+    // folder stays visible, dim at the right end.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+    let workspace = display_workspace(state.workspace(), home.as_deref());
+    let used: usize = parts
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum();
+    let width = area.width as usize;
+    let room = width
+        .saturating_sub(used)
+        .saturating_sub(FOOTER_PATH_GAP + 1);
+    if !workspace.is_empty() && room >= 8 {
+        let path = clip_width_start(&workspace, room);
+        let gap = width - used - display_width(&path) - 1;
+        parts.push(Span::raw(" ".repeat(gap)));
+        parts.push(Span::styled(
+            path,
+            theme::muted().add_modifier(Modifier::DIM),
         ));
     }
 

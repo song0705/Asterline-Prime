@@ -142,7 +142,6 @@ fn readmes_use_real_product_images_without_a_handwritten_ui_mockup() {
     for (path, document) in &DOCUMENTS[..2] {
         for image in [
             "docs/assets/chat.webp",
-            "docs/assets/team.webp",
             "docs/assets/mode.webp",
             "docs/assets/review.webp",
             "docs/assets/plan.webp",

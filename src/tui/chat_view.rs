@@ -7,18 +7,21 @@ use std::cell::RefCell;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::domain::event::{ChatItem, FileChangeItem};
-use crate::domain::team::{BackendKind, DefaultTarget, MemberId};
-use crate::tui::app_state::{AppState, member_status_is_active};
+use crate::domain::team::{BackendKind, MemberId};
+use crate::tui::agents_view;
+use crate::tui::app_state::{AppState, FocusRow, focus_row, member_status_is_active};
 use crate::tui::completion::Completion;
-use crate::tui::drawer_view::render_drawer;
+use crate::tui::drawer_view::{inline_height, is_inline, render_drawer, render_inline_drawer};
+use crate::tui::drawers::Drawer;
 use crate::tui::file_diff;
 use crate::tui::header::{render_footer, render_header};
 use crate::tui::markdown;
+use crate::tui::model_picker;
 use crate::tui::status_indicator;
 use crate::tui::theme;
 use crate::tui::theme::{clip_width, truncate_width};
@@ -47,9 +50,22 @@ pub struct ChatLayout {
     pub composer_wrap: usize,
     /// Visual rows reserved above composer text (attachment chips).
     pub composer_text_origin: u16,
+    /// Clickable tool-group title rows inside the viewport, as
+    /// `(flattened line index, chat index of the group's first item)`. The
+    /// line index is content-anchored, like `first_line`, so a click maps
+    /// correctly after the view has scrolled.
+    pub tool_titles: Vec<(usize, usize)>,
 }
 
 impl ChatLayout {
+    /// Chat index of the tool group whose title sits on flattened line `line`.
+    pub fn tool_group_at_line(&self, line: usize) -> Option<usize> {
+        self.tool_titles
+            .iter()
+            .find(|(at, _)| *at == line)
+            .map(|(_, key)| *key)
+    }
+
     /// Maximum scroll offset (lines up from the bottom) for this layout.
     pub fn max_scroll(&self) -> usize {
         let height = self.area.height as usize;
@@ -136,76 +152,81 @@ impl ChatLayout {
             } else {
                 theme::display_width(line)
             };
-            out.push_str(&theme::slice_display_cols(line, start_col, end_col));
+            // The user band pads rows to the full width; do not copy the padding.
+            out.push_str(theme::slice_display_cols(line, start_col, end_col).trim_end());
         }
         out
     }
 }
 
-// Paint the rail as a terminal-cell background instead of a font glyph. This
-// fills the complete cell rectangle regardless of font ascent, descent, or
-// line-height metrics, so adjacent rows meet without visible seams.
-fn chat_rail(color: Color) -> Span<'static> {
-    Span::styled(" ", Style::default().bg(color))
-}
-
-fn member_rail_color(state: &AppState, member: &MemberId) -> Color {
-    if state
-        .members()
-        .iter()
-        .any(|candidate| &candidate.id == member)
-    {
-        return state.member_color(member);
-    }
-    state
-        .chat()
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            ChatItem::Agent {
-                member: candidate,
-                backend,
-                ..
-            }
-            | ChatItem::Thinking {
-                member: candidate,
-                backend,
-                ..
-            } if candidate == member => Some(theme::backend_color(*backend)),
-            _ => None,
-        })
-        .unwrap_or_else(theme::muted_color)
-}
-
 /// Paint the full chat UI. Returns a layout snapshot of the conversation
 /// column for content-anchored selection (ignored when a drawer is open).
 pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
+    // The Agents list replaces the whole chat screen: no transcript,
+    // composer or footer.
+    if state.drawer() == Some(Drawer::Agents) {
+        agents_view::render(frame, state);
+        return None;
+    }
     // The composer grows with its content up to a cap, like a real textarea.
     const MAX_COMPOSER_ROWS: u16 = 8;
     let composer_avail = frame.area().width.saturating_sub(2) as usize;
     let composer_rows =
         (state.composer().visual_line_count(composer_avail) as u16).clamp(1, MAX_COMPOSER_ROWS);
-    let composer_height = composer_rows + 2; // top and bottom rules
-    let completion = if state.drawer().is_none() {
+    // One band padding row above and one below the input, like a user band.
+    let composer_height = composer_rows + 2;
+    let completion = if state.drawer().is_none() && !state.model_picker_open() {
         state.completion()
     } else {
         None
     };
-    let bottom_height = completion
-        .as_ref()
-        .map(completion_popup_height)
-        .unwrap_or(1);
+    // The key-hint footer stays one row below the composer band; the
+    // completion list sits above the band instead.
+    let bottom_height = 1;
+    let completion_height = completion.as_ref().map_or(0, completion_popup_height);
     let queued_preview = queued_input_preview_lines(state, frame.area().width as usize);
     let queued_height = queued_preview.len() as u16;
     let approval_height = approval_card_height(state, frame.area().width);
+    let picker = state.model_picker_view();
+    // Leave the chat a few rows even on a short terminal.
+    let picker_height = picker.as_ref().map_or(0, |view| {
+        model_picker::picker_height(view).min(frame.area().height.saturating_sub(10))
+    });
+    // Panels above the composer are set off from the transcript by one blank
+    // row (their first row) instead of a rule.
+    const PANEL_GAP: u16 = 1;
+    // The mode panel sits above the composer like the picker: as tall as
+    // its content, at most about half the chat area.
+    let inline_drawer = state.drawer().filter(is_inline);
+    let inline_drawer_height = inline_drawer.as_ref().map_or(0, |drawer| {
+        let chat_rows = frame
+            .area()
+            .height
+            .saturating_sub(1 + queued_height + approval_height + composer_height + bottom_height);
+        inline_height(
+            state,
+            drawer,
+            frame.area().width,
+            (chat_rows / 2).max(5).min(chat_rows.saturating_sub(2)),
+        )
+    });
+    let panel_height = picker_height
+        .max(inline_drawer_height)
+        .max(completion_height);
+    let above_composer_height = if panel_height > 0 {
+        panel_height + PANEL_GAP
+    } else {
+        0
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(queued_height),
             Constraint::Length(approval_height),
+            Constraint::Length(above_composer_height),
             Constraint::Length(composer_height),
             Constraint::Length(bottom_height),
         ])
@@ -215,27 +236,55 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     let mut layout = render_chat(frame, chunks[1], state);
     frame.render_widget(Paragraph::new(queued_preview), chunks[2]);
     render_approval_card(frame, chunks[3], state);
-    render_composer(frame, chunks[4], state);
-    let composer_inner = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .inner(chunks[4]);
+    render_composer(frame, chunks[5], state);
+    // The panel area minus its leading blank row.
+    let panel = Rect::new(
+        chunks[4].x,
+        chunks[4].y + PANEL_GAP.min(chunks[4].height),
+        chunks[4].width,
+        chunks[4].height.saturating_sub(PANEL_GAP),
+    );
+    if let Some(view) = &picker {
+        // After the composer so the search box owns the cursor.
+        model_picker::render_picker(frame, panel, view);
+    }
+    let composer_inner = composer_text_area(chunks[5]);
     layout.composer_area = Some(composer_inner);
     layout.composer_wrap = (composer_inner.width as usize).saturating_sub(2);
     layout.composer_text_origin = 0;
     if let Some(completion) = completion {
-        render_popup(frame, chunks[5], &completion, state.popup_selected());
-        layout.completion_area = Some(chunks[5]);
-    } else {
-        render_footer(frame, chunks[5], state);
+        render_popup(frame, panel, &completion, state.popup_selected());
+        layout.completion_area = Some(panel);
     }
+    render_footer(frame, chunks[6], state);
 
     if let Some(drawer) = state.drawer() {
-        render_drawer(frame, frame.area(), state, &drawer);
-        // Drawer overlays the chat; content selection uses the drawer path.
+        if is_inline(&drawer) {
+            render_inline_drawer(frame, panel, state, &drawer);
+        } else {
+            // The overlay is as tall as its content (at most the chat
+            // column), full width, anchored above the composer; it clears
+            // every cell it covers.
+            render_drawer(frame, chunks[1], state, &drawer);
+        }
+        // Drawers replace the chat for selection; content selection uses the
+        // drawer path.
         return None;
     }
     Some(layout)
 }
+
+/// Left edge shared by every transcript row: user text, agent text, tool and
+/// agent-message group titles, reasoning, notices and the Working row.
+const INDENT_TEXT: &str = "  ";
+
+/// Columns for wrapped text: the left indent and one column of right margin.
+fn content_width(width: usize) -> usize {
+    width.saturating_sub(INDENT_TEXT.len() + 1).max(1)
+}
+
+/// Widest a transcript row gets: long lines stay readable on wide terminals.
+const MAX_READING_WIDTH: usize = 120;
 
 const QUEUED_PREVIEW_LINE_LIMIT: usize = 3;
 
@@ -356,14 +405,19 @@ fn completion_parts(label: &str) -> (&str, Option<&str>) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PaintKey {
     width: usize,
+    focus: Option<MemberId>,
     roster_revision: u64,
     thinking_expanded: bool,
     diffs_expanded: bool,
     tools_expanded: bool,
+    /// Bumps whenever a single tool group is toggled or the set is cleared.
+    tool_groups_revision: u64,
     find_current: Option<usize>,
+    /// The welcome page's model line, which fills in when a catalog lands.
+    welcome_model: Option<String>,
 }
 
 #[derive(Default)]
@@ -376,6 +430,10 @@ struct ChatPaintCache {
     live_slots: Vec<LiveSlot>,
 }
 
+/// Visible styled lines, their plain text, the total flattened line count,
+/// and the clickable tool-group titles `(line index, group key)`.
+type PaintedChat = (Vec<Line<'static>>, Vec<String>, usize, Vec<(usize, usize)>);
+
 #[derive(Clone, Default)]
 struct CachedChunk {
     item_lo: usize,
@@ -383,6 +441,9 @@ struct CachedChunk {
     height: usize,
     lines: Option<Vec<Line<'static>>>,
     plain: Option<Vec<String>>,
+    /// `(line offset in the chunk, chat index of the group's first item)` for
+    /// each clickable tool-group title.
+    tool_titles: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -411,11 +472,18 @@ enum LiveRender<'a> {
 fn paint_key(state: &AppState, width: usize) -> PaintKey {
     PaintKey {
         width,
+        focus: state.focus().cloned(),
         roster_revision: state.roster_revision(),
         thinking_expanded: state.thinking_expanded(),
         diffs_expanded: state.diffs_expanded(),
         tools_expanded: state.tools_expanded(),
+        tool_groups_revision: state.tool_groups_revision(),
         find_current: state.find_current_chat_index(),
+        welcome_model: state
+            .chat()
+            .is_empty()
+            .then(|| state.welcome_model_summary())
+            .flatten(),
     }
 }
 
@@ -427,13 +495,14 @@ fn line_to_plain(line: &Line<'_>) -> String {
 }
 
 fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayout {
-    let block = Block::default().padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    // No side padding: the transcript owns its left edge (a 2-column indent)
+    // and the user band runs the full width.
+    let inner = area;
 
     let width = inner.width as usize;
     let height = inner.height as usize;
-    let (mut visible, plain, total) = painted_chat(state, width, state.scroll(), height);
+    let (mut visible, plain, total, tool_titles) =
+        painted_chat(state, width, state.scroll(), height);
 
     let max_start = total.saturating_sub(height);
     let start = max_start.saturating_sub(state.scroll());
@@ -452,18 +521,14 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
         composer_area: None,
         composer_wrap: 0,
         composer_text_origin: 0,
+        tool_titles,
     }
 }
 
 /// Grok Build keeps a pinned header and virtualizes the middle scrollback:
 /// each finished chunk is measured once, off-screen render caches are
 /// dropped, and a live tail is the only thing rebuilt while streaming.
-fn painted_chat(
-    state: &AppState,
-    width: usize,
-    scroll: usize,
-    height: usize,
-) -> (Vec<Line<'static>>, Vec<String>, usize) {
+fn painted_chat(state: &AppState, width: usize, scroll: usize, height: usize) -> PaintedChat {
     CHAT_PAINT.with(|cell| {
         let mut cache = cell.borrow_mut();
         ensure_scrollback_cached(state, width, &mut cache);
@@ -479,7 +544,7 @@ fn ensure_scrollback_cached(state: &AppState, width: usize, cache: &mut ChatPain
         .iter()
         .map(|item| paint_item_revision(state, item, spinner_frame))
         .collect();
-    let flags_changed = cache.key != Some(key);
+    let flags_changed = cache.key.as_ref() != Some(&key);
     let dirty = if flags_changed {
         0
     } else {
@@ -603,6 +668,7 @@ fn render_chunk(
     live_slots: &mut Vec<LiveSlot>,
 ) -> CachedChunk {
     let mut lines = Vec::new();
+    let mut tool_titles = Vec::new();
     if start == 0 && state.chat().is_empty() {
         lines.push(Line::raw(""));
         lines.extend(quick_start_lines(state));
@@ -615,14 +681,18 @@ fn render_chunk(
         end,
         &mut lines,
         LiveRender::Record(live_slots),
+        &mut tool_titles,
     );
     if end == state.chat().len() && state.omitted_active_output_count() > 0 {
         let omitted = state.omitted_active_output_count();
         let text = format!(
             "… {omitted} active output cell(s) omitted by the TUI memory limit; final results will appear on completion"
         );
-        for wrapped in markdown::wrap(&text, width.max(1)) {
-            lines.push(Line::from(Span::styled(wrapped, theme::warning_bold())));
+        for wrapped in markdown::wrap(&text, content_width(width.min(MAX_READING_WIDTH))) {
+            lines.push(Line::from(Span::styled(
+                format!("{INDENT_TEXT}{wrapped}"),
+                theme::warning_bold(),
+            )));
         }
         lines.push(Line::raw(""));
     }
@@ -632,6 +702,7 @@ fn render_chunk(
         height: lines.len(),
         plain: Some(lines.iter().map(line_to_plain).collect()),
         lines: Some(lines),
+        tool_titles,
     }
 }
 
@@ -655,7 +726,16 @@ fn item_rev(item: &ChatItem) -> u64 {
             )
         }
         ChatItem::Route { body, .. } => (6, body.len(), body.as_bytes()),
-        ChatItem::Notice { text } => (7, text.len(), text.as_bytes()),
+        ChatItem::Notice { text, .. } => (7, text.len(), text.as_bytes()),
+        ChatItem::Spawn {
+            parent,
+            child,
+            summary,
+        } => (
+            10,
+            parent.as_str().len() + child.as_str().len() + summary.len(),
+            child.as_str().as_bytes(),
+        ),
         ChatItem::Error { message, .. } => (8, message.len(), message.as_bytes()),
         ChatItem::Verdict { summary, .. } => (9, summary.len(), summary.as_bytes()),
     };
@@ -677,10 +757,18 @@ fn compose_scrollback(
     width: usize,
     scroll: usize,
     height: usize,
-) -> (Vec<Line<'static>>, Vec<String>, usize) {
+) -> PaintedChat {
     let prefix_h = cache.prefix.as_ref().map_or(0, |chunk| chunk.height);
     let tail_h = cache.tail.as_ref().map_or(0, |chunk| chunk.height);
-    let live = realized_live_slots(cache, state, width);
+    let mut live = realized_live_slots(cache, state, width);
+    // A Working row in the middle of the transcript is an entry too: one blank
+    // row keeps it off the entry below.
+    let content_rows = prefix_h + tail_h;
+    for (at, lines) in &mut live {
+        if *at < content_rows && lines.last().is_some_and(|line| !line_is_blank(line)) {
+            lines.push(Line::raw(""));
+        }
+    }
     let extra: usize = live.iter().map(|(_, lines)| lines.len()).sum();
     let total = prefix_h + tail_h + extra;
     let max_start = total.saturating_sub(height);
@@ -694,38 +782,49 @@ fn compose_scrollback(
 
     let mut visible = Vec::with_capacity(height.min(total));
     let mut plain = Vec::with_capacity(height.min(total));
+    let mut titles = Vec::new();
     let mut index = 0usize;
     let mut live_at = 0usize;
-    let mut emit = |line: &Line<'static>| {
+    // `title` is the chat index of the tool group this row titles, if any.
+    let mut emit = |line: &Line<'static>, title: Option<usize>| {
         if index >= start && visible.len() < height {
             plain.push(line_to_plain(line));
             visible.push(line.clone());
+            if let Some(key) = title {
+                titles.push((index, key));
+            }
         }
         index += 1;
     };
-    let flush_live_at = |at: usize, live_at: &mut usize, emit: &mut dyn FnMut(&Line<'static>)| {
-        while *live_at < live.len() && live[*live_at].0 == at {
-            for live_line in &live[*live_at].1 {
-                emit(live_line);
+    let flush_live_at =
+        |at: usize, live_at: &mut usize, emit: &mut dyn FnMut(&Line<'static>, Option<usize>)| {
+            while *live_at < live.len() && live[*live_at].0 == at {
+                for live_line in &live[*live_at].1 {
+                    emit(live_line, None);
+                }
+                *live_at += 1;
             }
-            *live_at += 1;
-        }
-    };
+        };
     let emit_chunk = |chunk: Option<&CachedChunk>,
                       origin: usize,
                       live_at: &mut usize,
-                      emit: &mut dyn FnMut(&Line<'static>)| {
+                      emit: &mut dyn FnMut(&Line<'static>, Option<usize>)| {
         if let Some(chunk) = chunk
             && let Some(lines) = chunk.lines.as_ref()
         {
             for (offset, line) in lines.iter().enumerate() {
                 flush_live_at(origin + offset, live_at, emit);
-                emit(line);
+                let title = chunk
+                    .tool_titles
+                    .iter()
+                    .find(|(at, _)| *at == offset)
+                    .map(|(_, key)| *key);
+                emit(line, title);
             }
         } else if let Some(chunk) = chunk {
             for offset in 0..chunk.height {
                 flush_live_at(origin + offset, live_at, emit);
-                emit(&Line::raw(""));
+                emit(&Line::raw(""), None);
             }
         }
     };
@@ -733,11 +832,11 @@ fn compose_scrollback(
     emit_chunk(cache.tail.as_ref(), prefix_h, &mut live_at, &mut emit);
     while live_at < live.len() {
         for live_line in &live[live_at].1 {
-            emit(live_line);
+            emit(live_line, None);
         }
         live_at += 1;
     }
-    (visible, plain, total)
+    (visible, plain, total, titles)
 }
 
 fn evict_offscreen_chunk(
@@ -803,6 +902,7 @@ fn render_chat_history(state: &AppState, width: usize, start: usize, out: &mut V
         state.chat().len(),
         out,
         LiveRender::Inline,
+        &mut Vec::new(),
     );
 }
 
@@ -922,6 +1022,32 @@ fn user_breaks_member_region(item: &ChatItem, member: &MemberId) -> bool {
     }
 }
 
+/// The nearest earlier row that is actually drawn, looking back through this
+/// paint chunk and then the items before it. With `skip_agent_messages`,
+/// `⇄ agents` rows are passed over.
+fn previous_rendered<'a>(
+    state: &AppState,
+    items: &'a [ChatItem],
+    order: &[usize],
+    pos: usize,
+    start: usize,
+    skip_agent_messages: bool,
+) -> Option<&'a ChatItem> {
+    let counts = |item: &&ChatItem| {
+        item_renders(item, state) && !(skip_agent_messages && is_agent_message(item))
+    };
+    order[..pos]
+        .iter()
+        .rev()
+        .map(|&p| &items[p])
+        .find(counts)
+        .or_else(|| {
+            (start > 0)
+                .then(|| items[..start].iter().rev().find(counts))
+                .flatten()
+        })
+}
+
 fn render_chat_history_range(
     state: &AppState,
     width: usize,
@@ -929,12 +1055,21 @@ fn render_chat_history_range(
     end: usize,
     out: &mut Vec<Line<'static>>,
     mut live: LiveRender<'_>,
+    titles: &mut Vec<(usize, usize)>,
 ) {
+    // Text never wraps wider than the reading width; only the user band
+    // keeps the full terminal width for its background.
+    let full_width = width;
+    let width = width.min(MAX_READING_WIDTH);
     let items = state.chat();
     let start = start.min(items.len());
     let end = end.min(items.len()).max(start);
-    let order = grouped_chat_indices(items, start, end);
-    let mut saw_work_activity = start > 0 && items[..start].iter().any(is_work_activity);
+    // A focused member's window drops everyone else's work from the display
+    // order, so hidden items never act as a neighbour or previous speaker.
+    let order: Vec<usize> = grouped_chat_indices(items, start, end)
+        .into_iter()
+        .filter(|&i| focus_row(state, &items[i]) != FocusRow::Hidden)
+        .collect();
     let mut rendered_live = std::collections::HashSet::new();
     let mut skip_until = 0usize;
     for (pos, &i) in order.iter().enumerate() {
@@ -951,40 +1086,25 @@ fn render_chat_history_range(
         ) {
             continue;
         }
-        if matches!(item, ChatItem::User { .. }) && saw_work_activity {
-            render_turn_separator(width, out);
-            saw_work_activity = false;
-        }
-        if is_work_activity(item) {
-            saw_work_activity = true;
-        }
         let before = out.len();
-        let previous = order[..pos]
-            .iter()
-            .rev()
-            .map(|&p| &items[p])
-            .find(|item| item_renders(item, state))
-            .or_else(|| {
-                (start > 0)
-                    .then(|| {
-                        items[..start]
-                            .iter()
-                            .rev()
-                            .find(|item| item_renders(item, state))
-                    })
-                    .flatten()
-            });
-        let previous_sender = previous.and_then(item_sender);
-        // A new user or agent reply keeps its own title. Mid-turn text after
-        // the same member's work stays on that member header.
+        let previous = previous_rendered(state, items, &order, pos, start, false);
+        // Agent-to-agent rows (`⇄ agents`) belong to the block they sit in,
+        // so they never decide who spoke last.
+        let speaker_before = previous_rendered(state, items, &order, pos, start, true);
+        let after_agent_messages = previous.is_some_and(is_agent_message);
+        // A new user message or another agent's reply starts a new block. The
+        // same agent continuing after its own tools or agent-message rows
+        // stays under its header; two consecutive replies keep their titles.
         let show_sender_header = match item {
             ChatItem::User { .. } => true,
-            ChatItem::Agent { member, .. } => match previous {
-                Some(ChatItem::Agent { member: prev, .. }) if prev == member => true,
+            ChatItem::Agent { member, .. } => match speaker_before {
+                Some(ChatItem::Agent { member: prev, .. }) if prev == member => {
+                    !after_agent_messages
+                }
                 Some(prev) if item_sender(prev) == Some(ChatSender::Agent(member.clone())) => false,
                 _ => true,
             },
-            _ => item_sender(item) != previous_sender,
+            _ => item_sender(item) != speaker_before.and_then(item_sender),
         };
         let run_end = consecutive_work_run_end(items, &order, pos);
         let is_find_current = order[pos..=run_end]
@@ -992,17 +1112,30 @@ fn render_chat_history_range(
             .any(|&idx| state.find_current_chat_index() == Some(idx));
         if matches!(item, ChatItem::Tool { .. } | ChatItem::Diff { .. }) {
             let run: Vec<&ChatItem> = order[pos..=run_end].iter().map(|&j| &items[j]).collect();
-            render_work_run(&run, width, state, out, show_sender_header);
+            let anchor = ToolGroupAnchor {
+                first_index: i,
+                titles,
+            };
+            render_work_run(&run, anchor, width, state, out, show_sender_header);
+            skip_until = run_end + 1;
+        } else if is_agent_message(item) {
+            let run: Vec<&ChatItem> = order[pos..=run_end].iter().map(|&j| &items[j]).collect();
+            render_agent_messages(&run, width, state, out);
             skip_until = run_end + 1;
         } else {
-            render_item(item, width, state, out, show_sender_header);
+            render_item_wide(item, width, full_width, state, out, show_sender_header);
         }
         if is_find_current && let Some(line) = out.get_mut(before) {
-            // Marker in the gutter for the current `/find` match.
-            let mut spans = vec![Span::styled("»", theme::selection())];
-            spans.append(&mut line.spans);
-            line.spans = spans;
+            // Marker in column 0, over the first blank column of the row, so
+            // the text keeps its place.
+            mark_find_match(line);
         }
+        // Exactly one blank row between consecutive entries (a user band, a
+        // reply, a tool group, ...); nothing inside an entry.
+        if out.len() > before {
+            out.push(Line::raw(""));
+        }
+
         let item = &items[order[run_end]];
         let next = order.get(run_end + 1).map(|&j| &items[j]);
         let member_block_ends = item_member(item)
@@ -1036,32 +1169,13 @@ fn render_chat_history_range(
                 }
             }
         }
-        // Same-member tools / thinking / diffs stay on one rail. A completed
-        // tool/diff run gets a rail gap before the member's next reply;
-        // distinct replies and members get a plain gap.
-        if out.len() > before {
-            let same_member = next.is_some_and(|next| same_member_thread(item, next));
-            let glued_replies = is_speech_item(item) && next.is_some_and(is_speech_item);
-            let work_to_reply = matches!(item, ChatItem::Tool { .. } | ChatItem::Diff { .. })
-                && matches!(next, Some(ChatItem::Agent { .. }));
-            if work_to_reply && same_member {
-                if let Some(member) = item_member(item) {
-                    out.push(Line::from(vec![
-                        chat_rail(member_rail_color(state, member)),
-                        Span::raw(""),
-                    ]));
-                }
-            } else if !same_member || glued_replies {
-                out.push(Line::raw(""));
-            }
-        }
-    }
-    if end == items.len() && saw_work_activity && state.running_count() == 0 {
-        render_turn_separator(width, out);
     }
     if end == items.len() {
         for member in state.members() {
             if rendered_live.contains(&member.id) {
+                continue;
+            }
+            if state.focus().is_some_and(|focus| focus != &member.id) {
                 continue;
             }
             // Prefix already recorded this member's live row. A tail-only
@@ -1135,6 +1249,10 @@ fn render_live_member_activity(
     show_placeholder_header: bool,
     out: &mut Vec<Line<'static>>,
 ) -> bool {
+    if state.focus().is_some_and(|focus| focus != member_id) {
+        return false;
+    }
+    let width = width.min(MAX_READING_WIDTH);
     let Some(member) = state.members().iter().find(|m| &m.id == member_id) else {
         return false;
     };
@@ -1146,7 +1264,8 @@ fn render_live_member_activity(
         return false;
     }
     if show_placeholder_header {
-        out.push(agent_header_line(
+        out.extend(agent_header_line(
+            state,
             &member.display_name,
             member.backend,
             state.member_color(&member.id),
@@ -1159,11 +1278,10 @@ fn render_live_member_activity(
         reasoning.is_some(),
         state.member_elapsed_secs(&member.id),
         status_indicator::spinner(),
-        Some(&state.member_runtime_profile(member)),
     );
     for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
         out.push(Line::from(vec![
-            chat_rail(state.member_color(&member.id)),
+            Span::raw(" "),
             Span::raw(" "),
             Span::styled(wrapped, theme::muted_italic()),
         ]));
@@ -1172,6 +1290,16 @@ fn render_live_member_activity(
 }
 
 fn consecutive_work_run_end(items: &[ChatItem], order: &[usize], pos: usize) -> usize {
+    if order.get(pos).is_some_and(|&i| is_agent_message(&items[i])) {
+        let mut end = pos;
+        while order
+            .get(end + 1)
+            .is_some_and(|&j| is_agent_message(&items[j]))
+        {
+            end += 1;
+        }
+        return end;
+    }
     let member = match order.get(pos).map(|&i| &items[i]) {
         Some(ChatItem::Tool { member, .. } | ChatItem::Diff { member, .. }) => member,
         _ => return pos,
@@ -1190,8 +1318,17 @@ fn consecutive_work_run_end(items: &[ChatItem], order: &[usize], pos: usize) -> 
     end
 }
 
+/// Where a tool group sits in the transcript: the chat index of the first
+/// item of its run (the key for per-group expansion) and the list that learns
+/// which output row is the clickable title.
+struct ToolGroupAnchor<'a> {
+    first_index: usize,
+    titles: &'a mut Vec<(usize, usize)>,
+}
+
 fn render_work_run(
     run: &[&ChatItem],
+    anchor: ToolGroupAnchor<'_>,
     width: usize,
     state: &AppState,
     out: &mut Vec<Line<'static>>,
@@ -1260,7 +1397,7 @@ fn render_work_run(
         })
         .collect();
     if !tools.is_empty() {
-        render_tool_group(&tools, width, state, out, show_sender_header);
+        render_tool_group(&tools, Some(anchor), width, state, out, show_sender_header);
     }
     let member = diff_member.or_else(|| {
         edit_tools.iter().find_map(|item| match item {
@@ -1271,7 +1408,8 @@ fn render_work_run(
     if let Some(member) = member.filter(|_| !files.is_empty()) {
         if tools.is_empty() && show_sender_header {
             let (display_name, backend) = state.member_meta(member);
-            out.push(agent_header_line(
+            out.extend(agent_header_line(
+                state,
                 &display_name,
                 backend,
                 state.member_color(member),
@@ -1282,12 +1420,9 @@ fn render_work_run(
             .enumerate()
         {
             if index > 0 {
-                out.push(Line::from(vec![
-                    chat_rail(member_rail_color(state, member)),
-                    Span::raw(""),
-                ]));
+                out.push(Line::from(vec![Span::raw(" "), Span::raw("")]));
             }
-            render_file_changes(state, member, &files, diff_ok, width, out);
+            render_file_changes(state, &files, diff_ok, width, out);
         }
     }
 }
@@ -1402,8 +1537,37 @@ fn file_change_detail_len(file: &FileChangeItem) -> usize {
         + file.patch.as_ref().map_or(0, String::len)
 }
 
+/// Distinct tool kinds named in a collapsed title before `…`.
+const COLLAPSED_KINDS_SHOWN: usize = 4;
+
+/// `3 read, 5 edit, 4 shell` in order of first appearance, capped with `…`.
+fn tool_kind_counts(tools: &[&ChatItem]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for item in tools {
+        let ChatItem::Tool { name, .. } = item else {
+            continue;
+        };
+        let kind = tool_display::tool_kind(name).to_lowercase();
+        match counts.iter_mut().find(|(known, _)| *known == kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let more = counts.len() > COLLAPSED_KINDS_SHOWN;
+    let mut parts: Vec<String> = counts
+        .into_iter()
+        .take(COLLAPSED_KINDS_SHOWN)
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect();
+    if more {
+        parts.push("…".to_string());
+    }
+    parts.join(", ")
+}
+
 fn render_tool_group(
     tools: &[&ChatItem],
+    anchor: Option<ToolGroupAnchor<'_>>,
     width: usize,
     state: &AppState,
     out: &mut Vec<Line<'static>>,
@@ -1414,49 +1578,97 @@ fn render_tool_group(
     };
     if show_sender_header {
         let (display_name, backend) = state.member_meta(member);
-        out.push(agent_header_line(
+        out.extend(agent_header_line(
+            state,
             &display_name,
             backend,
             state.member_color(member),
         ));
     }
-    let rail_color = member_rail_color(state, member);
-    let all_failed = tools.iter().all(|item| {
-        matches!(
-            item,
-            ChatItem::Tool {
-                ok: Some(false),
-                ..
-            }
-        )
-    });
+    let failed = tools
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ChatItem::Tool {
+                    ok: Some(false),
+                    ..
+                }
+            )
+        })
+        .count();
+    let all_failed = failed == tools.len();
     let (marker, title_style) = if all_failed {
         ("✕", theme::error_bold())
     } else {
         ("⚒", theme::accent_bold())
     };
-    out.push(Line::from(vec![
-        chat_rail(rail_color),
-        Span::styled(format!("   {marker} tools"), title_style),
-    ]));
-    for item in tools {
-        let ChatItem::Tool {
-            name,
-            summary,
-            detail,
-            ok,
-            ..
-        } = item
-        else {
-            continue;
-        };
-        render_tool_row(rail_color, name, summary, detail, *ok, width, state, out);
+    // Only a long run folds, and only when we know which group it is so a
+    // click can find it again.
+    let foldable = tools.len() > tool_display::TOOL_GROUP_COLLAPSE_ABOVE;
+    let key = anchor.as_ref().filter(|_| foldable).map(|a| a.first_index);
+    let collapsed = key.is_some_and(|key| !state.tool_group_expanded(key));
+    let fold = match (key, collapsed) {
+        (None, _) => "",
+        (Some(_), true) => "▸ ",
+        (Some(_), false) => "▾ ",
+    };
+    if let (Some(anchor), Some(key)) = (anchor, key) {
+        anchor.titles.push((out.len(), key));
+    }
+    if !collapsed {
+        out.push(Line::from(vec![Span::styled(
+            format!("  {fold}{marker} tools"),
+            title_style,
+        )]));
+        for item in tools {
+            let ChatItem::Tool {
+                name,
+                summary,
+                detail,
+                ok,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            render_tool_row(name, summary, detail, *ok, width, state, out);
+        }
+        return;
+    }
+    let failed_suffix = if failed > 0 {
+        format!(" · {failed} failed")
+    } else {
+        String::new()
+    };
+    let room = width
+        .saturating_sub(theme::display_width(&failed_suffix))
+        .max(10);
+    let head = format!(
+        "  {fold}{marker} tools · {} calls · {}",
+        tools.len(),
+        tool_kind_counts(tools)
+    );
+    let mut spans = vec![Span::styled(clip_width(&head, room), title_style)];
+    if !failed_suffix.is_empty() {
+        spans.push(Span::styled(failed_suffix, theme::error_bold()));
+    }
+    out.push(Line::from(spans));
+    // Keep progress visible: the newest call, while it is still running.
+    if let Some(ChatItem::Tool {
+        name,
+        summary,
+        detail,
+        ok: None,
+        ..
+    }) = tools.last().copied()
+    {
+        render_tool_row(name, summary, detail, None, width, state, out);
     }
 }
 
 #[allow(clippy::too_many_arguments)] // The row maps directly from a tool event and render context.
 fn render_tool_row(
-    rail_color: Color,
     name: &str,
     summary: &str,
     detail: &str,
@@ -1479,8 +1691,7 @@ fn render_tool_row(
     let kind_col = theme::pad_width(&kind, 6);
     let rest_width = width.saturating_sub(8).max(10);
     let mut spans = vec![
-        chat_rail(rail_color),
-        Span::styled(format!("     {prefix} "), Style::default().fg(color)),
+        Span::styled(format!("    {prefix} "), Style::default().fg(color)),
         Span::styled(kind_col, text_style),
     ];
     if !target.is_empty() {
@@ -1521,18 +1732,136 @@ fn render_tool_row(
             detail_style
         };
         out.push(Line::from(vec![
-            chat_rail(rail_color),
-            Span::raw(if idx == 0 { "       ↳ " } else { "         " }),
+            Span::raw(if idx == 0 { "      ↳ " } else { "        " }),
             Span::styled(line, line_style),
         ]));
     }
     if clipped && !expanded {
+        out.push(Line::from(vec![Span::styled(
+            "        … Ctrl+O expand tool output",
+            theme::muted_italic(),
+        )]));
+    }
+}
+
+fn is_agent_message(item: &ChatItem) -> bool {
+    matches!(item, ChatItem::Route { .. } | ChatItem::Spawn { .. })
+}
+
+/// Agent-to-agent traffic, drawn like a tool group: a `⇄ agents` title and one
+/// `·` row per message. Rows read relative to the viewed agent (`to` / `from`
+/// / `spawn`); the interleaved view names both ends.
+fn render_agent_messages(
+    run: &[&ChatItem],
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+) {
+    out.push(Line::from(vec![Span::styled(
+        "  ⇄ agents",
+        theme::accent_bold(),
+    )]));
+    for item in run {
+        render_agent_message_row(item, width, state, out);
+    }
+}
+
+fn agent_name_span(state: &AppState, member: &MemberId) -> Span<'static> {
+    Span::styled(
+        state.member_display(member),
+        state.member_color_bold(member),
+    )
+}
+
+/// Recipients written as ids or display names, each in its member's colour.
+fn push_recipient_names(state: &AppState, names: &[String], spans: &mut Vec<Span<'static>>) {
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", theme::muted()));
+        }
+        let shown = state
+            .members()
+            .iter()
+            .find(|member| {
+                member.id.as_str().eq_ignore_ascii_case(name)
+                    || member.display_name.eq_ignore_ascii_case(name)
+            })
+            .map_or_else(|| name.clone(), |member| member.display_name.clone());
+        spans.push(Span::styled(
+            shown,
+            theme::bold(named_member_color(state, name)),
+        ));
+    }
+}
+
+fn render_agent_message_row(
+    item: &ChatItem,
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut spans = vec![Span::styled(
+        "    · ",
+        Style::default().fg(theme::success_color()),
+    )];
+    let kind =
+        |label: &str| Span::styled(format!("{} ", theme::pad_width(label, 6)), theme::text());
+    let (preview, detail) = match item {
+        ChatItem::Route { from, to, body } => {
+            match state.focus() {
+                Some(focus) if focus == from => {
+                    spans.push(kind("to"));
+                    push_recipient_names(state, to, &mut spans);
+                }
+                Some(_) => {
+                    spans.push(kind("from"));
+                    spans.push(agent_name_span(state, from));
+                }
+                None => {
+                    spans.push(agent_name_span(state, from));
+                    spans.push(Span::styled(" → ", theme::muted()));
+                    push_recipient_names(state, to, &mut spans);
+                }
+            }
+            (first_body_line(body).to_string(), Some(body.as_str()))
+        }
+        ChatItem::Spawn {
+            parent,
+            child,
+            summary,
+        } => {
+            spans.push(kind("spawn"));
+            match state.focus() {
+                Some(focus) if focus == parent => spans.push(agent_name_span(state, child)),
+                Some(_) => spans.push(agent_name_span(state, parent)),
+                None => {
+                    spans.push(agent_name_span(state, parent));
+                    spans.push(Span::styled(" → ", theme::muted()));
+                    spans.push(agent_name_span(state, child));
+                }
+            }
+            (summary.clone(), None)
+        }
+        _ => return,
+    };
+    let used: usize = spans
+        .iter()
+        .map(|span| theme::display_width(&span.content))
+        .sum();
+    if !preview.is_empty() {
+        spans.push(Span::raw("  "));
+        let room = width.saturating_sub(used + 2).max(4);
+        spans.push(Span::styled(truncate_width(&preview, room), theme::muted()));
+    }
+    out.push(Line::from(spans));
+    let Some(body) = detail.filter(|body| state.tools_expanded() && !body.trim().is_empty()) else {
+        return;
+    };
+    let detail_width = width.saturating_sub(10).max(1);
+    for (idx, line) in markdown::wrap(body, detail_width).into_iter().enumerate() {
         out.push(Line::from(vec![
-            chat_rail(rail_color),
-            Span::styled(
-                "         … Ctrl+O expand tool output",
-                theme::muted_italic(),
-            ),
+            Span::raw(if idx == 0 { "      ↳ " } else { "        " }),
+            Span::styled(line, theme::muted()),
         ]));
     }
 }
@@ -1549,13 +1878,11 @@ fn is_tool_error_line(line: &str) -> bool {
 
 fn render_file_changes(
     state: &AppState,
-    member: &MemberId,
     files: &[FileChangeItem],
     ok: bool,
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
-    let rail_color = member_rail_color(state, member);
     let (marker, title_style) = if ok {
         ("✎", theme::accent_bold())
     } else {
@@ -1572,8 +1899,7 @@ fn render_file_changes(
             format!("{count} files")
         };
         out.push(Line::from(vec![
-            chat_rail(rail_color),
-            Span::styled(format!("   {marker} file changes"), title_style),
+            Span::styled(format!("  {marker} file changes"), title_style),
             Span::styled(
                 format!(" · {summary} · Ctrl+G expand"),
                 theme::muted_italic(),
@@ -1582,13 +1908,12 @@ fn render_file_changes(
         return;
     }
     out.push(Line::from(vec![
-        chat_rail(rail_color),
-        Span::styled(format!("   {marker} file changes"), title_style),
+        Span::styled(format!("  {marker} file changes"), title_style),
         Span::styled(" · Ctrl+G collapse", theme::muted_italic()),
     ]));
     for (index, file) in files.iter().enumerate() {
         if index > 0 {
-            out.push(Line::from(vec![chat_rail(rail_color), Span::raw("")]));
+            out.push(Line::from(vec![Span::raw(" "), Span::raw("")]));
         }
         let (sign, style) = match file.kind.as_str() {
             "add" => ("+", theme::diff_add_text()),
@@ -1597,8 +1922,7 @@ fn render_file_changes(
         };
         let shown = truncate_width(&file.path, width.saturating_sub(11).max(10));
         out.push(Line::from(vec![
-            chat_rail(rail_color),
-            Span::styled(format!("     {sign} "), style),
+            Span::styled(format!("    {sign} "), style),
             Span::styled(shown, theme::warning()),
         ]));
         let hunks = file
@@ -1637,8 +1961,7 @@ fn render_file_changes(
                 width.saturating_sub(line_number_width + 8).max(8),
             );
             out.push(Line::from(vec![
-                chat_rail(rail_color),
-                Span::styled(format!("     {number} "), number_style),
+                Span::styled(format!("    {number} "), number_style),
                 Span::styled(
                     pad_diff_content(&format!("{mark}{shown}"), width, line_number_width),
                     content_style,
@@ -1646,32 +1969,21 @@ fn render_file_changes(
             ]));
         }
         if clipped {
-            out.push(Line::from(vec![
-                chat_rail(rail_color),
-                Span::styled("       …", theme::muted_italic()),
-            ]));
+            out.push(Line::from(vec![Span::styled(
+                "      …",
+                theme::muted_italic(),
+            )]));
         }
     }
 }
 
 fn pad_diff_content(text: &str, width: usize, line_number_width: usize) -> String {
-    let target = width.saturating_sub(line_number_width + 7);
+    let target = width.saturating_sub(line_number_width + 6);
     let used = theme::display_width(text);
     if used >= target {
         return text.to_string();
     }
     format!("{text}{}", " ".repeat(target - used))
-}
-
-fn is_work_activity(item: &ChatItem) -> bool {
-    matches!(
-        item,
-        ChatItem::Tool { ok: Some(_), .. } | ChatItem::Diff { .. } | ChatItem::Route { .. }
-    )
-}
-
-fn is_speech_item(item: &ChatItem) -> bool {
-    matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
 }
 
 fn thinking_label(live: bool, stored: Option<u64>, live_secs: Option<u64>, lines: usize) -> String {
@@ -1698,10 +2010,6 @@ fn thinking_label(live: bool, stored: Option<u64>, live_secs: Option<u64>, lines
     }
 }
 
-fn same_member_thread(current: &ChatItem, next: &ChatItem) -> bool {
-    item_member(current).is_some_and(|member| item_member(next) == Some(member))
-}
-
 fn item_member(item: &ChatItem) -> Option<&MemberId> {
     match item {
         ChatItem::Agent { member, .. }
@@ -1709,15 +2017,40 @@ fn item_member(item: &ChatItem) -> Option<&MemberId> {
         | ChatItem::Tool { member, .. }
         | ChatItem::Diff { member, .. } => Some(member),
         ChatItem::Route { from, .. } => Some(from),
+        ChatItem::Spawn { parent, .. } => Some(parent),
         ChatItem::Error { member, .. } => member.as_ref(),
         ChatItem::Verdict { member, .. } => Some(member),
         ChatItem::User { .. } | ChatItem::Notice { .. } => None,
     }
 }
 
+/// First non-blank line of a message body.
+fn first_body_line(body: &str) -> &str {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
+
+/// Color for a route recipient written as an id or display name.
+fn named_member_color(state: &AppState, name: &str) -> Color {
+    state
+        .members()
+        .iter()
+        .find(|member| {
+            member.id.as_str().eq_ignore_ascii_case(name)
+                || member.display_name.eq_ignore_ascii_case(name)
+        })
+        .map_or_else(theme::muted_color, |member| state.member_color(&member.id))
+}
+
 /// Empty closed agent cells stay in the timeline after a tool split but
 /// must not count as a previous speaker, or the next tool loses its header.
 fn item_renders(item: &ChatItem, state: &AppState) -> bool {
+    // Rows hidden from the focused window never lead the next row.
+    if focus_row(state, item) != FocusRow::Full {
+        return false;
+    }
     match item {
         ChatItem::Agent { text, member, .. } => {
             !text.is_empty() || state.has_active_message(member)
@@ -1727,17 +2060,19 @@ fn item_renders(item: &ChatItem, state: &AppState) -> bool {
     }
 }
 
-/// A full-width rule between finished work turns.
-fn render_turn_separator(width: usize, out: &mut Vec<Line<'static>>) {
-    while out.last().is_some_and(line_is_blank) {
-        out.pop();
+/// Put the `/find` marker `»` in column 0 of `line`, replacing a leading blank
+/// column (every transcript row starts with the indent) instead of shifting
+/// the row.
+fn mark_find_match(line: &mut Line<'static>) {
+    let marker = Span::styled("»", theme::selection());
+    match line.spans.first_mut() {
+        Some(first) if first.content.starts_with(' ') => {
+            let rest = first.content[1..].to_string();
+            first.content = rest.into();
+            line.spans.insert(0, marker);
+        }
+        _ => line.spans.insert(0, marker),
     }
-    let rule_width = width.max(1);
-    out.push(Line::from(Span::styled(
-        "─".repeat(rule_width),
-        theme::muted(),
-    )));
-    out.push(Line::raw(""));
 }
 
 fn line_is_blank(line: &Line<'_>) -> bool {
@@ -1746,83 +2081,147 @@ fn line_is_blank(line: &Line<'_>) -> bool {
 
 fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(" Asterline", theme::accent_bold()),
-        Span::styled(" · Multi-Agent Coding Console", theme::muted()),
-    ]));
 
     if state.members().is_empty() {
-        lines.push(Line::styled(" Team is loading...", theme::muted()));
+        lines.push(Line::styled("  Team is loading...", theme::muted()));
         return lines;
     }
 
-    let members = state
-        .members()
-        .iter()
-        .map(|member| {
-            format!(
-                "{} ({}, {})",
-                member.id,
-                member.backend.as_str(),
-                member.role
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("  ");
-    lines.push(Line::from(vec![
-        Span::styled(" Members: ", theme::muted()),
-        Span::styled(members, theme::text()),
-    ]));
+    if let Some(model) = state.welcome_model_summary() {
+        lines.push(Line::from(vec![
+            Span::styled("  Model: ", theme::muted()),
+            Span::styled(model, theme::text()),
+        ]));
+    }
     lines.push(Line::raw(""));
 
-    let example_member = state
-        .members()
-        .iter()
-        .find(|member| match state.default_target() {
-            Some(DefaultTarget::Member(id)) => &member.id == id,
-            _ => false,
-        })
-        .or_else(|| state.members().first())
-        .map(|member| member.id.to_string())
-        .unwrap_or_else(|| "member".to_string());
+    let talk_to = match state.focus() {
+        Some(_) => format!("talk to {}", state.focus_display()),
+        None => "talk to the default agent".to_string(),
+    };
     let examples = [
-        (format!("@{example_member} <message>"), "message one member"),
-        ("/mode".to_string(), "choose a collaboration mode"),
-        ("/help".to_string(), "all commands"),
+        ("<message>".to_string(), talk_to),
+        ("←".to_string(), "switch agent".to_string()),
+        ("/model".to_string(), "switch model".to_string()),
+        ("/help".to_string(), "all commands".to_string()),
     ];
     for (i, (cmd, desc)) in examples.iter().enumerate() {
         lines.push(Line::from(vec![
-            Span::styled(if i == 0 { " Try:  " } else { "       " }, theme::muted()),
-            Span::styled(format!("{cmd:<24}"), theme::accent_bold()),
-            Span::styled(desc.to_string(), theme::muted()),
+            Span::styled(if i == 0 { "  Try:  " } else { "        " }, theme::muted()),
+            Span::styled(format!("{cmd:<12}"), theme::accent_bold()),
+            Span::styled(desc.clone(), theme::muted()),
         ]));
     }
     lines
 }
 
+/// The speaker label of an agent block: a dim `Main · codex` line, only in
+/// the All view where several agents interleave. One agent's window has no
+/// label at all; the whole window is that agent.
 fn agent_header_line(
+    state: &AppState,
     display_name: &str,
     backend: crate::domain::team::BackendKind,
     color: Color,
-) -> Line<'static> {
-    Line::from(vec![
-        chat_rail(color),
-        Span::raw(" "),
-        Span::styled("◆ ", theme::bold(color)),
-        Span::styled(display_name.to_string(), theme::bold(color)),
-        Span::styled(format!("  · {}", backend.as_str()), theme::muted()),
-    ])
+) -> Option<Line<'static>> {
+    state.focus().is_none().then(|| {
+        Line::from(vec![
+            Span::raw(INDENT_TEXT),
+            Span::styled(
+                display_name.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!(" · {}", backend.as_str()),
+                theme::muted().add_modifier(Modifier::DIM),
+            ),
+        ])
+    })
 }
 
-fn user_header_line(state: &AppState, targets: &[MemberId]) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled("◆ ", theme::bold(theme::user_color())),
-        Span::styled("You", theme::bold(theme::user_color())),
-    ];
-    if targets.is_empty() {
-        return Line::from(spans);
+/// A user message: a full-width band of subtle background with a blank band
+/// row above and below and the text indented like every other row. No name
+/// header; the All view alone shows who it went to, dim and right-aligned on
+/// the top padding row.
+fn render_user_band(
+    state: &AppState,
+    body: &str,
+    targets: &[MemberId],
+    width: usize,
+    full_width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let full_width = full_width.max(width);
+    let bg = theme::user_band_bg();
+    let band = Style::default().bg(bg);
+    // Rows are always padded out to the full terminal width.
+    let pad_row = |mut spans: Vec<Span<'static>>| {
+        let used: usize = spans
+            .iter()
+            .map(|span| theme::display_width(span.content.as_ref()))
+            .sum();
+        spans.push(Span::styled(
+            " ".repeat(full_width.saturating_sub(used)),
+            band,
+        ));
+        Line::from(spans)
+    };
+
+    // Top padding row, carrying the recipient in the All view (right-aligned
+    // at the text's right edge).
+    let mut top = Vec::new();
+    if state.focus().is_none() && !targets.is_empty() {
+        let mut names = Vec::new();
+        push_target_names(state, targets, &mut names);
+        let label = format!(
+            "to {}",
+            names
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        );
+        let label_width = theme::display_width(&label);
+        // Two columns of margin on the right, like the text's left indent.
+        if label_width + 2 * INDENT_TEXT.len() <= width {
+            let pad = width - label_width - INDENT_TEXT.len();
+            top = vec![
+                Span::styled(" ".repeat(pad), band),
+                Span::styled(
+                    label,
+                    theme::muted().add_modifier(Modifier::DIM).patch(band),
+                ),
+            ];
+        }
     }
-    spans.push(Span::styled(" → ", theme::muted()));
+    out.push(pad_row(top));
+
+    // The body keeps its markdown structure and wrapping; plain text takes the
+    // band's text colour, while spans that already carry their own colour
+    // (inline code, links, headings, code blocks) keep it so they stay
+    // visibly distinct.
+    let body = state.displayed_user_body(body, targets);
+    let wrap_width = width.saturating_sub(2 * INDENT_TEXT.len()).max(1);
+    let rendered = markdown::render(&body, wrap_width);
+    if rendered.is_empty() {
+        out.push(pad_row(vec![Span::styled(INDENT_TEXT, band)]));
+    }
+    for line in rendered {
+        let mut spans = vec![Span::styled(INDENT_TEXT, band)];
+        spans.extend(line.spans.into_iter().map(|span| {
+            let mut style = span.style.bg(bg);
+            if style.fg.is_none() {
+                style = style.fg(theme::emphasis_color());
+            }
+            Span::styled(span.content, style)
+        }));
+        out.push(pad_row(spans));
+    }
+    out.push(pad_row(Vec::new()));
+}
+
+/// Append the recipients of a prompt: `all` when it reached the whole roster,
+/// else each member's name in their color.
+fn push_target_names(state: &AppState, targets: &[MemberId], spans: &mut Vec<Span<'static>>) {
     let roster = state.members();
     if roster.len() > 1
         && targets.len() == roster.len()
@@ -1831,7 +2230,7 @@ fn user_header_line(state: &AppState, targets: &[MemberId]) -> Line<'static> {
             .all(|member| targets.iter().any(|target| target == &member.id))
     {
         spans.push(Span::styled("all", theme::emphasis()));
-        return Line::from(spans);
+        return;
     }
     for (index, target) in targets.iter().enumerate() {
         if index > 0 {
@@ -1840,7 +2239,6 @@ fn user_header_line(state: &AppState, targets: &[MemberId]) -> Line<'static> {
         let (name, _) = state.member_meta(target);
         spans.push(Span::styled(name, state.member_color_bold(target)));
     }
-    Line::from(spans)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1860,9 +2258,23 @@ fn item_sender(item: &ChatItem) -> Option<ChatSender> {
     }
 }
 
+#[cfg(test)]
 fn render_item(
     item: &ChatItem,
     width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+    show_sender_header: bool,
+) {
+    render_item_wide(item, width, width, state, out, show_sender_header);
+}
+
+/// `width` is the (capped) text width; `full_width` is the terminal width the
+/// user band's background spans.
+fn render_item_wide(
+    item: &ChatItem,
+    width: usize,
+    full_width: usize,
     state: &AppState,
     out: &mut Vec<Line<'static>>,
     show_sender_header: bool,
@@ -1872,7 +2284,8 @@ fn render_item(
         && let Some(member) = item_member(item)
     {
         let (display_name, backend) = state.member_meta(member);
-        out.push(agent_header_line(
+        out.extend(agent_header_line(
+            state,
             &display_name,
             backend,
             state.member_color(member),
@@ -1880,17 +2293,7 @@ fn render_item(
     }
     match item {
         ChatItem::User { body, targets, .. } => {
-            if show_sender_header {
-                out.push(user_header_line(state, targets));
-            }
-            let body = crate::adapter::prompt_images::display_prompt_images(body);
-            for line in markdown::wrap(&body, width.saturating_sub(2).max(1)) {
-                out.push(Line::from(vec![
-                    chat_rail(theme::user_color()),
-                    Span::raw(" "),
-                    Span::styled(line, theme::emphasis()),
-                ]));
-            }
+            render_user_band(state, body, targets, width, full_width, out);
         }
         ChatItem::Agent {
             member,
@@ -1903,14 +2306,15 @@ fn render_item(
                 return;
             }
             if show_sender_header {
-                out.push(agent_header_line(
+                out.extend(agent_header_line(
+                    state,
                     display_name,
                     *backend,
                     state.member_color(member),
                 ));
             }
-            for line in markdown::render(text, width.saturating_sub(2).max(1)) {
-                let mut spans = vec![chat_rail(state.member_color(member)), Span::raw(" ")];
+            for line in markdown::render(text, content_width(width)) {
+                let mut spans = vec![Span::raw(INDENT_TEXT)];
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
             }
@@ -1925,7 +2329,6 @@ fn render_item(
             if text.is_empty() && !live {
                 return;
             }
-            let rail_color = member_rail_color(state, member);
             let lines = text
                 .lines()
                 .filter(|line| !line.trim().is_empty())
@@ -1940,60 +2343,50 @@ fn render_item(
             };
             if !state.thinking_expanded() {
                 out.push(Line::from(vec![
-                    chat_rail(rail_color),
-                    Span::raw("   "),
+                    Span::raw("  "),
                     Span::styled(format!("{label} · Ctrl+T expand"), theme::muted_italic()),
                 ]));
                 return;
             }
             out.push(Line::from(vec![
-                chat_rail(rail_color),
-                Span::raw("   "),
+                Span::raw("  "),
                 Span::styled(format!("{label} · Ctrl+T collapse"), theme::muted_italic()),
             ]));
-            for line in markdown::wrap(text.trim(), width.saturating_sub(6).max(1)) {
+            for line in markdown::wrap(text.trim(), width.saturating_sub(5).max(1)) {
                 out.push(Line::from(vec![
-                    chat_rail(rail_color),
-                    Span::raw("     "),
+                    Span::raw("    "),
                     Span::styled(line, theme::muted_italic()),
                 ]));
             }
         }
         ChatItem::Tool { .. } => {
-            render_tool_group(&[item], width, state, out, false);
+            render_tool_group(&[item], None, width, state, out, false);
         }
-        ChatItem::Diff { member, files, ok } => {
-            render_file_changes(state, member, files, *ok, width, out);
+        ChatItem::Diff { files, ok, .. } => {
+            render_file_changes(state, files, *ok, width, out);
         }
-        ChatItem::Route { from, to, body } => {
-            let from_backend = member_rail_color(state, from);
-            out.push(Line::from(vec![
-                chat_rail(from_backend),
-                Span::styled("   ↳ ", theme::accent()),
-                Span::styled(
-                    format!("{from} → {}", to.join(", ")),
-                    theme::bold(from_backend),
-                ),
-            ]));
-            for line in markdown::wrap(body, width.saturating_sub(6).max(1)) {
-                out.push(Line::from(vec![
-                    chat_rail(from_backend),
-                    Span::styled(format!("     {line}"), theme::muted()),
-                ]));
+        ChatItem::Route { .. } | ChatItem::Spawn { .. } => {
+            render_agent_messages(&[item], width, state, out);
+        }
+        ChatItem::Notice { text, .. } => {
+            // Wrapped lines hang under the text, not under the bullet.
+            let room = width.saturating_sub(4 + 1).max(1);
+            for (index, line) in markdown::wrap(text, room).into_iter().enumerate() {
+                let lead = if index == 0 { "  • " } else { "    " };
+                out.push(Line::from(Span::styled(
+                    format!("{lead}{line}"),
+                    theme::notice(),
+                )));
             }
-        }
-        ChatItem::Notice { text } => {
-            push_wrapped(&format!("  • {text}"), width, "", theme::notice(), out);
         }
         ChatItem::Error { member, message } => {
             if let Some(member) = member {
-                let rail_color = member_rail_color(state, member);
                 let text = format!("✕ {member}: {message}");
-                for line in markdown::wrap(&text, width.saturating_sub(4).max(1)) {
-                    out.push(Line::from(vec![
-                        chat_rail(rail_color),
-                        Span::styled(format!("   {line}"), theme::error()),
-                    ]));
+                for line in markdown::wrap(&text, width.saturating_sub(3).max(1)) {
+                    out.push(Line::from(vec![Span::styled(
+                        format!("  {line}"),
+                        theme::error(),
+                    )]));
                 }
             } else {
                 push_wrapped(&format!("  ✕ {message}"), width, "", theme::error(), out);
@@ -2102,34 +2495,32 @@ fn render_approval_card(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Where the composer text goes: between the band's top and bottom padding
+/// rows, full width.
+fn composer_text_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y
+            .saturating_add(1)
+            .min(area.y.saturating_add(area.height)),
+        area.width,
+        area.height.saturating_sub(2),
+    )
+}
+
+/// The composer: the same subtle full-width band as a user message, one
+/// padding row above and below the input, text on the transcript's 2-column indent. A
+/// dim `>` prompt marks the first row.
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let (border_color, title_text) = if state.paused_routes() > 0 {
-        (
-            theme::warning_color(),
-            format!(" {} route(s) paused · /retry ", state.paused_routes()),
-        )
-    } else if state.running_count() > 0 {
-        (theme::muted_color(), " processing… ".to_string())
+    let band = Style::default().bg(theme::user_band_bg());
+    frame.render_widget(Block::default().style(band), area);
+    let prompt_color = if state.paused_routes() > 0 {
+        theme::warning_color()
     } else {
-        // Idle: a clean open composer (no title), like codex.
-        (theme::muted_color(), String::new())
+        theme::muted_color()
     };
 
-    // Open composer: top and bottom rules only, no enclosing side bars.
-    let mode = state.active_mode();
-    let mode_title = Line::from(Span::styled(
-        format!(" mode:{mode} "),
-        theme::bold(theme::mode_color(mode)),
-    ))
-    .right_aligned();
-    let block = Block::default()
-        .title(title_text)
-        .title_bottom(mode_title)
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+    let inner = composer_text_area(area);
     let rows = inner.height as usize;
     if rows == 0 {
         return;
@@ -2142,8 +2533,8 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     // Visual lines with wrapping so long input is fully visible (no horizontal
     // clipping). The cursor maps directly to a screen cell.
-    let (visual_lines, cursor_row, cursor_col) = state.composer().visual_lines_with_cursor(avail);
-    let line_starts = state.composer().visual_lines_with_starts(avail);
+    let wrapped = state.composer().visual_layout(avail);
+    let (cursor_row, cursor_col) = (wrapped.cursor_row, wrapped.cursor_col);
     let selection = state.composer().selection_range();
     let text_rows = rows.saturating_sub(text_origin);
 
@@ -2155,15 +2546,16 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     for (offset, row) in (top..top + text_rows).enumerate() {
-        let Some(line) = visual_lines.get(row) else {
+        let Some(visual_row) = wrapped.rows.get(row) else {
             break;
         };
+        let line = visual_row.text.as_str();
         let prefix = if row == 0 { "> " } else { "  " };
-        let start_char = line_starts.get(row).map(|(_, start)| *start).unwrap_or(0);
+        let start_char = visual_row.start;
         let cursor_width = if row == cursor_row { cursor_col } else { 0 };
         let mut spans = vec![Span::styled(
             prefix.to_string(),
-            Style::default().fg(border_color),
+            Style::default().fg(prompt_color).bg(theme::user_band_bg()),
         )];
         spans.extend(style_composer_line(line, start_char, selection));
         out_lines.push(Line::from(spans));
@@ -2174,9 +2566,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             ));
         }
     }
-    frame.render_widget(Paragraph::new(out_lines), inner);
+    frame.render_widget(Paragraph::new(out_lines).style(band), inner);
 
     if state.drawer().is_none()
+        && !state.model_picker_open()
         && let Some((col, row)) = cursor_screen
     {
         frame.set_cursor_position((col, row));

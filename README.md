@@ -43,17 +43,15 @@ cd /path/to/your/project
 ast
 ```
 
-第一次启动会打开 Team 编辑器，扫描 `PATH` 里受支持的 CLI。`↑`/`↓` 选成员，`Enter` 编辑，`s` 保存。
+第一次启动会直接进入聊天，使用在 `PATH` 里找到的第一个受支持的 CLI（Codex、Claude、Grok、Agy 的顺序）及其默认模型。输入 `/model` 切换当前查看的 Agent 的模型。
 
-<p align="center">
-  <img src="docs/assets/team.webp" alt="Asterline 团队编辑器" width="100%">
-</p>
-
-普通对话要把任务发给名册里的人：
+普通对话里直接打字描述任务：
 
 ```text
-@builder 审计这个仓库，并修复风险最高的缺陷
+审计这个仓库，并修复风险最高的缺陷
 ```
+
+消息会发给你当前查看的 Agent；在空输入框按 `←` 打开 Agent 列表即可切换。主 Agent 在需要时可以自己开子 Agent（并行干活、请另一个模型审查），结果会自动交回；在同一个列表里打开某个子 Agent，就能直接和它继续聊。
 
 需要结构化协作时，先打开模式选择器：
 
@@ -65,7 +63,7 @@ ast
   <img src="docs/assets/mode.webp" alt="Asterline 模式选择器" width="100%">
 </p>
 
-`↑`/`↓` 高亮模式，`Enter` 改可选字段，`s` 选中并应用到当前对话。已经确定模式时，也可以直接 `/mode review`。`review`、`plan`、`brainstorm`、`team` 选好后直接打任务即可，不用再写 `@成员`；新的 `normal` 对话仍要显式指定目标。
+`↑`/`↓` 高亮模式，`Enter` 改可选字段，`s` 选中并应用到当前对话。已经确定模式时，也可以直接 `/mode review`。`review`、`plan`、`brainstorm`、`team` 选好后直接打任务即可，不用再写 `@成员`。
 
 ```text
 /mode review
@@ -138,7 +136,7 @@ Asterline 不是把几个聊天窗口叠在一起。每种模式都有负责人�
 
 Asterline 不代替各提供商的认证、计费、模型授权或用量限制。
 
-重新打开默认接着上次对话。`/new` 和 `/clear` 都会开干净的新对话，mode 设置会留下来。`/resume` 恢复聊天、名册、后端会话、模式和 Runs。项目状态默认在：
+重新打开默认接着上次对话。`/new`（可带第一条提示）和 `/clear` 都会开干净的新对话，mode 设置会留下来。`/resume` 在 Agents 列表里选择已保存的对话，恢复聊天、名册、后端会话、模式和 Runs。项目状态默认在：
 
 ```text
 <workspace>/.asterline/
@@ -157,16 +155,16 @@ Codex 工具询问默认自动通过。只有加上 `--manual-approvals`，或�
 
 ## 常用命令
 
-| 命令                   | 用途             |
-| ---------------------- | ---------------- |
-| `@<member> <message>`  | 发给一个成员     |
-| `@all <message>`       | 发给整个团队     |
-| `/mode`                | 打开模式选择器   |
-| `/runs`                | 查看状态和下一步 |
-| `/team`                | 编辑当前团队     |
-| `/resume`              | 恢复已保存的对话 |
-| `/approve` / `/reject` | 处理待审批请求   |
-| `/help`                | 打开命令面板     |
+| 命令                   | 用途                               |
+| ---------------------- | ---------------------------------- |
+| `@<member> <message>`  | 可选：直接发给某个成员，不切换视图 |
+| `@all <message>`       | 可选：发给整个团队                 |
+| `/mode`                | 打开模式选择器                     |
+| `/runs`                | 查看状态和下一步                   |
+| `/team`                | 编辑当前团队                       |
+| `/resume`              | 在 Agents 列表里选择已保存的对话   |
+| `/approve` / `/reject` | 处理待审批请求                     |
+| `/help`                | 打开命令面板                       |
 
 完整按键、抽屉、Run 步骤和定向 Skill 见[命令与键盘参考](docs/commands.zh-CN.md)。
 

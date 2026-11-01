@@ -9,6 +9,7 @@
 //! @@team_message {"to":["builder","reviewer"],"body":"implement and review"}
 //! @@team_message {"to":"all","body":"let's agree on the data model first"}
 //! @@team_member {"display_name":"QA","backend":"codex","role":"tests"}
+//! @@spawn {"name":"reviewer","task":"review the diff","backend":"claude","model":"opus","effort":"high"}
 //! @@run_step {"action":"add","owner":"builder","title":"Write parser tests"}
 //! @@run_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
 //! @@run_step {"action":"assign","step":2,"owner":"reviewer"}
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::domain::config::default_member;
+pub use crate::domain::event::SpawnRequest;
 use crate::domain::event::{RouteTo, RunStepRequest, RunStepStatus, TeamMessage};
 use crate::domain::mode::{BrainstormCard, BrainstormVote, ReviewVerdict, ReviewVerdictKind};
 use crate::domain::team::{
@@ -30,6 +32,7 @@ use crate::domain::team::{
 
 const TEAM_MESSAGE_PREFIX: &str = "@@team_message";
 const TEAM_MEMBER_PREFIX: &str = "@@team_member";
+const SPAWN_PREFIX: &str = "@@spawn";
 const RUN_STEP_PREFIX: &str = "@@run_step";
 const REVIEW_PREFIX: &str = "@@review";
 const BRAINSTORM_CARD_PREFIX: &str = "@@brainstorm_card";
@@ -47,6 +50,8 @@ pub struct ParsedAgentOutput {
     pub messages: Vec<TeamMessage>,
     /// New teammate requests parsed from the output, in order.
     pub members: Vec<TeamMember>,
+    /// Sub-agent requests parsed from the output, in order.
+    pub spawns: Vec<SpawnRequest>,
     /// Run checklist mutations parsed from the output, in order.
     pub run_steps: Vec<RunStepRequest>,
     /// Review verdicts parsed from the output, in order.
@@ -98,6 +103,20 @@ struct TeamMemberRaw {
     session_id: Option<String>,
     #[serde(default)]
     effort: Option<Effort>,
+}
+
+#[derive(Deserialize)]
+struct SpawnRaw {
+    name: String,
+    task: String,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +186,7 @@ impl ToField {
 enum EnvelopeValue {
     Message(TeamMessage),
     Member(TeamMember),
+    Spawn(SpawnRequest),
     Run(RunStepRequest),
     Review(ReviewVerdict),
     BrainstormCard(BrainstormCard),
@@ -181,6 +201,10 @@ fn parse_message_envelope(payload: &str) -> Result<EnvelopeValue, String> {
 
 fn parse_member_envelope(payload: &str) -> Result<EnvelopeValue, String> {
     parse_team_member(payload).map(EnvelopeValue::Member)
+}
+
+fn parse_spawn_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_spawn(payload).map(EnvelopeValue::Spawn)
 }
 
 fn parse_run_envelope(payload: &str) -> Result<EnvelopeValue, String> {
@@ -204,6 +228,7 @@ fn parse_brainstorm_card_envelope(payload: &str) -> Result<EnvelopeValue, String
 const ENVELOPE_PARSERS: &[(&str, EnvelopeParser)] = &[
     (TEAM_MESSAGE_PREFIX, parse_message_envelope),
     (TEAM_MEMBER_PREFIX, parse_member_envelope),
+    (SPAWN_PREFIX, parse_spawn_envelope),
     (RUN_STEP_PREFIX, parse_run_envelope),
     (REVIEW_PREFIX, parse_review_envelope),
     (BRAINSTORM_CARD_PREFIX, parse_brainstorm_card_envelope),
@@ -215,6 +240,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut kept_lines = Vec::new();
     let mut messages = Vec::new();
     let mut members = Vec::new();
+    let mut spawns = Vec::new();
     let mut run_steps = Vec::new();
     let mut reviews = Vec::new();
     let mut brainstorm_cards = Vec::new();
@@ -263,6 +289,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
                 match parse_fn(payload) {
                     Ok(EnvelopeValue::Message(message)) => messages.push(message),
                     Ok(EnvelopeValue::Member(member)) => members.push(member),
+                    Ok(EnvelopeValue::Spawn(request)) => spawns.push(request),
                     Ok(EnvelopeValue::Run(request)) => run_steps.push(request),
                     Ok(EnvelopeValue::Review(review)) => reviews.push(review),
                     Ok(EnvelopeValue::BrainstormCard(card)) => brainstorm_cards.push(card),
@@ -284,6 +311,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         visible_text: kept_lines.join("\n").trim().to_string(),
         messages,
         members,
+        spawns,
         run_steps,
         reviews,
         brainstorm_cards,
@@ -397,6 +425,33 @@ fn parse_team_member(payload: &str) -> Result<TeamMember, String> {
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty()),
         effort: raw.effort,
+        parent: None,
+    })
+}
+
+fn parse_spawn(payload: &str) -> Result<SpawnRequest, String> {
+    let raw: SpawnRaw =
+        serde_json::from_str(payload).map_err(|err| format!("invalid @@spawn envelope: {err}"))?;
+    let name = raw.name.trim().to_string();
+    if name.is_empty() {
+        return Err("@@spawn name must be non-empty".to_string());
+    }
+    let task = raw.task.trim().to_string();
+    if task.is_empty() {
+        return Err("@@spawn task must be non-empty".to_string());
+    }
+    let optional = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    Ok(SpawnRequest {
+        name,
+        task,
+        backend: optional(raw.backend),
+        model: optional(raw.model),
+        effort: optional(raw.effort),
+        role: optional(raw.role),
     })
 }
 
@@ -1088,5 +1143,77 @@ mod tests {
         assert_eq!(parsed.reviews[0].verdict, ReviewVerdictKind::RequestChanges);
         assert_eq!(parsed.reviews[1].verdict, ReviewVerdictKind::Approve);
         assert_eq!(parsed.reviews[1].summary.as_deref(), Some("second"));
+    }
+    #[test]
+    fn parses_spawn_with_all_fields() {
+        let parsed = parse_agent_output(
+            "Opening a reviewer.\n@@spawn {\"name\":\"reviewer\",\"task\":\"review the diff\",\"backend\":\"claude\",\"model\":\"opus\",\"effort\":\"high\",\"role\":\"review\"}",
+        );
+
+        assert_eq!(parsed.visible_text, "Opening a reviewer.");
+        assert_eq!(
+            parsed.spawns,
+            vec![SpawnRequest {
+                name: "reviewer".to_string(),
+                task: "review the diff".to_string(),
+                backend: Some("claude".to_string()),
+                model: Some("opus".to_string()),
+                effort: Some("high".to_string()),
+                role: Some("review".to_string()),
+            }]
+        );
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn spawn_needs_only_name_and_task() {
+        let parsed = parse_agent_output(
+            r#"@@spawn {"name":" tester ","task":" run the suite ","model":"  "}"#,
+        );
+
+        assert_eq!(parsed.spawns.len(), 1);
+        let spawn = &parsed.spawns[0];
+        assert_eq!(spawn.name, "tester");
+        assert_eq!(spawn.task, "run the suite");
+        assert_eq!(spawn.backend, None);
+        assert_eq!(spawn.model, None);
+        assert_eq!(spawn.effort, None);
+        assert_eq!(spawn.role, None);
+    }
+
+    #[test]
+    fn spawn_keeps_unvalidated_backend_for_the_runtime_to_refuse() {
+        let parsed = parse_agent_output(
+            r#"@@spawn {"name":"x","task":"t","backend":"gpt","effort":"huge"}"#,
+        );
+
+        assert_eq!(parsed.spawns[0].backend.as_deref(), Some("gpt"));
+        assert_eq!(parsed.spawns[0].effort.as_deref(), Some("huge"));
+    }
+
+    #[test]
+    fn malformed_spawn_warns_and_keeps_line() {
+        for line in [
+            r#"@@spawn {"name":"x"}"#,
+            r#"@@spawn {"name":"  ","task":"t"}"#,
+            r#"@@spawn {"name":"x","task":" "}"#,
+            "@@spawn not-json",
+        ] {
+            let parsed = parse_agent_output(line);
+            assert!(parsed.spawns.is_empty(), "{line}");
+            assert_eq!(parsed.visible_text, line);
+            assert_eq!(parsed.warnings.len(), 1, "{line}");
+            assert!(parsed.warnings[0].contains("@@spawn"), "{line}");
+        }
+    }
+
+    #[test]
+    fn ignores_spawn_examples_inside_markdown_code() {
+        let parsed = parse_agent_output(
+            "```\n@@spawn {\"name\":\"x\",\"task\":\"t\"}\n```\n    @@spawn {\"name\":\"y\",\"task\":\"t\"}",
+        );
+
+        assert!(parsed.spawns.is_empty());
+        assert!(parsed.warnings.is_empty());
     }
 }

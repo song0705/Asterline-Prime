@@ -11,8 +11,8 @@ use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
 use crate::domain::config::{
-    detect_backends, ensure_brainstorm_skill, ensure_team_skill, inject_team_protocol,
-    load_team_config,
+    DetectedBackends, default_team, detect_backends, ensure_brainstorm_skill, ensure_team_skill,
+    inject_team_protocol, load_team_config,
 };
 use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
@@ -162,33 +162,21 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         fs_safety::ensure_workspace_directory(&requested_workspace, &[".asterline"], true)?;
     let saved_team = requested_state_dir.join("team.json");
     // Only an implicitly reused saved roster participates in conversation
-    // snapshot restoration. An explicit --team file or a freshly picked team
-    // is a launch-time choice and must not be overwritten by an older DB.
+    // snapshot restoration. An explicit --team file or a freshly created
+    // default team is a launch-time choice and must not be overwritten by an
+    // older DB.
     let restore_saved_roster = config.team_path.is_none()
         && !config.pick_team
         && fs_safety::regular_file_exists(&saved_team, "saved team config")?;
     let mut team = match &config.team_path {
         Some(path) => load_team_config(path)?,
-        // Reuse a previously-built roster so the builder doesn't nag every
-        // launch; `--pick-team` forces re-selection.
+        // Reuse the saved roster (including any `/model` change). The hidden
+        // `--pick-team` flag ignores it and starts over from the default.
         None if restore_saved_roster => load_team_config(&saved_team)?,
-        None => {
-            let detected = detect_backends();
-            if !detected.any() {
-                return Ok(None);
-            }
-            // Let the user choose the roster from the detected backends instead
-            // of silently applying a fixed default (falls back to the default
-            // roster when headless / on cancel).
-            match crate::tui::team_builder::run(detected, &requested_workspace)? {
-                Some(team) => {
-                    // Persist the choice for next time (before protocol injection).
-                    runtime::save_team_config(&saved_team, &team)?;
-                    team
-                }
-                None => return Ok(None),
-            }
-        }
+        None => match default_startup_team(&saved_team, &requested_workspace, detect_backends())? {
+            Some(team) => team,
+            None => return Ok(None),
+        },
     };
     // A CLI workspace is an explicit launch-time override. A roster loaded
     // from `<cwd>/.asterline/team.json` belongs to that directory as well: if
@@ -244,6 +232,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         let mut chat = match store.replay_chat() {
             Ok(chat) => chat,
             Err(err) => vec![ChatItem::Notice {
+                member: None,
                 text: format!("could not replay history: {err}"),
             }],
         };
@@ -253,6 +242,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             Ok(logs) => logs,
             Err(err) => {
                 chat.push(ChatItem::Notice {
+                    member: None,
                     text: format!("could not replay logs: {err}"),
                 });
                 Vec::new()
@@ -289,6 +279,21 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         state,
         instance_lock,
     }))
+}
+
+/// The team for a workspace with no saved or explicit config. There is no
+/// setup screen: one `main` member on the first detected backend, with that
+/// CLI's own default model. Saved so later launches and `/model` build on it.
+fn default_startup_team(
+    saved_team: &Path,
+    workspace: &Path,
+    detected: DetectedBackends,
+) -> io::Result<Option<TeamConfig>> {
+    let Some(team) = default_team(workspace, detected) else {
+        return Ok(None);
+    };
+    runtime::save_team_config(saved_team, &team)?;
+    Ok(Some(team))
 }
 
 fn build_runners(team: &TeamConfig, fake: bool) -> Runners {
@@ -394,8 +399,7 @@ impl AppConfig {
          \x20\x20\x20\x20\x20\x20 asterline update\n\
          \n\
          Options:\n\
-         \x20 --team <PATH>       Load a team config (JSON). Skips the team builder.\n\
-         \x20 --pick-team         Re-open the interactive team builder (ignore the saved team).\n\
+         \x20 --team <PATH>       Load a team config (JSON) instead of the saved one.\n\
          \x20 --workspace <PATH>  Working directory for members. Default: current directory.\n\
          \x20 --db <PATH>         SQLite path. Default: <workspace>/.asterline/asterline.sqlite3.\n\
          \x20 --no-restore        Do not replay persisted chat history on startup.\n\
@@ -408,8 +412,10 @@ impl AppConfig {
          \x20 --no-auto-update    Skip the Windows installer update check.\n\
          \x20 -h, --help          Show this help.\n\
          \n\
-         With no --team, Asterline opens a team builder from the detected backends\n\
-         and remembers your choice in <workspace>/.asterline/team.json."
+         With no --team, Asterline starts a chat with one `main` agent on the first\n\
+         detected backend (Codex, Claude, Grok, Agy) using its default model. Switch\n\
+         models in the session with /model; the choice is saved in\n\
+         <workspace>/.asterline/team.json."
     }
 }
 
@@ -457,6 +463,64 @@ mod tests {
         assert!(AppConfig::help().contains("asterline update"));
         assert!(AppConfig::help().contains("--no-auto-update"));
         assert!(AppConfig::help().contains("--manual-approvals"));
+    }
+
+    #[test]
+    fn help_no_longer_advertises_the_team_builder() {
+        let help = AppConfig::help();
+        assert!(!help.contains("--pick-team"));
+        assert!(!help.contains("team builder"));
+        assert!(help.contains("/model"));
+        // The flag is still accepted as a hidden reset.
+        assert!(AppConfig::parse(["--pick-team"]).unwrap().pick_team);
+    }
+
+    #[test]
+    fn startup_without_a_saved_team_creates_and_saves_one_main_member() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-app-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("team.json");
+        let detected = DetectedBackends {
+            codex: false,
+            claude: true,
+            grok: true,
+            agy: false,
+        };
+
+        let team = default_startup_team(&saved, &dir, detected)
+            .unwrap()
+            .expect("team");
+
+        assert_eq!(team.members.len(), 1);
+        let main = &team.members[0];
+        assert_eq!(main.id.as_str(), "main");
+        assert_eq!(main.backend, crate::domain::team::BackendKind::Claude);
+        assert_eq!(main.model, None);
+        assert_eq!(main.effort, None);
+        assert_eq!(
+            main.permission_mode,
+            Some(crate::domain::team::PermissionMode::AcceptEdits)
+        );
+        let reloaded = load_team_config(&saved).expect("saved team loads");
+        assert_eq!(reloaded.members.len(), 1);
+        assert_eq!(reloaded.members[0].id, main.id);
+        assert_eq!(reloaded.default_member_ids(), vec![main.id.clone()]);
+
+        let none = DetectedBackends {
+            codex: false,
+            claude: false,
+            grok: false,
+            agy: false,
+        };
+        assert!(
+            default_startup_team(&dir.join("other.json"), &dir, none)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!dir.join("other.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -548,20 +612,22 @@ mod tests {
 
     #[test]
     fn inject_protocol_lists_teammates() {
-        let mut team = crate::domain::config::default_team(
-            "/tmp/ws",
-            crate::domain::config::DetectedBackends {
-                codex: true,
-                claude: true,
-                grok: false,
-                agy: false,
-            },
-        )
-        .unwrap();
+        use crate::domain::team::{BackendKind, MemberId, TeamMember};
+        let mut team = TeamConfig::new("t", "/tmp/ws")
+            .with_member(TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "implementation",
+            ))
+            .with_member(TeamMember::new(
+                "reviewer",
+                "Reviewer",
+                BackendKind::Claude,
+                "review",
+            ));
         inject_team_protocol(&mut team);
-        let builder = team
-            .member(&crate::domain::team::MemberId::new("builder"))
-            .unwrap();
+        let builder = team.member(&MemberId::new("builder")).unwrap();
         let prompt = builder.system_prompt.as_ref().unwrap();
         assert!(prompt.contains("Asterline team skill"));
         assert!(!prompt.contains("$asterline-team"));

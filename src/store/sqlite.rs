@@ -48,6 +48,34 @@ pub struct StoredConversationSession {
     pub member: MemberId,
     pub backend: BackendKind,
     pub session_id: String,
+    /// The newest chat message id this native session has already seen (or
+    /// produced). `None` is a session saved before this was tracked: the
+    /// runtime treats it as having seen the chat up to when it is loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_through: Option<i64>,
+    /// A session of an earlier backend that the member switched away from.
+    /// It stays resumable if the member switches back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
+}
+
+impl StoredConversationSession {
+    pub fn new(member: MemberId, backend: BackendKind, session_id: impl Into<String>) -> Self {
+        Self {
+            member,
+            backend,
+            session_id: session_id.into(),
+            seen_through: None,
+            parked: false,
+        }
+    }
+}
+
+/// One stored chat message the recap can draw on, with its row id.
+#[derive(Clone, Debug)]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub item: ChatItem,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +160,14 @@ impl SqliteStore {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS parked_sessions (
+                member_id    TEXT NOT NULL,
+                backend      TEXT NOT NULL,
+                session_id   TEXT NOT NULL,
+                seen_through INTEGER,
+                PRIMARY KEY (member_id, backend)
+            );
+
             CREATE TABLE IF NOT EXISTS native_import_cursors (
                 member_id    TEXT NOT NULL,
                 session_id   TEXT NOT NULL,
@@ -146,7 +182,8 @@ impl SqliteStore {
 
             CREATE TABLE IF NOT EXISTS conversations (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                name       TEXT
             );
 
             CREATE TABLE IF NOT EXISTS runtime_state (
@@ -309,6 +346,12 @@ impl SqliteStore {
             )?;
             Ok(())
         })?;
+        if !self.has_column("agent_sessions", "seen_through")? {
+            self.conn.execute(
+                "ALTER TABLE agent_sessions ADD COLUMN seen_through INTEGER",
+                [],
+            )?;
+        }
         if !self.has_column("conversation_snapshots", "mode")? {
             self.conn.execute(
                 "ALTER TABLE conversation_snapshots
@@ -322,6 +365,10 @@ impl SqliteStore {
                  ADD COLUMN mode_overrides_json TEXT NOT NULL DEFAULT '{}'",
                 [],
             )?;
+        }
+        if !self.has_column("conversations", "name")? {
+            self.conn
+                .execute("ALTER TABLE conversations ADD COLUMN name TEXT", [])?;
         }
         if !self.has_column("runs", "number")? {
             self.conn.execute(
@@ -530,10 +577,18 @@ impl SqliteStore {
         })
     }
 
-    pub fn record_notice(&self, turn: Option<TurnId>, text: &str) -> Result<MessageId> {
+    /// Persist a system notice. `member` scopes it to one agent's window; rows
+    /// stored before that existed have no member and replay as general notices.
+    pub fn record_notice(
+        &self,
+        turn: Option<TurnId>,
+        member: Option<&MemberId>,
+        text: &str,
+    ) -> Result<MessageId> {
         self.insert_message(MessageRow {
             turn,
             kind: "notice",
+            member,
             text: Some(text),
             ..MessageRow::default()
         })
@@ -673,6 +728,7 @@ impl SqliteStore {
         }
         if truncated {
             let notice = ChatItem::Notice {
+                member: None,
                 text: REPLAY_TRUNCATION_NOTICE.to_string(),
             };
             let notice_bytes = chat_item_replay_bytes(&notice);
@@ -691,6 +747,54 @@ impl SqliteStore {
             items.reverse();
         }
         Ok(items)
+    }
+
+    // --- conversation history for model switches -------------------------
+
+    /// The newest message id of the active conversation (0 when empty).
+    pub fn latest_message_id(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE conversation_id = ?1",
+            params![self.conversation.get()],
+            |row| row.get(0),
+        )
+    }
+
+    /// Chat rows of the active conversation newer than `after`, oldest first,
+    /// skipping `skip_turn`. Only the kinds a recap summarizes are returned;
+    /// tool output is left out because the recap never shows it.
+    pub fn history_after(
+        &self,
+        after: i64,
+        skip_turn: Option<TurnId>,
+    ) -> Result<Vec<HistoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, member_id, display_name, backend,
+                    CASE WHEN kind = 'tool' THEN NULL ELSE text END,
+                    name, summary, ok, targets, id
+             FROM messages
+             WHERE conversation_id = ?1
+               AND id > ?2
+               AND kind IN ('user', 'agent', 'tool', 'route', 'diff')
+               AND (turn_id IS NULL OR turn_id != ?3)
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                self.conversation.get(),
+                after,
+                skip_turn.map(|turn| turn.0 as i64).unwrap_or(-1)
+            ],
+            |row| Ok((map_chat_item(row)?, row.get::<_, i64>(9)?)),
+        )?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (item, id) = row?;
+            if let Some(item) = item {
+                entries.push(HistoryEntry { id, item });
+            }
+        }
+        Ok(entries)
     }
 
     // --- conversations ---------------------------------------------------
@@ -956,14 +1060,22 @@ impl SqliteStore {
         .transpose()
     }
 
-    /// Saved chats other than the active one, newest first.
+    /// Saved chats other than the active one, most recently changed first.
     ///
-    /// Only conversations with a roster/session snapshot are selectable:
+    /// Only conversations with a roster/session snapshot are listed:
     /// restoring a transcript without its members would violate `/resume`.
+    /// A chat with no real user message (a blank chat, or one holding only
+    /// an imported plugin inventory) is skipped unless it has a name, so
+    /// starting `/new` and leaving does not leave an unnamed entry behind.
     pub fn resumable_conversations(&self) -> Result<Vec<ConversationSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id,
                     c.created_at,
+                    COALESCE(
+                        (SELECT MAX(created_at) FROM messages
+                         WHERE conversation_id = c.id),
+                        c.created_at
+                    ) AS updated_at,
                     COALESCE(
                         (SELECT text FROM messages
                          WHERE conversation_id = c.id
@@ -976,37 +1088,95 @@ impl SqliteStore {
                            AND LOWER(LTRIM(text)) NOT LIKE '<recommended_plugins>%'
                          ORDER BY id ASC LIMIT 1),
                         ''
-                    ),
+                    ) AS preview,
                     (SELECT COUNT(*) FROM messages
                      WHERE conversation_id = c.id AND kind != 'agent_control'),
-                    s.team_json
+                    s.team_json,
+                    c.name
              FROM conversations c
              JOIN conversation_snapshots s ON s.conversation_id = c.id
-             WHERE c.id != ?1
-             ORDER BY c.id DESC",
+             WHERE c.id != ?1 AND (preview != '' OR c.name IS NOT NULL)
+             ORDER BY updated_at DESC, c.id DESC",
         )?;
         let rows = stmt.query_map(params![self.conversation.get()], |row| {
-            let preview: String = row.get(2)?;
-            let team_json: String = row.get(4)?;
-            let member_count = serde_json::from_str::<TeamConfig>(&team_json)
-                .map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(err))
-                })?
-                .members
-                .len();
+            let team_json: String = row.get(5)?;
+            let team = serde_json::from_str::<TeamConfig>(&team_json).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(err))
+            })?;
+            let main = team.members.iter().find(|member| member.parent.is_none());
             Ok(ConversationSummary {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
-                preview: if preview.trim().is_empty() {
-                    "(empty chat)".to_string()
-                } else {
-                    preview
-                },
-                message_count: row.get::<_, i64>(3)? as usize,
-                member_count,
+                updated_at: row.get(2)?,
+                preview: row.get(3)?,
+                name: row.get(6)?,
+                message_count: row.get::<_, i64>(4)? as usize,
+                member_count: team.members.len(),
+                main_backend: main.map(|member| member.backend),
+                main_model: main.and_then(|member| member.model.clone()),
+                main_effort: main.and_then(|member| member.effort),
             })
         })?;
         rows.collect()
+    }
+
+    /// The name given to a conversation, if it has one.
+    pub fn conversation_name(&self, conversation: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name FROM conversations WHERE id = ?1",
+                params![conversation],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Name a conversation. The name is trimmed; an empty or whitespace-only
+    /// one clears it. Returns whether the conversation exists.
+    pub fn set_conversation_name(&self, conversation: i64, name: Option<&str>) -> Result<bool> {
+        let name = name.map(str::trim).filter(|name| !name.is_empty());
+        let changed = self.conn.execute(
+            "UPDATE conversations SET name = ?2 WHERE id = ?1",
+            params![conversation, name],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Delete one saved conversation and everything stored for it, in one
+    /// transaction: its messages, roster snapshot, approvals, runs and the
+    /// runs' events and steps. Returns whether the conversation existed.
+    /// The active conversation is never deleted.
+    ///
+    /// Tables keyed by member rather than by conversation (`agent_sessions`,
+    /// `parked_sessions`, `native_import_cursors`, `stream_events`, `logs`,
+    /// the roster tables) belong to the live team, not to a chat, and stay.
+    pub fn delete_conversation(&self, conversation: i64) -> Result<bool> {
+        if conversation == self.conversation.get() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "the active conversation cannot be deleted".to_string(),
+            ));
+        }
+        self.transactional(|| {
+            for sql in [
+                "DELETE FROM run_events
+                 WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?1)",
+                "DELETE FROM run_steps
+                 WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?1)",
+                "DELETE FROM runs WHERE conversation_id = ?1",
+                "DELETE FROM approvals WHERE conversation_id = ?1",
+                "DELETE FROM messages WHERE conversation_id = ?1",
+                "DELETE FROM conversation_snapshots WHERE conversation_id = ?1",
+            ] {
+                self.conn.execute(sql, params![conversation])?;
+            }
+            let removed = self.conn.execute(
+                "DELETE FROM conversations WHERE id = ?1",
+                params![conversation],
+            )?;
+            Ok(removed > 0)
+        })
     }
 
     pub fn message_count(&self) -> Result<i64> {
@@ -1064,6 +1234,9 @@ impl SqliteStore {
 
     // --- sessions --------------------------------------------------------
 
+    /// Remember `session` as the member's resumable session. A session id the
+    /// member did not have before starts with nothing seen; the same id keeps
+    /// its watermark.
     pub fn upsert_session(
         &self,
         member: &MemberId,
@@ -1071,15 +1244,58 @@ impl SqliteStore {
         session: &AgentSessionId,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO agent_sessions (member_id, backend, session_id, updated_at)
-             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+            "INSERT INTO agent_sessions (member_id, backend, session_id, seen_through, updated_at)
+             VALUES (?1, ?2, ?3, 0, CURRENT_TIMESTAMP)
              ON CONFLICT(member_id) DO UPDATE SET
+                seen_through = CASE
+                    WHEN agent_sessions.backend = excluded.backend
+                     AND agent_sessions.session_id = excluded.session_id
+                    THEN agent_sessions.seen_through
+                    ELSE 0
+                END,
                 backend = excluded.backend,
                 session_id = excluded.session_id,
                 updated_at = CURRENT_TIMESTAMP",
             params![member.as_str(), backend.as_str(), session.as_str()],
         )?;
         Ok(())
+    }
+
+    /// Record how far into the chat the member's current session has seen.
+    pub fn set_session_seen(&self, member: &MemberId, seen_through: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_sessions SET seen_through = ?2 WHERE member_id = ?1",
+            params![member.as_str(), seen_through],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored session: the active one per member, then the parked ones.
+    pub fn stored_sessions(&self) -> Result<Vec<StoredConversationSession>> {
+        let mut sessions = Vec::new();
+        for parked in [false, true] {
+            let sql = if parked {
+                "SELECT member_id, backend, session_id, seen_through FROM parked_sessions
+                 ORDER BY member_id, backend"
+            } else {
+                "SELECT member_id, backend, session_id, seen_through FROM agent_sessions
+                 ORDER BY member_id"
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StoredConversationSession {
+                    member: MemberId::new(row.get::<_, String>(0)?),
+                    backend: read_backend(row.get::<_, Option<String>>(1)?.as_deref())?,
+                    session_id: row.get(2)?,
+                    seen_through: row.get(3)?,
+                    parked,
+                })
+            })?;
+            for row in rows {
+                sessions.push(row?);
+            }
+        }
+        Ok(sessions)
     }
 
     pub fn session_for(&self, member: &MemberId) -> Result<Option<AgentSessionId>> {
@@ -1152,24 +1368,45 @@ impl SqliteStore {
             "DELETE FROM agent_sessions WHERE member_id = ?1",
             params![member.as_str()],
         )?;
+        self.conn.execute(
+            "DELETE FROM parked_sessions WHERE member_id = ?1",
+            params![member.as_str()],
+        )?;
         Ok(())
     }
 
     pub fn clear_sessions(&self) -> Result<()> {
         self.conn.execute("DELETE FROM agent_sessions", [])?;
+        self.conn.execute("DELETE FROM parked_sessions", [])?;
         Ok(())
+    }
+
+    /// Rewrite every stored session row (for example after filling in the
+    /// watermark of sessions saved before it existed).
+    pub fn save_session_rows(&self, sessions: &[StoredConversationSession]) -> Result<()> {
+        self.transactional(|| self.replace_session_rows(sessions))
     }
 
     fn replace_session_rows(&self, sessions: &[StoredConversationSession]) -> Result<()> {
         self.conn.execute("DELETE FROM agent_sessions", [])?;
+        self.conn.execute("DELETE FROM parked_sessions", [])?;
         for session in sessions {
+            let sql = if session.parked {
+                "INSERT OR REPLACE INTO parked_sessions
+                    (member_id, backend, session_id, seen_through)
+                 VALUES (?1, ?2, ?3, ?4)"
+            } else {
+                "INSERT INTO agent_sessions
+                    (member_id, backend, session_id, seen_through, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)"
+            };
             self.conn.execute(
-                "INSERT INTO agent_sessions (member_id, backend, session_id, updated_at)
-                 VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+                sql,
                 params![
                     session.member.as_str(),
                     session.backend.as_str(),
-                    session.session_id
+                    session.session_id,
+                    session.seen_through
                 ],
             )?;
         }
@@ -2020,7 +2257,14 @@ fn chat_item_replay_bytes(item: &ChatItem) -> usize {
         ChatItem::Route { from, to, body } => {
             from.as_str().len() + to.iter().map(String::len).sum::<usize>() + body.len()
         }
-        ChatItem::Notice { text } => text.len(),
+        ChatItem::Spawn {
+            parent,
+            child,
+            summary,
+        } => parent.as_str().len() + child.as_str().len() + summary.len(),
+        ChatItem::Notice { text, member } => {
+            text.len() + member.as_ref().map_or(0, |member| member.as_str().len())
+        }
         ChatItem::Error { member, message } => {
             member.as_ref().map_or(0, |member| member.as_str().len()) + message.len()
         }
@@ -2092,6 +2336,7 @@ fn map_chat_item(row: &Row<'_>) -> rusqlite::Result<Option<ChatItem>> {
         },
         "notice" => ChatItem::Notice {
             text: text.unwrap_or_default(),
+            member: member_id.map(MemberId::new),
         },
         "error" => ChatItem::Error {
             member: member_id.map(MemberId::new),

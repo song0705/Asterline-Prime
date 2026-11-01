@@ -9,7 +9,7 @@ page is the [Chinese README](../README.md).
 ## Quick start
 
 ```text
-@builder inspect the repository and explain the architecture
+inspect the repository and explain the architecture
 /mode brainstorm
 How could we reduce indexing latency?
 /runs
@@ -45,19 +45,10 @@ Both `--option value` and `--option=value` are accepted for `--team`,
 
 ### `--team <PATH>`
 
-Load a JSON team configuration from `PATH` and skip the interactive team
-builder.
+Load a JSON team configuration from `PATH` instead of the saved one.
 
 ```bash
 asterline --team .asterline/team.json
-```
-
-### `--pick-team`
-
-Open the interactive team builder even when Asterline has a saved team.
-
-```bash
-asterline --pick-team
 ```
 
 ### `--workspace <PATH>`
@@ -108,7 +99,11 @@ asterline --debug
 ### `--fake`
 
 Use deterministic offline fake agents instead of installed backend CLIs. This
-is intended for development, demos, and tests.
+is intended for development, demos, and tests. A prompt containing `slow`
+makes the fake agent take about five seconds, so the running state can be
+inspected. A prompt containing the word `tools` makes it run eight tool calls
+of mixed kinds (one of them failing) before it answers, which is a quick way to
+see a long tool group.
 
 ```bash
 asterline --fake
@@ -167,19 +162,21 @@ asterline --help
 
 ### `@<member> <message>`
 
-Send a message to one team member. The member name must exist in `/team`.
+Optional: send a message to one team member without switching views. The
+member name must exist in `/team`. Plain text without a prefix already goes to
+the member you are viewing (press `←` on an empty composer to switch).
 
 ```text
 @builder implement the parser change and run its tests
 ```
 
-In a fresh normal conversation, the first message needs an explicit target.
-Later plain text reuses the previous target. In a collaboration mode, plain
-text starts or continues that mode using its configured participants.
+In the "All" view, plain text goes to the team's default member. In a
+collaboration mode, plain text starts or continues that mode using its
+configured participants.
 
 ### `@all <message>`
 
-Send the same message to every enabled member.
+Optional: send the same message to every enabled member.
 
 ```text
 @all review the proposed API and identify one risk
@@ -208,36 +205,21 @@ broadcasting it.
 
 ## Message and conversation commands
 
-### `/ask`
+### Older spellings
 
-```text
-/ask <member|all> <message>
-```
+These still work when typed in full, but `/help` and completion no longer list
+them:
 
-Send to one named member, or use `all` to broadcast. This is the slash-command
-equivalent of `@member` and `@all`.
-
-```text
-/ask reviewer check the error handling
-/ask all summarize your current progress
-```
-
-### `/all`
-
-```text
-/all <message>
-```
-
-Broadcast the message to every enabled member.
-
-```text
-/all stop editing and report findings
-```
+- `/ask <member|all> <message>` and `/all <message>` are the slash-command
+  forms of `@member` and `@all`.
+- `/agents` opens the Agents list, the same one `←` opens.
+- `/focus <member>` is the older spelling of `/logs <member>`.
 
 ### `/new`
 
 ```text
 /new
+/new <prompt>
 ```
 
 Persist the current conversation, create a new conversation, clear the visible
@@ -248,23 +230,49 @@ the new conversation. New runs in that chat start again at `run-1`. If a
 member, collaboration run, or verification is active, `/new` is rejected;
 press `Esc` and wait for cancellation first.
 
-`/clear` is a direct alias for `/new`; both perform the same full
-new-conversation operation rather than merely hiding history. A normal restart
-reopens the currently selected conversation instead of clearing it.
+`/new <prompt>` starts the new conversation and then sends the prompt to the
+main member as an ordinary first message. The prompt is kept as typed (inner
+spaces and line breaks included), and it is sent only after the new
+conversation exists: when `/new` is rejected, nothing is sent and the old chat
+is untouched.
+
+`/clear` takes no argument and does the same full new-conversation operation
+as a bare `/new` rather than merely hiding history (`/clear text` answers
+`Usage: /clear`). A normal restart reopens the currently selected conversation
+instead of clearing it. `/new` also removes the chat's sub-agents (see
+[Sub-agents](configuration.md#sub-agents)). The old chat stays in the Agents
+list's **Inactive** section (see [Agents list](#agents-list-)). `Ctrl+N` in
+that list is the same as `/new`.
 
 ### `/resume`
 
 ```text
 /resume
+/resume <number>
 ```
 
-Open the saved-conversation picker. Select a conversation with `↑` or `↓` and
-press `Enter` to restore its transcript, team configuration, roster, native
-backend session IDs, active mode, and conversation-scoped runs. Press `Esc` to
-cancel.
+`/resume` opens the Agents list with the highlight on its newest **Inactive**
+row, the saved conversations. Press `Enter` (or `→`, or click) on one to
+restore its transcript, team configuration, roster, native backend session
+IDs, active mode, and conversation-scoped runs; the restored chat itself is
+the confirmation. `/resume <number>` restores the conversation with that
+number directly; anything else after `/resume` answers a usage message.
+Asterline refuses to switch while members or verification are active; press
+`Esc` first.
 
-`/resume` accepts no ID or other argument. Asterline refuses to switch while
-members or verification are active; press `Esc` first.
+### `/name`
+
+```text
+/name <name>
+```
+
+Names the current chat. The name is trimmed and must not be empty (an empty one
+answers `Usage: /name <name>`). It replaces the first message as the chat's
+title: on the **Main** row of the Agents list while you are in it, and on its
+**Inactive** row once you leave. It is saved with the conversation, so it
+survives a restart and `/resume`; `/new` starts an unnamed chat. You can also
+rename a chat from the Agents list with `Ctrl+R`, which can clear a name too.
+A named chat is listed under **Inactive** even before you send a message to it.
 
 ### `/retry`
 
@@ -368,30 +376,183 @@ result is shared by matching backend/workspace members.
 Missing CLIs remain visible for diagnosis but cannot be selected.
 
 The editor changes the roster, backend, role, model, effort, native session ID,
-approval behavior, and default target. Changes stay in a
-draft until `s` applies and saves them. See [Team editor keys](#team-editor).
+and approval behavior. The model field shows what the member effectively runs:
+its pinned model and effort, else the ones the CLI's own configuration selects,
+else the catalog default. Changes stay in a draft until `s` applies and saves
+them. See [Team editor keys](#team-editor).
 
-### `/focus`
-
-```text
-/focus <member>
-```
-
-Open the log drawer filtered to one member. This is useful for inspecting its
-stdout, stderr, tool activity, and adapter warnings.
+### `/model`
 
 ```text
-/focus builder
+/model [text]
 ```
+
+Open the inline model selector above the composer. It changes the model of the
+agent you are viewing (in the "All" view, the default target's agent), the way
+a coding CLI's own `/model` changes the active session. The chat stays visible
+above it. Text after the command pre-fills the search box, which is a single
+`Search: …` line.
+
+The selector lists the models of every installed CLI, grouped under a dim
+heading each (`codex`, `claude`, `grok`, `agy`). Headings are not selectable,
+so `↑` / `↓` skip them. `current` follows the effort level (two columns after
+it; after the name column for a model without levels) on the target's current
+model, and nothing is shown on other rows. A model is current when it is the target's pinned
+`model`; for an agent with no pinned model, it is the model the CLI's own
+configuration selects, else the catalog's default. A backend whose catalog is
+still loading, or whose lookup failed, shows only a muted status row under its
+heading and nothing to select. A search with no results shows `No matching
+models`, and Enter does nothing.
+
+Claude Code has no model-listing command, so Asterline always offers its
+aliases (`opus`, `sonnet`, `haiku`, `fable`) plus every full id that has an
+entry in your `modelSettings`; a non-empty `availableModels` in Claude's
+settings restricts the list to those models (and the selected one). AGY lists
+one model per reasoning tier (`…-low`, `…-medium`, `…-high`); the selector
+merges these siblings into a single row, and `←`/`→` pick the variant.
+
+A model that offers several effort levels shows one square per level, filled up
+to the level in force, between `←` `→` arrows (on the highlighted row) and the
+level name. Each model starts on the target's own effort (for its current
+model), else the effort the CLI's own configuration sets (Codex
+`model_reasoning_effort`, Claude `effortLevel` / `modelSettings`), else the
+model's default level, else `medium`, else its lowest level. A model with fewer
+than two levels shows nothing and `←`/`→` do nothing for it. When the list
+scrolls, a `(3/12)` row shows the position among the models (headings are not
+counted).
+
+| Key                   | Action                                              |
+| --------------------- | --------------------------------------------------- |
+| Type / `Backspace`    | Search backend, model ID, and model name            |
+| `↑` / `↓`             | Select a model (the mouse wheel does the same)      |
+| `←` / `→`             | Change the highlighted model's effort level         |
+| `Enter`               | Apply to the target agent and close                 |
+| `Esc`                 | Close without changing anything                     |
+
+Applying always pins the chosen model id in the agent's `model`. An `effort` is
+saved only if you changed it with `←`/`→` on that row; the agent's current
+model keeps the effort it already had, and any other model leaves effort to the
+CLI. For AGY's merged rows the variant id carries the level, so no `effort` is
+written. Choosing a model from another CLI also switches the agent to that
+CLI's default permission preset and starts a fresh native session. The change is
+saved to `.asterline/team.json`, and a `Model: …` row records it in the chat. It
+is refused (with a notice) while the agent is working; press `Esc` to stop it
+first.
+
+**How the conversation carries over.** A model change on the same CLI keeps the
+native session, so the context stays as it is and nothing is added. A different
+CLI starts a native session that has seen nothing, so Asterline treats its
+stored chat as the source of truth: the next message to that agent gets a short
+recap in front of it, made of the user messages, replies and forwarded messages
+in that agent's own conversation (tool calls and file changes are one line each,
+without tool output). The recap goes to the model only; it is not shown in the
+chat and not saved as a chat message. It is capped at about 40,000 characters
+and keeps the newest part; when something had to be dropped, the `Model: …` row
+gets ` · earlier messages not carried over`. Each native session of each agent
+remembers how far into the chat it has seen, saved with the session id (it
+survives a restart and `/resume`; `/new` clears it). Switching back to a CLI
+whose old session is still remembered resumes that session and recaps only what
+it missed.
+
+### Agents list (`←`)
+
+Press `←` on an empty composer to open the Agents list. It takes over the whole
+screen (no transcript, composer, or chat footer) until you pick an agent or
+close it, and `/agents` opens the same list. The main chat shows one member's
+conversation at a time: that member's replies, reasoning, tools, and diffs, the
+prompts you sent to it, and the relays it sends or receives. Prompts you sent
+to other members, relays between other members, and notices about another
+member (a `Model: …` switch, a refused spawn) are not shown in that window, and
+`/find` skips them too. General notices (mode changes, `/new`, team updates)
+show in every view. Choose **All messages** to see every member's activity in
+order instead.
+
+From top to bottom the screen shows:
+
+- A dim counts line, `Agents · 2 running, 1 idle, 3 inactive`, counting
+  top-level agents and saved chats.
+- A search prompt (`> Search agents`). Typing, `Backspace`, and paste edit the
+  search instead of the chat composer. It matches the name (for the main row,
+  its title and `main`), backend, and model (substring first, then letters in order, so `rvw` finds `Reviewer`; every
+  word must match). While a search is typed the list is flat and ranked by
+  relevance, without sections; `No agents match your search.` appears when
+  nothing matches.
+- A bold legend (`Agent  Model  Activity`), then **All messages** first, then
+  the **Running (n)**, **Idle (n)**, and **Inactive (n)** sections. A top-level agent is in
+  *Running* while it or any of its sub-agents is working, queued, waiting, or
+  needs approval; otherwise in *Idle*. A sub-agent stays under its parent,
+  indented four columns inside the name column so the other columns stay
+  aligned. *Inactive* lists the saved conversations (not live members), newest
+  first, and appears only when there are any. Its rows have a dim `•`, the
+  chat's first message on one line as the title, the main member's backend and
+  model, and the time since the chat last changed (`45s`, `12m`, `3h`, `2d`).
+  If you named the chat (`/name`, or `Ctrl+R` below), the name is the title
+  instead of the first message. They show no preview, and a search matches
+  their title and model too. `Enter`
+  or `→` on one restores that conversation and closes the list; `Ctrl+N`
+  starts a new conversation. Asterline reloads the saved chats every time the
+  list opens.
+- Each row has an icon (a pulsing `◇◈◆◈` while the agent is active, a yellow
+  `!` while it waits for your approval, `•` otherwise, in the error colour for
+  failed),
+  the name, the backend with the model and effort it effectively runs, and its
+  activity. The main member's row is titled by the chat, not by its name: the
+  name you gave it (`/name`), else the first prompt sent to it, with whitespace
+  collapsed to single spaces, else the workspace folder's name before any
+  prompt. Sub-agents and members added in
+  `/team` keep their configured names. The name column is at most 28 columns
+  wide and longer text ends with `…`, so a long first prompt does not squeeze
+  the other columns. Activity is:
+  `working 12s` (or `queued`, `waiting`, `needs approval`) while active,
+  `failed` after a failure, otherwise the time since its last reply this
+  session (`3m`; blank until it has replied).
+- The selected row is a full-width highlighted band. Only the selected row
+  shows a preview of that agent's last message, wrapped under it in dim text
+  (at most three lines, ending with `…` when cut). When the list is taller than
+  the screen, the selection stays near the middle and dim `...` rows mark what
+  is clipped above or below.
+- A hint line on the last row.
+
+Select a sub-agent to see its whole conversation and keep chatting with it
+directly; its replies to you are not forwarded to its parent. The list opens
+with the agent you are viewing selected.
+
+- `↑` / `↓` move the selection; `Home` / `End` jump to the first or last row;
+  `PageUp` / `PageDown` move by a page; the mouse wheel moves one row.
+- `Ctrl+N` starts a new conversation (like `/new`) and closes the list.
+- `Ctrl+R` (empty search; on an **Inactive** row or the **Main** row) renames
+  that chat. The search line becomes `> Rename: <name>`, prefilled with the
+  current name; `Enter` saves it (an empty name clears it) and `Esc` cancels.
+  The hint line reads `Enter save   Esc cancel` meanwhile.
+- `Ctrl+X` (empty search, **Inactive** row only) deletes a saved chat with all
+  its messages, runs, and approvals. The first press changes the hint line to
+  `Press Ctrl+X again to delete`; a second `Ctrl+X` on the same row deletes it.
+  Any other key, or moving the selection, cancels. The current chat and live
+  agents cannot be deleted. The hint line lists `Ctrl+R rename` and `Ctrl+X
+  delete` only on rows where they apply.
+- `Enter` or `→` switches the main chat to the selected row and closes the list;
+  a mouse click on a row does the same.
+- `Esc` clears a typed search first and closes the list when the search is
+  empty. `←` closes the list only while the search is empty.
+
+The first member (or the team's default target) is shown when Asterline
+starts. Plain text goes to the agent you are viewing. In the "All" view, plain
+text goes to the team's default member.
 
 ### `/logs`
 
 ```text
-/logs
+/logs [member]
 ```
 
 Open persisted runtime logs, including backend stderr and adapter/runtime
-warnings. Use `/focus <member>` for a member-specific view.
+warnings, oldest first like the transcript, opened on the newest entry. Only
+warnings and errors carry a level label. Give a member to filter the drawer to its stdout, stderr, tool
+activity, and adapter warnings.
+
+```text
+/logs builder
+```
 
 ### `/diff`
 
@@ -400,7 +561,9 @@ warnings. Use `/focus <member>` for a member-specific view.
 ```
 
 Open a live working-tree view containing `git diff` output plus untracked file
-information. It does not stage, revert, or otherwise modify files.
+information. It does not stage, revert, or otherwise modify files. When the
+tree is clean, or the workspace is not a git repository, a one-line notice
+appears in the transcript instead of an empty panel.
 
 ### `/find`
 
@@ -411,7 +574,8 @@ information. It does not stage, revert, or otherwise modify files.
 Search the current transcript case-insensitively. The footer shows the current
 match and total, such as `find: "timeout" (2/5)`. With an empty composer and no
 drawer open, press `n` for the next match or `p` for the previous match.
-`/find` with no text, or `Esc`, clears the search.
+`/find` with no text, or `Esc`, clears the search. A match inside a folded
+tool group (see [Tool calls](#tool-calls)) opens that group.
 
 ```text
 /find timeout
@@ -423,8 +587,9 @@ drawer open, press `n` for the next match or `p` for the previous match.
 /help
 ```
 
-Open the command palette. Unknown slash commands and commands with invalid or
-missing required arguments also open this palette.
+Open the command palette (titled with the Asterline version), the commands worth knowing in three groups: Common, Approvals & sessions, and Runs. The `/` suggestion list uses the same order, with the best match for what you have typed first.
+Unknown slash commands and commands with invalid or missing required arguments
+also open this palette.
 
 ## Collaboration modes
 
@@ -435,8 +600,8 @@ missing required arguments also open this palette.
 /mode <normal|review|plan|brainstorm|team>
 ```
 
-`/mode` with no argument opens a small overlay on the chat (the same kind
-of drawer as `/team`). The first layer lists every mode with its resolved
+`/mode` with no argument opens a panel just above the composer, like the
+`/model` selector, as tall as its content. The first layer lists every mode with its resolved
 binding line and lands on the current conversation mode. Enter is the only
 key that opens the highlighted mode's fields. Esc or q closes without
 applying unsaved edits.
@@ -450,7 +615,10 @@ clears the selected field's this-chat override so it falls back. Closing
 without `s` or `w` discards pending edits.
 
 `/mode <name>` stays the keyboard fast path: it switches immediately and
-does not open the panel. After selecting `review`, `plan`, `brainstorm`, or
+does not open the panel. A `Mode: …` line in the transcript describes the new
+mode, or says plainly why this roster cannot run it yet (only an explicit
+binding that cannot work, such as a reviewer bound to the builder); outside `normal` a ` review mode ` chip sits in the
+member bar. After selecting `review`, `plan`, `brainstorm`, or
 `team`, enter the task as the next plain message — do **not** add an
 `@member` prefix. That message starts the selected mode with its configured
 participants. `@member <message>` deliberately remains a one-to-one
@@ -462,8 +630,8 @@ overrides.
 
 #### `/mode normal`
 
-Use ordinary direct-message dispatch. A fresh chat requires `@member`,
-`@all`, `/ask`, or `/all`; later plain text can reuse the previous target.
+Use ordinary direct-message dispatch. Plain text goes to the agent you are
+viewing; `@member` and `@all` still send elsewhere.
 
 #### `/mode review`
 
@@ -472,7 +640,9 @@ structured `@@review` verdict, and revision continues until approval or
 `max_iterations`. If the limit is reached, the run becomes blocked. The
 reviewer is asked to inspect the working tree rather than trusting the
 builder's report. An optional `reviewer_hint` is appended to that prompt.
-A reviewer reply
+When no other top-level member can review, the run first opens a `reviewer`
+[sub-agent](configuration.md#sub-agents) under `main` with `main`'s model and
+reuses it next time. A reviewer reply
 without a structured verdict is nudged once, then treated as
 `request_changes` (a notice says so) and costs an iteration.
 
@@ -483,9 +653,9 @@ Refactor the parser without changing its public behavior
 
 #### `/mode plan`
 
-Start a leader-driven planning run. Plan needs a configured Builder; the leader
-creates a checklist (steps do not need owners), then the complete checklist is
-sent to that Builder. The Reviewer is optional. When configured, it audits only
+Start a leader-driven planning run. The leader creates a checklist (steps do
+not need owners), then the complete checklist is sent to the Builder, which
+defaults to the leader itself unless `modes.plan.builder` names someone else. The Reviewer is optional. When configured, it audits only
 the plan — completeness, ordering, risks, acceptance criteria, testability —
 never code or diffs; requested changes return to the Leader for a revised
 checklist. `modes.plan.auto_execute` defaults to `true`; set it to `false` to
@@ -503,7 +673,9 @@ Start a structured multi-participant brainstorm. A complete run performs
 judgment-free `seed`, `build`, and `stretch` generation waves, then collects
 private ranked ballots, calculates the ranking, and synthesizes the selected
 ideas while preserving dissent and evidence. Idea cards and ballots follow the
-bundled Asterline brainstorm skill so they can be extracted reliably.
+bundled Asterline brainstorm skill so they can be extracted reliably. With
+only `main`, the run opens `ideator-1`, `ideator-2`, … sub-agents (with
+`main`'s model) up to `modes.brainstorm.participant_count`, default 3.
 
 ```text
 /mode brainstorm
@@ -545,7 +717,8 @@ conversation's runs.
 
 Open the Runs drawer to inspect run ID, mode, phase, status, contributions,
 verification, checklist, timeline, and suggested next action. See [Runs drawer
-keys](#runs-drawer).
+keys](#runs-drawer). Before the first run exists, a one-line notice replaces the
+drawer.
 
 ### `/continue`
 
@@ -671,16 +844,19 @@ conversation can be scrolled all the way to its first message.
 | `Alt+Enter`                    | Newline fallback for terminals without distinct Shift+Enter   |
 | `↑` / `↓`                      | Move in composer, history, or active selection                |
 | `Tab`                          | Accept completion                                             |
-| `Ctrl+R`                       | Reverse-search prompt history                                 |
+| `Ctrl+R`                       | Reverse-search prompt history (in the Agents list: rename)    |
+| `Ctrl+X` (Agents list)         | Press twice to delete the selected saved chat                 |
 | `n` / `p`                      | Next/previous `/find` match when composer is empty            |
 | `PageUp` / `PageDown`          | Scroll chat or the open drawer by a page                      |
+| `←` (empty composer)           | Open the Agents list (members, sub-agents, saved chats)       |
 | `Shift+←`                      | Pull the last queued, not-yet-started message back to edit    |
 | Mouse drag                     | Select and copy chat, composer, status-bar, or drawer text    |
+| Click a tool group title       | Fold or unfold that tool group                                |
 | Mouse wheel                    | Scroll chat or the open drawer                                |
 | `Esc`                          | Close overlay/find, or stop work and send the queued message  |
 | `Ctrl+T`                       | Expand or collapse thinking                                   |
 | `Ctrl+G`                       | Expand or collapse file-change diffs                          |
-| `Ctrl+O`                       | Expand or collapse tool output                                |
+| `Ctrl+O`                       | Show full tool output and open every tool group (toggle)      |
 | `Ctrl+L`                       | Open logs                                                     |
 | `Ctrl+P`                       | Open command palette                                          |
 | `Ctrl+N` / `Ctrl+B`            | Focus next/previous member                                    |
@@ -704,6 +880,28 @@ Prompt history behaves like a shell: `↑` and `↓` preserve the current draft
 while browsing older submissions. During `Ctrl+R`, type to refine the match,
 press `Ctrl+R` again for an older match, `Enter` to accept, or `Esc` to cancel.
 
+### Tool calls
+
+Consecutive tool calls by one agent are drawn as one group under a `⚒ tools`
+title, one row per call. A group of up to 3 calls is always listed in full. A
+longer group is folded into a single line by default:
+
+```text
+  ▸ ⚒ tools · 12 calls · 3 read, 5 edit, 4 shell · 2 failed
+```
+
+The line counts calls by kind (the first four kinds in order of appearance,
+then `…`) and, when any call failed, how many (shown in the error colour). While
+the group's newest call is still running, that one row stays under the line so
+progress remains visible.
+
+Click the title line to unfold that group (`▾ ⚒ tools`) and click it again to
+fold it. A click toggles only the group it lands on; dragging across the line
+still selects text. `Ctrl+O` also shows the complete output of each call and
+opens every folded group while it is on; turning it off returns each group to
+its own folded or unfolded state. `/new` and `/resume` start with all groups
+folded. `⇄ agents` groups are not folded.
+
 ## Team editor
 
 The Team editor has member-selection and field-selection levels.
@@ -715,11 +913,12 @@ The Team editor has member-selection and field-selection levels.
 | `Enter`   | Open member fields                          | Edit or open Agent/model/session picker  |
 | `Esc`     | Close Team                                  | Return to member selection               |
 | `a` / `d` | Add/delete a member                         | —                                        |
-| `t`       | Make member the default target              | Retry failed Model catalog               |
-| `*`       | Make all members the default target         | —                                        |
+| `t`       | —                                           | Retry failed Model catalog               |
+| `y`       | Copy the session ID                         | Copy the field value                     |
 | `s`       | Apply and save                              | Apply and save                           |
 | `e`       | —                                           | Manually enter model or session ID       |
 
+The keys for the current level are listed once, in the last row of the editor.
 Text fields open in a focused input box. Press `Enter` to commit or `Esc` to
 cancel. Model pickers use `↑`/`↓` for model, `←`/`→` for that model's effort,
 and `Enter` to apply both. When discovery returns models, its actual default
@@ -753,8 +952,12 @@ close the drawer with `Esc`, then press `Esc` again.
 
 ## Other drawers
 
-All drawers support `PageUp`/`PageDown` or the mouse wheel for scrolling and
-`Esc` to close. Text in chat, status bars, and drawers can be selected with a
+The mode panel sits above the composer, and the Agents list replaces the whole
+screen; the other drawers
+(`/help`, `/team`, `/logs`, `/runs`, `/diff`) are full-width overlays
+just tall enough for their content (title, content, hint), with one column of
+padding inside the border. All drawers support `PageUp`/`PageDown` or the mouse wheel for
+scrolling and `Esc` to close. Text in chat, status bars, and drawers can be selected with a
 mouse drag and copied using the terminal's normal copy shortcut.
 
 ## Native session attach

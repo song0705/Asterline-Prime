@@ -28,6 +28,7 @@ fn ready_two() -> RuntimeEvent {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             },
             MemberSummary {
                 id: MemberId::new("reviewer"),
@@ -43,6 +44,7 @@ fn ready_two() -> RuntimeEvent {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             },
         ],
     }

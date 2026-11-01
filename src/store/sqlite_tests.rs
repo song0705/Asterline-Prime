@@ -217,11 +217,25 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
         BackendKind::Codex,
         "build",
     ));
-    let sessions = vec![StoredConversationSession {
-        member: MemberId::new("builder"),
-        backend: BackendKind::Codex,
-        session_id: "codex-session-1".to_string(),
-    }];
+    let sessions = vec![
+        StoredConversationSession {
+            seen_through: Some(7),
+            ..StoredConversationSession::new(
+                MemberId::new("builder"),
+                BackendKind::Codex,
+                "codex-session-1",
+            )
+        },
+        StoredConversationSession {
+            parked: true,
+            seen_through: Some(3),
+            ..StoredConversationSession::new(
+                MemberId::new("builder"),
+                BackendKind::Claude,
+                "claude-session-1",
+            )
+        },
+    ];
     store
         .save_conversation_snapshot(
             &team,
@@ -247,6 +261,9 @@ fn conversation_snapshots_drive_resume_list_and_restore_data() {
     assert_eq!(choices[0].preview, "restore this exact chat");
     assert_eq!(choices[0].message_count, 1);
     assert_eq!(choices[0].member_count, 1);
+    assert_eq!(choices[0].main_backend, Some(BackendKind::Codex));
+    assert_eq!(choices[0].main_model, None);
+    assert!(!choices[0].updated_at.is_empty());
 
     let restored = store.conversation_snapshot(first).unwrap().unwrap();
     assert_eq!(restored.team, team);
@@ -598,7 +615,7 @@ fn replay_keeps_the_first_message_when_the_conversation_fits() {
     let conversation = store.current_conversation().unwrap();
     for index in 0..80 {
         store
-            .record_notice(None, &format!("item-{index:03}"))
+            .record_notice(None, None, &format!("item-{index:03}"))
             .unwrap();
     }
 
@@ -606,11 +623,11 @@ fn replay_keeps_the_first_message_when_the_conversation_fits() {
     assert_eq!(items.len(), 80);
     assert!(matches!(
         items.first(),
-        Some(ChatItem::Notice { text }) if text == "item-000"
+        Some(ChatItem::Notice { text, .. }) if text == "item-000"
     ));
     assert!(matches!(
         items.last(),
-        Some(ChatItem::Notice { text }) if text == "item-079"
+        Some(ChatItem::Notice { text, .. }) if text == "item-079"
     ));
 }
 
@@ -637,15 +654,15 @@ fn replay_loads_only_the_deterministic_tail_of_a_hundred_thousand_rows() {
     assert_eq!(items.len(), REPLAY_MAX_ITEMS);
     assert!(matches!(
         &items[0],
-        ChatItem::Notice { text } if text == REPLAY_TRUNCATION_NOTICE
+        ChatItem::Notice { text, .. } if text == REPLAY_TRUNCATION_NOTICE
     ));
     assert!(matches!(
         &items[1],
-        ChatItem::Notice { text } if text == "item-090002"
+        ChatItem::Notice { text, .. } if text == "item-090002"
     ));
     assert!(matches!(
         items.last().unwrap(),
-        ChatItem::Notice { text } if text == "item-100000"
+        ChatItem::Notice { text, .. } if text == "item-100000"
     ));
 }
 
@@ -656,7 +673,7 @@ fn replay_tail_respects_the_cumulative_byte_budget() {
     let payload = "x".repeat(2 * 1024 * 1024);
     for index in 0..12 {
         store
-            .record_notice(None, &format!("{payload}#{index}"))
+            .record_notice(None, None, &format!("{payload}#{index}"))
             .unwrap();
     }
 
@@ -666,18 +683,18 @@ fn replay_tail_respects_the_cumulative_byte_budget() {
     assert!(retained_bytes <= REPLAY_MAX_BYTES);
     assert!(matches!(
         &items[0],
-        ChatItem::Notice { text } if text == REPLAY_TRUNCATION_NOTICE
+        ChatItem::Notice { text, .. } if text == REPLAY_TRUNCATION_NOTICE
     ));
     assert!(matches!(
         items.last().unwrap(),
-        ChatItem::Notice { text } if text.ends_with("#11")
+        ChatItem::Notice { text, .. } if text.ends_with("#11")
     ));
 }
 
 #[test]
 fn error_and_notice_round_trip() {
     let store = store();
-    store.record_notice(None, "relay paused").unwrap();
+    store.record_notice(None, None, "relay paused").unwrap();
     store
         .record_error(None, Some(&MemberId::new("builder")), "process failed")
         .unwrap();
@@ -686,6 +703,7 @@ fn error_and_notice_round_trip() {
     assert_eq!(
         items[0],
         ChatItem::Notice {
+            member: None,
             text: "relay paused".to_string()
         }
     );
@@ -694,6 +712,39 @@ fn error_and_notice_round_trip() {
         ChatItem::Error {
             member: Some(MemberId::new("builder")),
             message: "process failed".to_string()
+        }
+    );
+}
+
+#[test]
+fn a_member_notice_keeps_its_member_and_old_rows_replay_as_general() {
+    let store = store();
+    store
+        .record_notice(None, Some(&MemberId::new("reviewer")), "Model: Reviewer")
+        .unwrap();
+    // A row written before notices carried a member: no member_id at all.
+    store
+        .conn
+        .execute(
+            "INSERT INTO messages (conversation_id, kind, text) VALUES (?1, 'notice', 'old notice')",
+            rusqlite::params![store.conversation.get()],
+        )
+        .unwrap();
+
+    let items = store.replay_chat().unwrap();
+
+    assert_eq!(
+        items[0],
+        ChatItem::Notice {
+            member: Some(MemberId::new("reviewer")),
+            text: "Model: Reviewer".to_string()
+        }
+    );
+    assert_eq!(
+        items[1],
+        ChatItem::Notice {
+            member: None,
+            text: "old notice".to_string()
         }
     );
 }
@@ -1496,5 +1547,291 @@ fn legacy_roundtable_mode_is_preserved_as_legacy_mode() {
             .iter()
             .any(|r| r.id == run.id && r.legacy_mode.as_deref() == Some("roundtable")),
         "legacy run should still appear in the runs list: {listed:?}"
+    );
+}
+
+#[test]
+fn saved_chats_skip_blank_chats_and_order_by_latest_message() {
+    let store = store();
+    let team = TeamConfig::new("saved", "/tmp/ws")
+        .with_member({
+            let mut sub = TeamMember::new("kid", "Kid", BackendKind::Grok, "side");
+            sub.parent = Some(MemberId::new("builder"));
+            sub
+        })
+        .with_member({
+            let mut member = TeamMember::new("builder", "Builder", BackendKind::Claude, "build");
+            member.model = Some("opus".to_string());
+            member.effort = Some(crate::domain::team::Effort::High);
+            member
+        });
+    let save = |text: Option<&str>| {
+        let id = store.create_conversation().unwrap();
+        store.set_conversation(id).unwrap();
+        store
+            .save_conversation_snapshot(&team, &[], TerminalMode::Normal, &ModesConfig::default())
+            .unwrap();
+        if let Some(text) = text {
+            let turn = store.create_turn().unwrap();
+            store
+                .record_user(turn, &[MemberId::new("builder")], text)
+                .unwrap();
+        }
+        id
+    };
+    let old = save(Some("older chat"));
+    let _blank = save(None);
+    let newer = save(Some("newer chat"));
+    let current = save(Some("current chat"));
+    // Make the first chat the most recently touched one.
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET created_at = '2999-01-01 00:00:00' WHERE conversation_id = ?1",
+            [old],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET created_at = '2001-02-03 04:05:06' WHERE conversation_id = ?1",
+            [newer],
+        )
+        .unwrap();
+    assert_eq!(store.current_conversation().unwrap(), current);
+
+    let chats = store.resumable_conversations().unwrap();
+
+    assert_eq!(
+        chats.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+        [old, newer]
+    );
+    assert_eq!(chats[0].updated_at, "2999-01-01 00:00:00");
+    assert_eq!(chats[1].updated_at, "2001-02-03 04:05:06");
+    // The main member is the first top-level one, not the sub-agent listed first.
+    assert_eq!(chats[0].main_backend, Some(BackendKind::Claude));
+    assert_eq!(chats[0].main_model.as_deref(), Some("opus"));
+    assert_eq!(
+        chats[0].main_effort,
+        Some(crate::domain::team::Effort::High)
+    );
+}
+
+fn count(store: &SqliteStore, sql: &str, conversation: i64) -> i64 {
+    store
+        .conn
+        .query_row(sql, [conversation], |row| row.get(0))
+        .unwrap()
+}
+
+/// A saved conversation holding a message, an approval, and a run with an
+/// event and a step; leaves the store pointed at a fresh conversation.
+fn conversation_with_everything(store: &SqliteStore, text: &str) -> i64 {
+    let team = TeamConfig::new("saved", "/tmp/ws").with_member(TeamMember::new(
+        "builder",
+        "Builder",
+        BackendKind::Claude,
+        "build",
+    ));
+    let id = store.create_conversation().unwrap();
+    store.set_conversation(id).unwrap();
+    store
+        .save_conversation_snapshot(&team, &[], TerminalMode::Normal, &ModesConfig::default())
+        .unwrap();
+    let turn = store.create_turn().unwrap();
+    store
+        .record_user(turn, &[MemberId::new("builder")], text)
+        .unwrap();
+    store
+        .insert_approval(Some(turn), Some(&MemberId::new("builder")), "run", "ls")
+        .unwrap();
+    let run = store.create_run("ship it", None).unwrap();
+    store.add_run_step(run.id, None, "write code").unwrap();
+    id
+}
+
+#[test]
+fn deleting_a_saved_chat_removes_everything_that_belongs_to_it() {
+    let store = store();
+    let doomed = conversation_with_everything(&store, "delete me");
+    let kept = conversation_with_everything(&store, "keep me");
+    let current = store.create_conversation().unwrap();
+    store.set_conversation(current).unwrap();
+    let in_doomed = [
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM conversation_snapshots WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM approvals WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM runs WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM run_events
+         WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?1)",
+        "SELECT COUNT(*) FROM run_steps
+         WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?1)",
+        "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+    ];
+    let before: Vec<i64> = in_doomed
+        .iter()
+        .map(|sql| count(&store, sql, doomed))
+        .collect();
+    assert!(before.iter().all(|&rows| rows > 0), "{before:?}");
+    let kept_before: Vec<i64> = in_doomed
+        .iter()
+        .map(|sql| count(&store, sql, kept))
+        .collect();
+
+    assert!(store.delete_conversation(doomed).unwrap());
+
+    for sql in in_doomed {
+        assert_eq!(count(&store, sql, doomed), 0, "{sql}");
+    }
+    let kept_after: Vec<i64> = in_doomed
+        .iter()
+        .map(|sql| count(&store, sql, kept))
+        .collect();
+    assert_eq!(kept_after, kept_before);
+    let listed: Vec<i64> = store
+        .resumable_conversations()
+        .unwrap()
+        .iter()
+        .map(|chat| chat.id)
+        .collect();
+    assert_eq!(listed, [kept]);
+    // Deleting it again finds nothing.
+    assert!(!store.delete_conversation(doomed).unwrap());
+}
+
+#[test]
+fn the_active_conversation_cannot_be_deleted() {
+    let store = store();
+    let active = conversation_with_everything(&store, "still here");
+
+    assert!(store.delete_conversation(active).is_err());
+
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            active
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_failed_delete_leaves_the_chat_whole() {
+    let store = store();
+    let doomed = conversation_with_everything(&store, "delete me");
+    let current = store.create_conversation().unwrap();
+    store.set_conversation(current).unwrap();
+    // Break the last statement so the earlier deletes must roll back.
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER block_delete BEFORE DELETE ON conversations
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .unwrap();
+
+    assert!(store.delete_conversation(doomed).is_err());
+
+    for sql in [
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM runs WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM approvals WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM conversation_snapshots WHERE conversation_id = ?1",
+    ] {
+        assert_eq!(count(&store, sql, doomed), 1, "{sql}");
+    }
+}
+
+#[test]
+fn a_chat_name_is_stored_trimmed_and_titles_the_listing() {
+    let store = store();
+    let named = conversation_with_everything(&store, "first words");
+    let current = store.create_conversation().unwrap();
+    store.set_conversation(current).unwrap();
+    assert_eq!(store.conversation_name(named).unwrap(), None);
+    assert_eq!(store.resumable_conversations().unwrap()[0].name, None);
+
+    assert!(
+        store
+            .set_conversation_name(named, Some("  Release prep \n"))
+            .unwrap()
+    );
+
+    assert_eq!(
+        store.conversation_name(named).unwrap().as_deref(),
+        Some("Release prep")
+    );
+    let chats = store.resumable_conversations().unwrap();
+    assert_eq!(chats[0].name.as_deref(), Some("Release prep"));
+    assert_eq!(chats[0].preview, "first words");
+
+    // An empty or whitespace-only name clears it.
+    store.set_conversation_name(named, Some("   ")).unwrap();
+    assert_eq!(store.conversation_name(named).unwrap(), None);
+    store.set_conversation_name(named, Some("again")).unwrap();
+    store.set_conversation_name(named, None).unwrap();
+    assert_eq!(store.conversation_name(named).unwrap(), None);
+    // A conversation that does not exist is reported, not created.
+    assert!(!store.set_conversation_name(9_999, Some("x")).unwrap());
+}
+
+#[test]
+fn a_named_chat_without_messages_is_listed_but_an_unnamed_one_is_not() {
+    let store = store();
+    let team = TeamConfig::new("saved", "/tmp/ws").with_member(TeamMember::new(
+        "builder",
+        "Builder",
+        BackendKind::Claude,
+        "build",
+    ));
+    let empty = |name: Option<&str>| {
+        let id = store.create_conversation().unwrap();
+        store.set_conversation(id).unwrap();
+        store
+            .save_conversation_snapshot(&team, &[], TerminalMode::Normal, &ModesConfig::default())
+            .unwrap();
+        store.set_conversation_name(id, name).unwrap();
+        id
+    };
+    let _unnamed = empty(None);
+    let named = empty(Some("Scratch pad"));
+    let current = empty(None);
+    assert_eq!(store.current_conversation().unwrap(), current);
+
+    let chats = store.resumable_conversations().unwrap();
+
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].id, named);
+    assert_eq!(chats[0].name.as_deref(), Some("Scratch pad"));
+    assert_eq!(chats[0].preview, "");
+}
+
+#[test]
+fn the_name_column_is_added_to_an_existing_database() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO conversations DEFAULT VALUES;",
+    )
+    .unwrap();
+    let store = SqliteStore {
+        conn,
+        conversation: Cell::new(0),
+    };
+
+    store.create_schema().unwrap();
+
+    assert!(store.has_column("conversations", "name").unwrap());
+    assert_eq!(store.conversation_name(1).unwrap(), None);
+    assert!(store.set_conversation_name(1, Some("old chat")).unwrap());
+    // A second start finds the column already there.
+    store.create_schema().unwrap();
+    assert_eq!(
+        store.conversation_name(1).unwrap().as_deref(),
+        Some("old chat")
     );
 }

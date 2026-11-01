@@ -400,7 +400,7 @@ fn controls_are_not_executed_after_raw_stream_persistence_fails() {
     );
     assert!(completed.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text) if text.contains("ignored controls")
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. } if text.contains("ignored controls")
     )));
     let (sources, routes): (i64, i64) = external
         .query_row(
@@ -469,6 +469,55 @@ fn route_is_not_emitted_or_dispatched_when_route_persistence_fails() {
 }
 
 #[test]
+fn switching_to_a_mode_the_roster_cannot_run_says_so_in_plain_words() {
+    let mut config = TeamConfig::new("solo", "/tmp/ws").with_member(TeamMember::new(
+        "main",
+        "Main",
+        BackendKind::Codex,
+        "general",
+    ));
+    config.default_target = Some(DefaultTarget::Member(MemberId::new("main")));
+    // An explicit reviewer that is the builder cannot be fixed by a sub-agent.
+    config.modes.review = Some(ReviewModeConfig {
+        reviewer: Some(MemberId::new("main")),
+        ..ReviewModeConfig::default()
+    });
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+
+    let notice = |rt: &mut TeamRuntime, mode| {
+        rt.on_ui_command(UiCommand::SetMode { mode })
+            .events
+            .into_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::Notice(text) => Some(text),
+                _ => None,
+            })
+            .expect("a notice")
+    };
+    let review = notice(&mut rt, TerminalMode::Review);
+    assert!(
+        review.starts_with("Mode: review — can't run with this roster yet"),
+        "{review}"
+    );
+    assert!(review.contains("two distinct members"), "{review}");
+    assert!(!review.contains('\n'));
+
+    // A lone main runs the other modes; the seats it lacks are opened later.
+    let brainstorm = notice(&mut rt, TerminalMode::Brainstorm);
+    assert_eq!(
+        brainstorm,
+        "Mode: brainstorm — next plain text starts a run (Main, Ideator-1, Ideator-2 \
+         (2 new sub-agents, Main's model) · 3 waves × 4 cards)"
+    );
+
+    let normal = notice(&mut rt, TerminalMode::Normal);
+    assert_eq!(
+        normal,
+        "Mode: normal — plain text goes to the agent you're viewing"
+    );
+}
+
+#[test]
 fn selected_terminal_mode_dispatches_subsequent_plain_messages() {
     let mut rt = runtime();
     let changed = rt.on_ui_command(UiCommand::SetMode {
@@ -483,11 +532,11 @@ fn selected_terminal_mode_dispatches_subsequent_plain_messages() {
     assert!(changed.events.iter().any(|event| matches!(
         event,
         RuntimeEvent::Notice(text)
-            if text.contains("mode → review")
-                && text.contains("next plain text starts this run")
+            if text.starts_with("Mode: review — ")
+                && text.contains("next plain text starts a run")
                 && text.contains("builder")
                 && text.contains("reviewer")
-                && text.contains("@member still sends directly")
+                && !text.contains("@member")
     )));
 
     let step = rt.on_ui_command(user("fix parser"));
@@ -508,7 +557,7 @@ fn new_chat_resets_selected_terminal_mode_to_normal() {
     rt.on_ui_command(UiCommand::SetMode {
         mode: TerminalMode::Review,
     });
-    let reset = rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
 
     assert!(reset.events.iter().any(|event| matches!(
         event,
@@ -533,7 +582,7 @@ fn selected_terminal_mode_is_restored_with_its_conversation() {
         mode: TerminalMode::Review,
     });
 
-    rt.on_ui_command(UiCommand::NewSession);
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert_eq!(rt.active_mode(), TerminalMode::Normal);
 
     let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
@@ -582,7 +631,7 @@ fn new_chat_is_rejected_while_a_member_is_active() {
     let original = rt.store.active_conversation();
     rt.on_ui_command(user("keep working"));
 
-    let rejected = rt.on_ui_command(UiCommand::NewSession);
+    let rejected = rt.on_ui_command(UiCommand::NewSession { prompt: None });
 
     assert_eq!(rt.store.active_conversation(), original);
     assert!(
@@ -636,7 +685,7 @@ fn new_chat_keeps_mode_overrides_and_restarts_run_numbers() {
         },
     );
 
-    let reset = rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert!(
         reset
             .events
@@ -677,7 +726,7 @@ fn new_chat_keeps_mode_overrides_and_restarts_run_numbers() {
 fn new_chat_leaves_the_new_transcript_empty() {
     let mut rt = runtime();
 
-    let reset = rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
 
     assert!(
         reset
@@ -711,7 +760,7 @@ fn new_chat_resets_members_to_fresh_policy_and_clears_sessions() {
         },
     );
 
-    let reset = rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert!(
         reset
             .events
@@ -765,7 +814,7 @@ fn new_chat_keeps_current_state_when_atomic_reset_fails() {
         )
         .unwrap();
 
-    let reset = rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
 
     assert_eq!(rt.store.active_conversation(), original);
     assert!(
@@ -801,7 +850,7 @@ fn new_chat_clears_retry_history() {
         },
     );
 
-    rt.on_ui_command(UiCommand::NewSession);
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
     let retry = rt.on_ui_command(UiCommand::Retry);
 
     assert!(retry.actions.is_empty());
@@ -822,7 +871,7 @@ fn new_and_resume_scope_ready_runs_to_the_selected_conversation() {
             if runs.iter().map(|run| run.id).collect::<Vec<_>>() == vec![original_run.id]
     ));
 
-    rt.on_ui_command(UiCommand::NewSession);
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert!(matches!(
         rt.ready_event(),
         RuntimeEvent::Ready { runs, .. } if runs.is_empty()
@@ -839,7 +888,7 @@ fn new_and_resume_scope_ready_runs_to_the_selected_conversation() {
 }
 
 #[test]
-fn resume_picker_restores_chat_roster_and_native_member_sessions() {
+fn saved_chat_resume_restores_chat_roster_and_native_member_sessions() {
     let mut rt = runtime();
     let original = rt.store.active_conversation();
     let builder = MemberId::new("builder");
@@ -861,17 +910,17 @@ fn resume_picker_restores_chat_roster_and_native_member_sessions() {
         },
     );
 
-    rt.on_ui_command(UiCommand::NewSession);
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
     let replacement = TeamMember::new("researcher", "Researcher", BackendKind::Grok, "research");
     rt.on_ui_command(UiCommand::ReplaceTeam {
         members: vec![replacement],
         default_target: Some(DefaultTarget::Member(MemberId::new("researcher"))),
     });
 
-    let choices = rt.on_ui_command(UiCommand::RequestResume);
+    let choices = rt.on_ui_command(UiCommand::RequestSavedChats);
     assert!(choices.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::ResumeChoices { conversations }
+        RuntimeEvent::SavedChats { conversations }
             if conversations.iter().any(|conversation| {
                 conversation.id == original
                     && conversation.preview == "original question"
@@ -1172,7 +1221,7 @@ fn agent_can_add_teammate_with_team_member_envelope() {
         )));
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text) if text.contains("builder added teammate qa")
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. } if text.contains("builder added teammate qa")
     )));
     assert!(step.runner_changes.iter().any(|change| matches!(
         change,
@@ -1257,7 +1306,7 @@ fn team_mode_default_refuses_agent_teammate_addition() {
     assert!(refused.runner_changes.is_empty());
     assert!(refused.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text)
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. }
             if text.contains("locked to the current roster") && text.contains("qa")
     )));
 }
@@ -1388,7 +1437,7 @@ fn agent_cannot_add_duplicate_teammate() {
     assert!(step.runner_changes.is_empty());
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text) if text.contains("member already exists")
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. } if text.contains("member already exists")
     )));
 }
 
@@ -1537,7 +1586,7 @@ fn cancel_keeps_queued_prompt_and_sends_it_after_the_run_exits() {
     );
     assert!(cancelled.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text) if text.contains("queued message")
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. } if text.contains("queued message")
     )));
     assert!(
         !cancelled
@@ -1681,7 +1730,7 @@ fn abort_finishes_a_turn_held_only_by_a_paused_route() {
             .any(|event| matches!(event, RuntimeEvent::TurnFinished { .. })),
         "dropping the paused route must finish its turn"
     );
-    let new_chat = rt.on_ui_command(UiCommand::NewSession);
+    let new_chat = rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert!(
         new_chat
             .events
@@ -2124,7 +2173,7 @@ fn cancelled_run_is_not_reported_as_error() {
     );
     assert!(step.events.iter().any(|e| matches!(
         e,
-        RuntimeEvent::Notice(text) if text.contains("cancelled")
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. } if text.contains("cancelled")
     )));
 }
 
@@ -2253,4 +2302,343 @@ fn replace_team_model_and_effort_carry_into_runner_and_run() {
     )));
     let run = rt.on_ui_command(user("go"));
     assert_eq!(run.actions[0].effort, Some(Effort::Xhigh));
+}
+
+#[test]
+fn new_chat_with_a_prompt_resets_first_then_asks_the_main_member() {
+    let mut rt = runtime();
+    rt.on_ui_command(user("old chat"));
+    let old = rt.store.active_conversation();
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    let prompt = "keep\n\n   this   spacing".to_string();
+    let step = rt.on_ui_command(UiCommand::NewSession {
+        prompt: Some(prompt.clone()),
+    });
+
+    assert_ne!(rt.store.active_conversation(), old);
+    let reset = step
+        .events
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::SessionReset))
+        .expect("the chat was reset");
+    let turn = step
+        .events
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::TurnStarted { .. }))
+        .expect("the prompt started a turn");
+    assert!(reset < turn, "{:?}", step.events);
+    assert_eq!(step.actions.len(), 1);
+    assert_eq!(step.actions[0].member, MemberId::new("builder"));
+    assert!(step.actions[0].prompt.contains(&prompt));
+    // It was stored in the new chat, not the old one.
+    let replay = rt
+        .store
+        .replay_chat_for(rt.store.active_conversation())
+        .unwrap();
+    assert!(replay.iter().any(|item| matches!(
+        item,
+        ChatItem::User { body, .. } if *body == prompt
+    )));
+    assert!(
+        !rt.store
+            .replay_chat_for(old)
+            .unwrap()
+            .iter()
+            .any(|item| matches!(item, ChatItem::User { body, .. } if *body == prompt))
+    );
+}
+
+#[test]
+fn new_chat_prompt_prefers_the_member_named_main() {
+    let mut config = TeamConfig::new("mixed", "/tmp/ws")
+        .with_member(TeamMember::new(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "impl",
+        ))
+        .with_member(TeamMember::new(
+            "main",
+            "Main",
+            BackendKind::Claude,
+            "general",
+        ));
+    config.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+
+    let step = rt.on_ui_command(UiCommand::NewSession {
+        prompt: Some("hello".to_string()),
+    });
+
+    assert_eq!(step.actions.len(), 1);
+    assert_eq!(step.actions[0].member, MemberId::new("main"));
+}
+
+#[test]
+fn a_refused_new_chat_never_sends_its_prompt() {
+    let mut rt = runtime();
+    let original = rt.store.active_conversation();
+    rt.on_ui_command(user("keep working"));
+
+    let refused = rt.on_ui_command(UiCommand::NewSession {
+        prompt: Some("must not be sent".to_string()),
+    });
+
+    assert_eq!(rt.store.active_conversation(), original);
+    assert!(refused.actions.is_empty());
+    assert!(
+        !refused
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnStarted { .. }))
+    );
+    assert!(refused.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("cannot start a new chat")
+    )));
+}
+
+#[test]
+fn saved_chats_list_newest_first_skips_blank_chats_and_the_current_one() {
+    let mut rt = runtime();
+    let first = rt.store.active_conversation();
+    rt.on_ui_command(user("first chat question"));
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    // Left blank: it must not be listed.
+    let blank = rt.store.active_conversation();
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    let current = rt.store.active_conversation();
+    assert_ne!(blank, current);
+
+    let step = rt.on_ui_command(UiCommand::RequestSavedChats);
+
+    let listed = step
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::SavedChats { conversations } => Some(conversations),
+            _ => None,
+        })
+        .expect("a saved-chat list");
+    assert_eq!(
+        listed.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+        [first]
+    );
+    assert_eq!(listed[0].main_backend, Some(BackendKind::Codex));
+    assert!(!listed[0].updated_at.is_empty());
+}
+
+#[test]
+fn resuming_a_saved_chat_adds_no_notice() {
+    let mut rt = runtime();
+    let original = rt.store.active_conversation();
+    rt.on_ui_command(user("question"));
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: original,
+    });
+
+    assert!(
+        resumed
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ConversationResumed { .. }))
+    );
+    assert!(!resumed.events.iter().any(
+        |event| matches!(event, RuntimeEvent::Notice(text) if text.contains("resumed saved chat"))
+    ));
+}
+
+/// A runtime holding one finished, saved chat and a blank current one.
+fn runtime_with_one_saved_chat() -> (TeamRuntime, i64) {
+    let mut rt = runtime();
+    let saved = rt.store.active_conversation();
+    rt.on_ui_command(user("saved chat question"));
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    (rt, saved)
+}
+
+fn saved_list(step: &RuntimeStep) -> Option<&Vec<crate::domain::event::ConversationSummary>> {
+    step.events.iter().find_map(|event| match event {
+        RuntimeEvent::SavedChats { conversations } => Some(conversations),
+        _ => None,
+    })
+}
+
+#[test]
+fn deleting_a_saved_chat_removes_it_and_resends_the_list() {
+    let (mut rt, saved) = runtime_with_one_saved_chat();
+    let current = rt.store.active_conversation();
+
+    let step = rt.on_ui_command(UiCommand::DeleteConversation {
+        conversation: saved,
+    });
+
+    assert!(saved_list(&step).expect("a refreshed list").is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Notice(_)))
+    );
+    assert_eq!(rt.store.active_conversation(), current);
+    assert!(rt.store.conversation_snapshot(saved).unwrap().is_none());
+    assert!(rt.store.replay_chat_for(saved).unwrap().is_empty());
+    // It can no longer be resumed.
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: saved,
+    });
+    assert!(resumed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("no longer available")
+    )));
+}
+
+#[test]
+fn the_current_chat_is_never_deleted() {
+    let (mut rt, _saved) = runtime_with_one_saved_chat();
+    let current = rt.store.active_conversation();
+    rt.on_ui_command(user("current chat question"));
+
+    let step = rt.on_ui_command(UiCommand::DeleteConversation {
+        conversation: current,
+    });
+
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("cannot delete the current chat")
+    )));
+    assert!(saved_list(&step).is_none());
+    assert!(rt.store.conversation_snapshot(current).unwrap().is_some());
+    assert!(!rt.store.replay_chat_for(current).unwrap().is_empty());
+}
+
+#[test]
+fn renaming_a_saved_chat_titles_it_and_an_empty_name_clears_it() {
+    let (mut rt, saved) = runtime_with_one_saved_chat();
+
+    let step = rt.on_ui_command(UiCommand::RenameConversation {
+        conversation: Some(saved),
+        name: Some("  Release prep ".to_string()),
+    });
+    let listed = saved_list(&step).expect("a refreshed list");
+    assert_eq!(listed[0].name.as_deref(), Some("Release prep"));
+    assert_eq!(listed[0].preview, "saved chat question");
+    // Not the current chat: no current-name event.
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ConversationRenamed { .. }))
+    );
+
+    let step = rt.on_ui_command(UiCommand::RenameConversation {
+        conversation: Some(saved),
+        name: Some("   ".to_string()),
+    });
+    assert_eq!(saved_list(&step).unwrap()[0].name, None);
+
+    let step = rt.on_ui_command(UiCommand::RenameConversation {
+        conversation: Some(9_999),
+        name: Some("ghost".to_string()),
+    });
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("no longer available")
+    )));
+}
+
+#[test]
+fn naming_the_current_chat_persists_survives_resume_and_clears_on_new() {
+    let (mut rt, saved) = runtime_with_one_saved_chat();
+    let current = rt.store.active_conversation();
+    // The fresh chat starts unnamed.
+    assert_eq!(rt.chat_name_event(), None);
+
+    let step = rt.on_ui_command(UiCommand::RenameConversation {
+        conversation: None,
+        name: Some("Scratch pad".to_string()),
+    });
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ConversationRenamed { name } if name.as_deref() == Some("Scratch pad")
+    )));
+    assert_eq!(
+        rt.store.conversation_name(current).unwrap().as_deref(),
+        Some("Scratch pad")
+    );
+    // What startup would send after a restart.
+    assert_eq!(
+        rt.chat_name_event(),
+        Some(RuntimeEvent::ConversationRenamed {
+            name: Some("Scratch pad".to_string())
+        })
+    );
+    // The named chat has no messages yet but is listed once left.
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: saved,
+    });
+    assert!(
+        resumed
+            .events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ConversationResumed { .. }))
+    );
+    // The resumed chat is unnamed: no name event follows it.
+    assert!(
+        !resumed
+            .events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ConversationRenamed { .. }))
+    );
+    let listed = rt.on_ui_command(UiCommand::RequestSavedChats);
+    let listed = saved_list(&listed).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, current);
+    assert_eq!(listed[0].name.as_deref(), Some("Scratch pad"));
+
+    // Resuming the named chat reports its name again.
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: current,
+    });
+    assert_eq!(
+        rt.chat_name_event(),
+        Some(RuntimeEvent::ConversationRenamed {
+            name: Some("Scratch pad".to_string())
+        })
+    );
+
+    // A /new chat is unnamed.
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    assert_eq!(rt.chat_name_event(), None);
 }

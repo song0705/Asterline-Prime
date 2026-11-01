@@ -211,7 +211,7 @@ impl TeamRuntime {
         self.config
             .members
             .iter()
-            .filter(|m| &m.id != coordinator)
+            .filter(|m| &m.id != coordinator && m.parent.is_none())
             .map(|m| format!("{} ({})", m.id, m.role))
             .collect::<Vec<_>>()
             .join(", ")

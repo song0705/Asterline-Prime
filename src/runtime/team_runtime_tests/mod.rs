@@ -182,9 +182,12 @@ pub(super) fn complete_all(rt: &mut TeamRuntime, members: &[(MemberId, &str)]) -
     merged
 }
 
+mod auto_seats;
+mod context;
 mod gates;
 mod mode_overrides;
 mod plan;
 mod review;
 mod roster;
+mod sub_agents;
 mod turns;

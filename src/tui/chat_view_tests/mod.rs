@@ -5,6 +5,7 @@ pub(super) use crate::domain::event::{
     ApprovalId, MemberStatus, RunEventSummary, RunId, RunStatus, RunStepStatus, RunStepSummary,
     RunSummary, RunVerification, RuntimeEvent,
 };
+pub(super) use crate::domain::mode::TerminalMode;
 pub(super) use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
 };
@@ -34,6 +35,7 @@ fn member_summary(
         permission_mode: Some(PermissionMode::Default),
         approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
         session_policy: SessionPolicy::Resume,
+        parent: None,
     }
 }
 
@@ -54,5 +56,9 @@ fn is_separator_text(text: &str) -> bool {
     !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '─')
 }
 
+mod agents;
+mod chrome;
+mod focus;
 mod grouping;
 mod render;
+mod tools;

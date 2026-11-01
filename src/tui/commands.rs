@@ -22,6 +22,10 @@ pub enum Submission {
     Runtime(UiCommand),
     /// Open a drawer (a local UI action).
     Drawer(Drawer),
+    /// Open the Agents list on its saved ("Inactive") chats (`/resume`).
+    ResumeList,
+    /// Open the inline model selector, search prefilled with this text.
+    Model(String),
     /// Approve (true) or reject (false) the first pending approval.
     ApproveFirst(ApprovalDecision),
     /// Search the transcript (`/find`); empty query clears the search.
@@ -98,6 +102,20 @@ fn target_from_member_token(member: &str) -> MessageTarget {
     }
 }
 
+/// `/logs <member>` (alias `/focus <member>`): one member's raw logs.
+fn parse_member_logs(arg: &str, command: &str) -> Submission {
+    let (member, extra) = split_first_word(arg);
+    if member.is_empty() {
+        Submission::Help
+    } else if !extra.is_empty() {
+        Submission::Invalid(format!(
+            "/{command} accepts exactly one member; trailing arguments were not used; draft kept"
+        ))
+    } else {
+        Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
+    }
+}
+
 fn parse_slash(rest: &str) -> Submission {
     let (cmd, arg) = split_first_word(rest);
     match cmd {
@@ -134,8 +152,13 @@ fn parse_slash(rest: &str) -> Submission {
             }
         }
         "team" if arg.is_empty() => Submission::Drawer(Drawer::Team),
+        "agents" if arg.is_empty() => Submission::Drawer(Drawer::Agents),
+        "model" => Submission::Model(arg.to_string()),
         "runs" if arg.is_empty() => Submission::Drawer(Drawer::Runs),
         "logs" if arg.is_empty() => Submission::Drawer(Drawer::Logs),
+        // `/focus` is the older spelling of `/logs <member>`; it shares a
+        // name with the focus concept, so it is no longer advertised.
+        "logs" => parse_member_logs(arg, "logs"),
         "diff" if arg.is_empty() => Submission::Drawer(Drawer::Diff),
         "attach" => {
             let (member, extra) = split_first_word(arg);
@@ -151,11 +174,31 @@ fn parse_slash(rest: &str) -> Submission {
                 }
             }
         }
-        // Both spellings intentionally perform the same durable reset. Keep
-        // `/new` for muscle memory and accept `/clear` when it is submitted
-        // directly (rather than only after completion rewrites it).
-        "new" | "clear" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
-        "resume" if arg.is_empty() => Submission::Runtime(UiCommand::RequestResume),
+        // `/new` may carry a first prompt for the fresh chat; `/clear` is its
+        // argument-less alias. The prompt is the text after the separator,
+        // verbatim apart from the whitespace at its ends.
+        "new" => Submission::Runtime(UiCommand::NewSession {
+            prompt: (!arg.is_empty()).then(|| arg.to_string()),
+        }),
+        "clear" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession { prompt: None }),
+        "clear" => Submission::Invalid("Usage: /clear".to_string()),
+        "resume" if arg.is_empty() => Submission::ResumeList,
+        "resume" => match arg.parse::<i64>() {
+            Ok(conversation) if conversation > 0 => {
+                Submission::Runtime(UiCommand::ResumeConversation { conversation })
+            }
+            _ => Submission::Invalid(
+                "Usage: /resume [number] — no number opens the saved chats in the agents list"
+                    .to_string(),
+            ),
+        },
+        "name" => match arg.trim() {
+            "" => Submission::Invalid("Usage: /name <name>".to_string()),
+            name => Submission::Runtime(UiCommand::RenameConversation {
+                conversation: None,
+                name: Some(name.to_string()),
+            }),
+        },
         "exit" if arg.is_empty() => Submission::Exit,
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
@@ -205,19 +248,7 @@ fn parse_slash(rest: &str) -> Submission {
             }
         }
         "step" => parse_step_command(arg),
-        "focus" => {
-            let (member, extra) = split_first_word(arg);
-            if member.is_empty() {
-                Submission::Help
-            } else if !extra.is_empty() {
-                Submission::Invalid(
-                    "/focus accepts exactly one member; trailing arguments were not used; draft kept"
-                        .to_string(),
-                )
-            } else {
-                Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
-            }
-        }
+        "focus" => parse_member_logs(arg, "focus"),
         "import" => {
             let (first, rest) = split_first_word(arg);
             if first.is_empty() {
@@ -248,8 +279,7 @@ fn parse_slash(rest: &str) -> Submission {
             }
         }
         "help" if arg.is_empty() => Submission::Help,
-        "team" | "runs" | "logs" | "diff" | "new" | "clear" | "resume" | "exit" | "retry"
-        | "approve" | "reject" | "help" => {
+        "team" | "agents" | "runs" | "diff" | "exit" | "retry" | "approve" | "reject" | "help" => {
             Submission::Invalid(format!("/{cmd} does not accept arguments; draft kept"))
         }
         _ => Submission::Help,
@@ -585,6 +615,8 @@ mod tests {
         assert_eq!(parse("/runs"), Submission::Drawer(Drawer::Runs));
         assert_eq!(parse("/team"), Submission::Drawer(Drawer::Team));
         assert_eq!(parse("/team "), Submission::Drawer(Drawer::Team));
+        assert_eq!(parse("/agents"), Submission::Drawer(Drawer::Agents));
+        assert_eq!(parse("/agents "), Submission::Drawer(Drawer::Agents));
         assert_eq!(parse("/diff"), Submission::Drawer(Drawer::Diff));
         assert_eq!(parse("/exit"), Submission::Exit);
         assert_eq!(parse("/retry"), Submission::Runtime(UiCommand::Retry));
@@ -598,12 +630,9 @@ mod tests {
     fn no_argument_commands_reject_trailing_text() {
         for command in [
             "/team extra",
+            "/agents extra",
             "/runs extra",
-            "/logs extra",
             "/diff extra",
-            "/new extra",
-            "/clear extra",
-            "/resume extra",
             "/exit extra",
             "/retry extra",
             "/approve extra",
@@ -621,6 +650,7 @@ mod tests {
     fn fixed_arity_commands_reject_unused_trailing_text() {
         for command in [
             "/focus reviewer accidental",
+            "/logs reviewer accidental",
             "/step remove 2 accidental",
             "/step remove run-12 2 accidental",
             "/step delete 2 accidental",
@@ -642,9 +672,13 @@ mod tests {
     }
 
     #[test]
-    fn model_is_not_a_composer_control() {
-        assert_eq!(parse("/model"), Submission::Help);
-        assert_eq!(parse("/model builder gpt-5.6-sol"), Submission::Help);
+    fn model_opens_the_selector_but_a_targeted_model_stays_a_native_command() {
+        assert_eq!(parse("/model"), Submission::Model(String::new()));
+        assert_eq!(parse("/model "), Submission::Model(String::new()));
+        assert_eq!(
+            parse("/model gpt-5.6 sol"),
+            Submission::Model("gpt-5.6 sol".to_string())
+        );
         assert_eq!(
             parse("@builder /model gpt-5.6-sol"),
             Submission::TargetedSlash {
@@ -712,10 +746,14 @@ mod tests {
     #[test]
     fn plan_and_focus_commands() {
         assert_eq!(parse("/plan build a parser"), Submission::Help);
-        assert_eq!(
-            parse("/focus reviewer"),
-            Submission::Drawer(Drawer::MemberLogs(MemberId::new("reviewer")))
-        );
+        // `/logs <member>` is the advertised spelling; `/focus` stays as an alias.
+        for command in ["/focus reviewer", "/logs reviewer"] {
+            assert_eq!(
+                parse(command),
+                Submission::Drawer(Drawer::MemberLogs(MemberId::new("reviewer"))),
+                "{command}"
+            );
+        }
         assert_eq!(
             parse("/continue"),
             Submission::Runtime(UiCommand::ContinueRun {
@@ -858,17 +896,70 @@ mod tests {
 
     #[test]
     fn new_and_clear_both_start_a_fresh_session() {
-        assert_eq!(parse("/new"), Submission::Runtime(UiCommand::NewSession));
-        assert_eq!(parse("/clear"), Submission::Runtime(UiCommand::NewSession));
+        let fresh = Submission::Runtime(UiCommand::NewSession { prompt: None });
+        assert_eq!(parse("/new"), fresh);
+        assert_eq!(parse("/new   "), fresh);
+        assert_eq!(parse("/clear"), fresh);
     }
 
     #[test]
-    fn resume_opens_saved_chat_picker() {
+    fn new_takes_an_optional_first_prompt_kept_verbatim() {
+        let with = |prompt: &str| {
+            Submission::Runtime(UiCommand::NewSession {
+                prompt: Some(prompt.to_string()),
+            })
+        };
+        assert_eq!(parse("/new fix the bug"), with("fix the bug"));
         assert_eq!(
-            parse("/resume"),
-            Submission::Runtime(UiCommand::RequestResume)
+            parse("/new  fix\n\n  the   bug  "),
+            with("fix\n\n  the   bug")
         );
-        assert!(matches!(parse("/resume 3"), Submission::Invalid(_)));
+        assert_eq!(parse("/new\nfirst\nsecond"), with("first\nsecond"));
+        // The prompt may itself start with a slash or an @member.
+        assert_eq!(parse("/new /help me"), with("/help me"));
+        assert_eq!(parse("/new @main hi"), with("@main hi"));
+    }
+
+    #[test]
+    fn clear_takes_no_arguments() {
+        assert_eq!(
+            parse("/clear x"),
+            Submission::Invalid("Usage: /clear".to_string())
+        );
+    }
+
+    #[test]
+    fn name_names_the_current_chat_and_needs_text() {
+        assert_eq!(
+            parse("/name  Release   prep  "),
+            Submission::Runtime(UiCommand::RenameConversation {
+                conversation: None,
+                name: Some("Release   prep".to_string()),
+            })
+        );
+        for bad in ["/name", "/name   "] {
+            assert_eq!(
+                parse(bad),
+                Submission::Invalid("Usage: /name <name>".to_string()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_opens_the_list_or_restores_a_numbered_chat() {
+        assert_eq!(parse("/resume"), Submission::ResumeList);
+        assert_eq!(parse("/resume "), Submission::ResumeList);
+        assert_eq!(
+            parse("/resume 3"),
+            Submission::Runtime(UiCommand::ResumeConversation { conversation: 3 })
+        );
+        for bad in ["/resume abc", "/resume 3 4", "/resume 0", "/resume -2"] {
+            assert!(
+                matches!(parse(bad), Submission::Invalid(message) if message.starts_with("Usage: /resume")),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

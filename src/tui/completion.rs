@@ -34,35 +34,69 @@ pub struct AgentSkill {
     pub invocation: String,
 }
 
-/// (name, hint, takes_argument). Also feeds the `/help` palette drawer.
+/// (name, hint, takes_argument) in display order: the groups of
+/// [`COMMAND_GROUPS`], top to bottom. The `/` popup and the `/help` palette
+/// both follow this order. Also feeds the `/help` palette.
+///
+/// Only commands worth advertising are listed. `/agents` (← opens the same
+/// list), `/ask` and `/all` (the `@member` era) and `/focus` (an alias of
+/// `/logs <member>`) still run when typed in full; see `commands::parse_slash`.
 pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
-    ("ask", "send to one member", true),
-    ("all", "send to everyone", true),
-    ("attach", "open a member's native CLI session", true),
-    ("approve", "approve first pending", false),
-    ("block", "mark a run blocked", true),
-    ("continue", "resume latest or selected run", true),
-    ("diff", "show working-tree git diff", false),
-    ("exit", "exit Asterline", false),
-    ("export", "export session to Claude Code format", true),
-    ("find", "search the transcript", true),
-    ("focus", "view a member's logs", true),
-    ("help", "show commands", false),
-    ("import", "import native session transcript into chat", true),
-    ("logs", "raw logs · stderr · warnings", false),
-    ("mode", "open mode panel or switch dispatch mode", true),
+    // Common
+    (
+        "model",
+        "change the model of the agent you are viewing",
+        true,
+    ),
     (
         "new",
-        "start a fresh chat (new session, cleared transcript)",
-        false,
+        "start a fresh chat, optionally with its first prompt",
+        true,
     ),
-    ("note", "record a run checkpoint", true),
-    ("reject", "reject first pending", false),
-    ("resume", "choose and restore a saved chat", false),
-    ("retry", "re-send the latest user request", false),
-    ("runs", "run status · next action", false),
-    ("step", "manage run checklist", true),
+    ("resume", "pick a saved chat in the agents list", true),
+    ("name", "name the current chat", true),
     ("team", "edit roster · sessions · approvals", false),
+    ("mode", "open mode panel or switch dispatch mode", true),
+    ("find", "search the transcript", true),
+    ("diff", "show working-tree git diff", false),
+    ("retry", "re-send the latest user request", false),
+    ("help", "show commands", false),
+    ("exit", "exit Asterline", false),
+    // Approvals & sessions
+    ("approve", "approve first pending", false),
+    ("reject", "reject first pending", false),
+    ("attach", "open a member's native CLI session", true),
+    ("import", "import native session transcript into chat", true),
+    ("export", "export session to Claude Code format", true),
+    (
+        "logs",
+        "raw logs · stderr · warnings (or one member's)",
+        true,
+    ),
+    // Runs
+    ("runs", "run status · next action", false),
+    ("continue", "resume latest or selected run", true),
+    ("step", "manage run checklist", true),
+    ("note", "record a run checkpoint", true),
+    ("block", "mark a run blocked", true),
+];
+
+/// The command groups shown in `/help`, in display order. Each group lists
+/// its command names in the same order as [`COMMANDS`], which is the flat
+/// concatenation of these groups.
+pub(crate) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Common",
+        &[
+            "model", "new", "resume", "name", "team", "mode", "find", "diff", "retry", "help",
+            "exit",
+        ],
+    ),
+    (
+        "Approvals & sessions",
+        &["approve", "reject", "attach", "import", "export", "logs"],
+    ),
+    ("Runs", &["runs", "continue", "step", "note", "block"]),
 ];
 
 /// (name, hint) entries shown after `/mode `.
@@ -79,6 +113,20 @@ const MODES: &[(&str, &str)] = &[
         "keep using coordinator-driven team runs until changed",
     ),
 ];
+
+/// Commands that run as typed even though they accept an optional argument.
+const OPTIONAL_ARGUMENT_COMMANDS: &[&str] = &["model", "logs", "new", "resume"];
+
+/// Whether `token` is a whole slash command that needs nothing more before
+/// Enter submits it: a known command with no (or only an optional) argument.
+pub(crate) fn command_is_complete(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('/') else {
+        return false;
+    };
+    COMMANDS.iter().any(|(command, _, takes_arg)| {
+        *command == name && (!takes_arg || OPTIONAL_ARGUMENT_COMMANDS.contains(command))
+    })
+}
 
 /// Compute the completion for `head` (composer text up to the cursor).
 pub fn compute(head: &str, members: &[String]) -> Option<Completion> {
@@ -104,10 +152,18 @@ pub fn compute_with_agent_skills(
             None => {
                 let prefix: String = chars[1..].iter().collect();
                 let lower = prefix.to_lowercase();
-                let items: Vec<CompletionItem> = COMMANDS
+                // Best match first (exact, then prefix, then alias); equally
+                // good matches keep the `COMMANDS` group order.
+                let mut matches: Vec<(u8, &(&str, &str, bool))> = COMMANDS
                     .iter()
-                    .filter(|(name, _, _)| slash_command_matches(name, &lower))
-                    .map(|(name, hint, _)| CompletionItem {
+                    .filter_map(|command| {
+                        slash_command_rank(command.0, &lower).map(|rank| (rank, command))
+                    })
+                    .collect();
+                matches.sort_by_key(|(rank, _)| *rank);
+                let items: Vec<CompletionItem> = matches
+                    .into_iter()
+                    .map(|(_, (name, hint, _))| CompletionItem {
                         label: format!("/{name} — {hint}"),
                         // `/mode` without an argument opens its required
                         // picker, so keep the completed command submit-ready.
@@ -120,7 +176,8 @@ pub fn compute_with_agent_skills(
                     .collect();
                 non_empty("commands", 0, items)
             }
-            // Command chosen; only `/ask` completes its first argument (a member).
+            // Command chosen; only the member-taking commands complete their
+            // first argument.
             Some(space) => {
                 let cmd: String = chars[1..space].iter().collect();
                 if cmd == "mode" {
@@ -140,7 +197,7 @@ pub fn compute_with_agent_skills(
                         .collect();
                     return non_empty("modes", space + 1, items);
                 }
-                if cmd != "ask" && cmd != "attach" && cmd != "focus" {
+                if !matches!(cmd.as_str(), "ask" | "attach" | "focus" | "logs") {
                     return None;
                 }
                 let arg: Vec<char> = chars[space + 1..].to_vec();
@@ -149,7 +206,7 @@ pub fn compute_with_agent_skills(
                     return None;
                 }
                 let prefix: String = arg.iter().collect();
-                let mut candidates: Vec<String> = (cmd != "attach")
+                let mut candidates: Vec<String> = (cmd == "ask")
                     .then(|| "all".to_string())
                     .into_iter()
                     .collect();
@@ -190,8 +247,18 @@ pub fn compute_with_agent_skills(
     None
 }
 
-fn slash_command_matches(name: &str, query: &str) -> bool {
-    name.starts_with(query) || (name == "new" && "clear".starts_with(query))
+/// How well `query` matches the command `name`: 0 for the whole name, 1 for a
+/// prefix, 2 for an alias prefix (`/clear` is `/new`); `None` for no match.
+fn slash_command_rank(name: &str, query: &str) -> Option<u8> {
+    if name == query {
+        Some(0)
+    } else if name.starts_with(query) {
+        Some(1)
+    } else if name == "new" && "clear".starts_with(query) {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 fn targeted_skill_completion(
@@ -303,11 +370,14 @@ mod tests {
     fn slash_lists_all_commands() {
         let c = compute("/", &members()).unwrap();
         assert_eq!(c.token_start, 0);
-        assert!(c.items.iter().any(|i| i.insert == "/ask "));
         assert!(c.items.iter().any(|i| i.insert == "/team "));
         assert!(c.items.iter().any(|i| i.insert == "/mode"));
         assert!(c.items.iter().any(|i| i.insert == "/exit "));
         assert!(c.items.iter().any(|i| i.insert == "/attach "));
+        // Hidden aliases still run when typed in full, but are not advertised.
+        for hidden in ["/ask ", "/all ", "/agents ", "/focus "] {
+            assert!(!c.items.iter().any(|i| i.insert == hidden), "{hidden}");
+        }
         assert!(!c.items.iter().any(|i| i.insert == "/plan "));
         assert!(!c.items.iter().any(|i| i.insert == "/review "));
         assert!(c.items.iter().any(|i| i.insert == "/continue "));
@@ -316,6 +386,60 @@ mod tests {
         assert!(c.items.iter().any(|i| i.insert == "/step "));
         assert!(!c.items.iter().any(|i| i.insert == "/skills"));
         assert!(!c.items.iter().any(|i| i.insert == "/abort"));
+    }
+
+    const EXPECTED_ORDER: [&str; 22] = [
+        "model", "new", "resume", "name", "team", "mode", "find", "diff", "retry", "help", "exit",
+        "approve", "reject", "attach", "import", "export", "logs", "runs", "continue", "step",
+        "note", "block",
+    ];
+
+    #[test]
+    fn palette_commands_are_grouped_in_display_order_and_unique() {
+        let names: Vec<&str> = COMMANDS.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(names, EXPECTED_ORDER);
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        // The help groups are exactly the flat list, cut into three.
+        let grouped: Vec<&str> = COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        assert_eq!(grouped, names);
+        assert_eq!(
+            COMMAND_GROUPS
+                .iter()
+                .map(|(title, _)| *title)
+                .collect::<Vec<_>>(),
+            vec!["Common", "Approvals & sessions", "Runs"]
+        );
+    }
+
+    #[test]
+    fn bare_slash_lists_commands_in_group_order() {
+        let c = compute("/", &members()).unwrap();
+        let names: Vec<String> = c
+            .items
+            .iter()
+            .map(|i| i.insert.trim().trim_start_matches('/').to_string())
+            .collect();
+        assert_eq!(names, EXPECTED_ORDER);
+    }
+
+    #[test]
+    fn logs_completes_a_member_without_offering_all() {
+        let c = compute("/logs rev", &members()).expect("logs member completion");
+        assert_eq!(
+            c.items
+                .iter()
+                .map(|i| i.insert.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviewer "]
+        );
+        assert!(compute("/logs a", &members()).is_none());
+        assert!(command_is_complete("/logs"));
     }
 
     #[test]
@@ -337,22 +461,32 @@ mod tests {
 
     #[test]
     fn slash_prefix_filters() {
-        assert_eq!(inserts("/as"), vec!["/ask ".to_string()]);
-        assert_eq!(inserts("/mo"), vec!["/mode".to_string()]);
+        assert!(inserts("/as").is_empty());
+        assert_eq!(
+            inserts("/mo"),
+            vec!["/model ".to_string(), "/mode".to_string()]
+        );
+        // The whole command name beats longer names it prefixes.
+        assert_eq!(
+            inserts("/mode"),
+            vec!["/mode".to_string(), "/model ".to_string()]
+        );
         assert!(inserts("/pl").is_empty());
         assert_eq!(inserts("/con"), vec!["/continue ".to_string()]);
         assert_eq!(inserts("/no"), vec!["/note ".to_string()]);
         assert_eq!(inserts("/blo"), vec!["/block ".to_string()]);
         assert_eq!(inserts("/ste"), vec!["/step ".to_string()]);
-        let a = inserts("/a");
-        assert!(a.contains(&"/ask ".to_string()) && a.contains(&"/all ".to_string()));
+        assert_eq!(
+            inserts("/a"),
+            vec!["/approve ".to_string(), "/attach ".to_string(),]
+        );
         let re = inserts("/re");
         assert_eq!(
             re,
             vec![
-                "/reject ".to_string(),
                 "/resume ".to_string(),
-                "/retry ".to_string()
+                "/retry ".to_string(),
+                "/reject ".to_string()
             ]
         );
         assert!(inserts("/find").contains(&"/find ".to_string()));

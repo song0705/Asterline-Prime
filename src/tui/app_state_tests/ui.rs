@@ -69,6 +69,7 @@ fn find_matches_case_insensitively_and_navigates() {
             ok: Some(true),
         },
         ChatItem::Notice {
+            member: None,
             text: "other note".to_string(),
         },
         ChatItem::Error {
@@ -140,9 +141,11 @@ fn find_jump_scroll_sums_items_below() {
             interrupted: Vec::new(),
         },
         ChatItem::Notice {
+            member: None,
             text: "beta".to_string(),
         },
         ChatItem::Notice {
+            member: None,
             text: "gamma".to_string(),
         },
     ]);
@@ -335,7 +338,7 @@ fn attach_is_blocked_by_work_elsewhere_and_pending_approval() {
     assert!(state.take_attach_request().is_none());
     assert!(state.chat().iter().any(|item| matches!(
         item,
-        ChatItem::Notice { text } if text.contains("Cannot attach while")
+        ChatItem::Notice { text, .. } if text.contains("Cannot attach while")
     )));
 
     state.apply(RuntimeEvent::MemberStatus {
@@ -495,6 +498,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             },
             MemberSummary {
                 id: MemberId::new("reviewer"),
@@ -510,6 +514,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             },
         ],
     });
@@ -572,7 +577,7 @@ fn quit_requires_two_consecutive_requests() {
     assert!(!state.should_quit());
     assert!(state.chat().iter().any(|item| matches!(
         item,
-        ChatItem::Notice { text } if text.contains("Ctrl+C again")
+        ChatItem::Notice { text, .. } if text.contains("Ctrl+C again")
     )));
 
     state.request_quit();
@@ -586,6 +591,23 @@ fn clear_line_keeps_other_composer_lines() {
     state.composer_up();
     state.clear_line();
     assert_eq!(state.composer().text(), "keep\nkeep");
+}
+
+#[test]
+fn composer_up_and_down_follow_the_drawn_wrap_width() {
+    let mut state = AppState::new(Vec::new());
+    state.insert_text("alpha beta gamma delta");
+    // Nothing drawn yet: the whole text is one logical line.
+    assert!(!state.composer_up());
+
+    // Drawn 12 columns wide: "alpha beta " | "gamma delta".
+    state.set_composer_wrap(12);
+    assert!(state.composer_up());
+    assert_eq!(state.composer().visual_layout(12).cursor_row, 0);
+    assert!(!state.composer_up());
+    assert!(state.composer_down());
+    assert_eq!(state.composer().visual_layout(12).cursor_row, 1);
+    assert!(!state.composer_down());
 }
 
 #[test]
@@ -671,13 +693,13 @@ fn team_editor_reuses_model_catalog_after_the_drawer_closes() {
 fn slash_opens_command_popup_and_accept_inserts() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    for ch in "/as".chars() {
+    for ch in "/at".chars() {
         state.insert_char(ch);
     }
     let completion = state.completion().expect("command popup");
-    assert_eq!(completion.items[0].insert, "/ask ");
+    assert_eq!(completion.items[0].insert, "/attach ");
     assert!(state.accept_completion());
-    assert_eq!(state.composer().text(), "/ask ");
+    assert_eq!(state.composer().text(), "/attach ");
 }
 
 #[test]
@@ -688,6 +710,27 @@ fn accepting_a_no_argument_command_still_leaves_a_trailing_space() {
 
     assert!(state.accept_completion());
     assert_eq!(state.composer().text(), "/team ");
+}
+
+#[test]
+fn a_fully_typed_command_is_not_completed_again() {
+    for command in ["/model", "/logs", "/team", "/runs"] {
+        let mut state = AppState::new(Vec::new());
+        state.apply(ready());
+        state.insert_text(command);
+        assert!(state.completion().is_some(), "{command}");
+
+        // Enter would submit it, so completion reports nothing to do.
+        assert!(!state.accept_completion(), "{command}");
+        assert_eq!(state.composer().text(), command);
+    }
+
+    // A command that needs an argument still completes its trailing space.
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.insert_text("/attach");
+    assert!(state.accept_completion());
+    assert_eq!(state.composer().text(), "/attach ");
 }
 
 #[test]
@@ -708,6 +751,7 @@ fn targeted_skill_completion_excludes_other_backends() {
         permission_mode: Some(PermissionMode::Default),
         approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
         session_policy: SessionPolicy::Resume,
+        parent: None,
     });
     state.default_target = Some(DefaultTarget::Member(MemberId::new("claude")));
     state.set_skills(vec![
@@ -792,6 +836,7 @@ fn header_roster_selection() {
             permission_mode: Some(PermissionMode::Default),
             approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
+            parent: None,
         },
         MemberView {
             id: MemberId::new("reviewer"),
@@ -807,6 +852,7 @@ fn header_roster_selection() {
             permission_mode: Some(PermissionMode::Default),
             approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
+            parent: None,
         },
     ];
     assert_eq!(state.header_selected(), None);

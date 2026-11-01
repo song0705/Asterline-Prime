@@ -218,6 +218,7 @@ fn streamed_message_and_tool_detail_have_total_memory_bounds() {
 fn current_conversation_keeps_its_first_message() {
     let replayed = (0..MAX_CHAT_ITEMS + 25)
         .map(|index| ChatItem::Notice {
+            member: None,
             text: format!("history-{index}"),
         })
         .collect::<Vec<_>>();
@@ -225,7 +226,7 @@ fn current_conversation_keeps_its_first_message() {
     assert_eq!(state.chat().len(), MAX_CHAT_ITEMS + 25);
     assert!(matches!(
         state.chat().first(),
-        Some(ChatItem::Notice { text }) if text == "history-0"
+        Some(ChatItem::Notice { text, .. }) if text == "history-0"
     ));
 
     for index in 0..40 {
@@ -236,7 +237,7 @@ fn current_conversation_keeps_its_first_message() {
     }
     assert!(matches!(
         state.chat().first(),
-        Some(ChatItem::Notice { text }) if text == "history-0"
+        Some(ChatItem::Notice { text, .. }) if text == "history-0"
     ));
     assert!(
         state
@@ -249,11 +250,12 @@ fn current_conversation_keeps_its_first_message() {
 #[test]
 fn oversized_replayed_and_live_items_are_visibly_truncated() {
     let mut state = AppState::new(vec![ChatItem::Notice {
+        member: None,
         text: "r".repeat(2 * 1024 * 1024),
     }]);
     let replayed = state.chat().first().unwrap();
     assert!(chat_item_bytes(replayed) <= MAX_CHAT_ITEM_BYTES);
-    assert!(matches!(replayed, ChatItem::Notice { text } if text.contains("output truncated")));
+    assert!(matches!(replayed, ChatItem::Notice { text, .. } if text.contains("output truncated")));
 
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
@@ -665,7 +667,7 @@ fn oversized_paste_is_utf8_bounded_and_warns_once() {
             .chat()
             .iter()
             .filter(
-                |item| matches!(item, ChatItem::Notice { text } if text == COMPOSER_INPUT_TRUNCATED)
+                |item| matches!(item, ChatItem::Notice { text, .. } if text == COMPOSER_INPUT_TRUNCATED)
             )
             .count(),
         1
@@ -686,6 +688,7 @@ fn chat_eviction_rebases_active_message_and_tool_indices() {
     let mut state = AppState::new(
         (0..MAX_CHAT_ITEMS - 2)
             .map(|index| ChatItem::Notice {
+                member: None,
                 text: format!("old-{index}"),
             })
             .collect(),
@@ -723,7 +726,7 @@ fn chat_eviction_rebases_active_message_and_tool_indices() {
     )));
     assert!(matches!(
         state.chat().first(),
-        Some(ChatItem::Notice { text }) if text == "old-0"
+        Some(ChatItem::Notice { text, .. }) if text == "old-0"
     ));
 }
 

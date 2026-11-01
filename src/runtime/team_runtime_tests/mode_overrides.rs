@@ -58,7 +58,7 @@ fn new_session_keeps_mode_overrides() {
         other => panic!("unexpected {other:?}"),
     }
 
-    rt.on_ui_command(UiCommand::NewSession);
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
     match rt.ready_event() {
         RuntimeEvent::Ready { mode_overrides, .. } => {
             assert_eq!(

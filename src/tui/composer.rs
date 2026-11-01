@@ -2,7 +2,8 @@
 //! word/line editing. Cursor movement and deletion follow user-visible graphemes.
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+
+use super::composer_wrap::{RowSpan, grapheme_width, width_of, wrap_rows};
 
 pub(crate) const MAX_COMPOSER_BYTES: usize = 256 * 1024;
 
@@ -291,17 +292,6 @@ impl Composer {
         (start, end)
     }
 
-    /// Char index of the start of each visual line.
-    fn line_starts(&self) -> Vec<usize> {
-        let mut starts = vec![0];
-        for (i, &c) in self.chars.iter().enumerate() {
-            if c == '\n' {
-                starts.push(i + 1);
-            }
-        }
-        starts
-    }
-
     /// Number of visual lines (≥ 1).
     pub fn line_count(&self) -> usize {
         self.chars.iter().filter(|&&c| c == '\n').count() + 1
@@ -322,37 +312,29 @@ impl Composer {
         (row, col)
     }
 
-    /// Move the cursor up one visual line, keeping the column. Returns false if
-    /// already on the first line (so the caller can fall back to history recall).
-    pub fn up(&mut self) -> bool {
+    /// Move the cursor up one wrapped row, keeping its display column.
+    /// Returns false if already on the first row (so the caller can fall back
+    /// to history recall). `width` is the wrap width the composer is drawn at;
+    /// pass `usize::MAX` to move by logical line.
+    pub fn up(&mut self, width: usize) -> bool {
         self.selection_anchor = None;
-        let (row, col) = self.cursor_row_col();
-        if row == 0 {
+        let layout = self.visual_layout(width);
+        if layout.cursor_row == 0 {
             return false;
         }
-        let starts = self.line_starts();
-        let prev_start = starts[row - 1];
-        let prev_end = (starts[row] - 1).max(prev_start);
-        self.cursor = self.grapheme_column_index(prev_start, prev_end, col);
+        self.cursor = layout.index_at(layout.cursor_row - 1, layout.cursor_col);
         true
     }
 
-    /// Move the cursor down one visual line, keeping the column. Returns false if
-    /// already on the last line.
-    pub fn down(&mut self) -> bool {
+    /// Move the cursor down one wrapped row, keeping its display column.
+    /// Returns false if already on the last row.
+    pub fn down(&mut self, width: usize) -> bool {
         self.selection_anchor = None;
-        let (row, col) = self.cursor_row_col();
-        let starts = self.line_starts();
-        if row + 1 >= starts.len() {
+        let layout = self.visual_layout(width);
+        if layout.cursor_row + 1 >= layout.rows.len() {
             return false;
         }
-        let next_start = starts[row + 1];
-        let next_end = if row + 2 < starts.len() {
-            starts[row + 2] - 1
-        } else {
-            self.chars.len()
-        };
-        self.cursor = self.grapheme_column_index(next_start, next_end, col);
+        self.cursor = layout.index_at(layout.cursor_row + 1, layout.cursor_col);
         true
     }
 
@@ -402,65 +384,16 @@ impl Composer {
 
     /// Map a visual (row, column) in wrapped composer space to a char index.
     pub fn index_at_visual(&self, width: usize, row: usize, col: usize) -> usize {
-        let width = width.max(1);
-        let mut visual_row = 0usize;
-        let mut visual_col = 0usize;
-        let mut index = 0usize;
-        let text = self.text();
-        for grapheme in text.graphemes(true) {
-            if visual_row > row {
-                return index;
-            }
-            if grapheme == "\n" {
-                if visual_row == row {
-                    return index;
-                }
-                visual_row += 1;
-                visual_col = 0;
-                index += grapheme.chars().count();
-                continue;
-            }
-            let w = UnicodeWidthStr::width(grapheme);
-            if visual_col > 0 && visual_col + w > width {
-                visual_row += 1;
-                visual_col = 0;
-            }
-            if visual_row == row && visual_col >= col {
-                return index;
-            }
-            if visual_row == row && visual_col + w > col {
-                return index;
-            }
-            visual_col += w;
-            index += grapheme.chars().count();
-        }
-        self.chars.len()
+        self.visual_layout(width).index_at(row, col)
     }
 
     /// Wrapped lines with the starting char index of each visual line.
     pub fn visual_lines_with_starts(&self, width: usize) -> Vec<(String, usize)> {
-        let width = width.max(1);
-        let mut lines = vec![(String::new(), 0usize)];
-        let mut col = 0usize;
-        let mut index = 0usize;
-        let text = self.text();
-        for grapheme in text.graphemes(true) {
-            if grapheme == "\n" {
-                index += grapheme.chars().count();
-                lines.push((String::new(), index));
-                col = 0;
-                continue;
-            }
-            let w = UnicodeWidthStr::width(grapheme);
-            if col > 0 && col + w > width {
-                lines.push((String::new(), index));
-                col = 0;
-            }
-            lines.last_mut().unwrap().0.push_str(grapheme);
-            col += w;
-            index += grapheme.chars().count();
-        }
-        lines
+        self.visual_layout(width)
+            .rows
+            .into_iter()
+            .map(|row| (row.text, row.start))
+            .collect()
     }
 
     fn grapheme_boundaries(&self) -> Vec<usize> {
@@ -496,75 +429,133 @@ impl Composer {
             .unwrap_or(self.chars.len())
     }
 
-    fn grapheme_column_index(&self, start: usize, end: usize, column: usize) -> usize {
-        let line: String = self.chars[start..end].iter().collect();
-        start
-            + line
-                .graphemes(true)
-                .take(column)
-                .map(|grapheme| grapheme.chars().count())
-                .sum::<usize>()
+    /// The wrapped layout at `width` display columns: every visual row plus
+    /// the cursor's (row, column). Rendering, cursor placement, Up/Down,
+    /// mouse hit-testing and the composer height all use this one layout.
+    pub fn visual_layout(&self, width: usize) -> VisualLayout {
+        let width = width.max(1);
+        let text = self.text();
+        let mut rows: Vec<VisualRow> = wrap_rows(&text, width)
+            .into_iter()
+            .map(|span| VisualRow::new(&self.chars, span))
+            .collect();
+        // A cursor at the end of a full last row needs a cell of its own, so
+        // it opens one more (empty) row.
+        if self.cursor == self.chars.len() && rows.last().is_some_and(|row| row.width >= width) {
+            rows.push(VisualRow::new(
+                &self.chars,
+                RowSpan {
+                    start: self.chars.len(),
+                    end: self.chars.len(),
+                    hard_end: true,
+                },
+            ));
+        }
+        let cursor_row = rows
+            .iter()
+            .rposition(|row| row.start <= self.cursor)
+            .unwrap_or(0);
+        let row = &rows[cursor_row];
+        let prefix: String = self.chars[row.start..self.cursor.max(row.start)]
+            .iter()
+            .collect();
+        let cursor_col = prefix
+            .graphemes(true)
+            .map(grapheme_width)
+            .sum::<usize>()
+            .min(width - 1);
+        VisualLayout {
+            rows,
+            cursor_row,
+            cursor_col,
+            width,
+        }
     }
 
     /// Wrap the composer text to `width` display columns and return every
-    /// visual line plus the cursor's visual (row, column) position. Each
-    /// logical line (`\n`) starts a new visual line; long lines wrap at the
-    /// exact column boundary (character-level, like a plain textarea) so the
-    /// cursor maps directly to a screen cell.
+    /// visual line plus the cursor's visual (row, column) position.
     pub fn visual_lines_with_cursor(&self, width: usize) -> (Vec<String>, usize, usize) {
-        let width = width.max(1);
-        let mut lines: Vec<String> = vec![String::new()];
-        let mut cur_col = 0usize;
-        let mut cursor_row = 0usize;
-        let mut cursor_col = 0usize;
-
-        let text = self.text();
-        let mut scalar_index = 0;
-        for grapheme in text.graphemes(true) {
-            if scalar_index == self.cursor {
-                if cur_col >= width {
-                    cursor_row = lines.len();
-                    cursor_col = 0;
-                } else {
-                    cursor_row = lines.len() - 1;
-                    cursor_col = cur_col;
-                }
-            }
-            if grapheme == "\n" {
-                lines.push(String::new());
-                cur_col = 0;
-            } else {
-                let w = UnicodeWidthStr::width(grapheme);
-                if cur_col > 0 && cur_col + w > width {
-                    lines.push(String::new());
-                    cur_col = 0;
-                    if scalar_index == self.cursor {
-                        cursor_row = lines.len() - 1;
-                        cursor_col = 0;
-                    }
-                }
-                lines.last_mut().unwrap().push_str(grapheme);
-                cur_col += w;
-            }
-            scalar_index += grapheme.chars().count();
-        }
-        // Cursor at the very end of the text.
-        if self.cursor == self.chars.len() {
-            if cur_col >= width {
-                lines.push(String::new());
-                cursor_row = lines.len() - 1;
-                cursor_col = 0;
-            } else {
-                cursor_row = lines.len() - 1;
-                cursor_col = cur_col;
-            }
-        }
-        (lines, cursor_row, cursor_col)
+        let layout = self.visual_layout(width);
+        let lines = layout.rows.into_iter().map(|row| row.text).collect();
+        (lines, layout.cursor_row, layout.cursor_col)
     }
 
     /// Number of visual lines after wrapping to `width` (≥ 1).
     pub fn visual_line_count(&self, width: usize) -> usize {
-        self.visual_lines_with_cursor(width).0.len()
+        self.visual_layout(width).rows.len()
+    }
+}
+
+/// One wrapped row of composer text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualRow {
+    pub text: String,
+    /// Char index of the row's first character.
+    pub start: usize,
+    /// Char index just past the row's last character (a hard newline excluded).
+    pub end: usize,
+    /// Display width of `text`.
+    pub width: usize,
+    /// False when the next row continues the same logical line.
+    hard_end: bool,
+}
+
+impl VisualRow {
+    fn new(chars: &[char], span: RowSpan) -> Self {
+        let text: String = chars[span.start..span.end].iter().collect();
+        let width = width_of(&text);
+        Self {
+            text,
+            start: span.start,
+            end: span.end,
+            width,
+            hard_end: span.hard_end,
+        }
+    }
+}
+
+/// The composer text wrapped for one width, with the cursor's position in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualLayout {
+    pub rows: Vec<VisualRow>,
+    pub cursor_row: usize,
+    /// Display column of the cursor within its row, kept inside the width.
+    pub cursor_col: usize,
+    width: usize,
+}
+
+impl VisualLayout {
+    /// Char index for a click or move landing on display column `col` of
+    /// `row`. A column past the end of the row lands at the row's end; rows
+    /// past the last one land at the end of the text.
+    pub fn index_at(&self, row: usize, col: usize) -> usize {
+        let Some(line) = self.rows.get(row) else {
+            return self.rows.last().map_or(0, |last| last.end);
+        };
+        let mut x = 0usize;
+        let mut index = line.start;
+        let mut last_start = line.start;
+        for grapheme in line.text.graphemes(true) {
+            let w = grapheme_width(grapheme);
+            if x + w > col {
+                return index;
+            }
+            x += w;
+            last_start = index;
+            index += grapheme.chars().count();
+        }
+        // Past the end of the row text. The end of a soft-wrapped row is the
+        // start of the next row, so stay on this row by stopping before its
+        // last character.
+        if line.hard_end || line.text.is_empty() {
+            line.end
+        } else {
+            last_start
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
     }
 }
 
@@ -709,10 +700,10 @@ mod tests {
         assert_eq!(c.cursor_row_col(), (1, 3)); // end of "cde"
 
         // Up keeps the column (clamped to the shorter first line).
-        assert!(c.up());
+        assert!(c.up(80));
         assert_eq!(c.cursor_row_col(), (0, 2)); // "ab" has length 2
         // Already on the first line: up returns false (history fallback).
-        assert!(!c.up());
+        assert!(!c.up(80));
 
         // Home/End act on the current line.
         c.home();
@@ -720,9 +711,9 @@ mod tests {
         c.end();
         assert_eq!(c.cursor(), 2); // before the newline
 
-        assert!(c.down());
+        assert!(c.down(80));
         assert_eq!(c.cursor_row_col().0, 1);
-        assert!(!c.down());
+        assert!(!c.down(80));
     }
 
     #[test]
@@ -736,7 +727,7 @@ mod tests {
 
         let mut first = typed("gone\nstay");
         first.home();
-        assert!(first.up());
+        assert!(first.up(80));
         first.delete_line();
         assert_eq!(first.text(), "stay");
         assert_eq!(first.cursor(), 0);
@@ -754,7 +745,7 @@ mod tests {
         assert_eq!(only.cursor(), 0);
 
         let mut blank = typed("stay\n\nstay");
-        blank.up();
+        blank.up(80);
         blank.delete_line();
         assert_eq!(blank.text(), "stay\nstay");
     }
@@ -780,16 +771,15 @@ mod tests {
     }
 
     #[test]
-    fn visual_lines_respect_newlines_and_cursor() {
+    fn visual_lines_wrap_at_word_boundaries_with_the_cursor() {
         let mut c = typed("hello world");
         c.left(); // cursor after "hello worl"
         c.left();
         let (lines, row, col) = c.visual_lines_with_cursor(5);
-        // "hello world" wrapped at 5 → "hello" " worl" "d"
-        assert_eq!(lines, vec!["hello", " worl", "d"]);
-        // Cursor is after "hello wor" (9 chars) → line 1 (" worl"), col 4.
-        assert_eq!(row, 1);
-        assert_eq!(col, 4);
+        // The break comes after the space, which stays on the upper line.
+        assert_eq!(lines, vec!["hello ", "world"]);
+        // Cursor is after "hello wor" (9 chars) -> line 1, col 3.
+        assert_eq!((row, col), (1, 3));
     }
 
     #[test]
@@ -824,5 +814,169 @@ mod tests {
 
         assert_eq!(lines, vec!["abcd", ""]);
         assert_eq!((row, col), (1, 0));
+    }
+
+    fn at(text: &str, cursor: usize) -> Composer {
+        let mut c = typed(text);
+        c.set_cursor_index(cursor);
+        c
+    }
+
+    const SENTENCE: &str = "adjust the file values and add tests for the parser";
+
+    #[test]
+    fn english_wraps_at_a_word_boundary_not_mid_word() {
+        let c = typed(SENTENCE);
+        let (lines, _, _) = c.visual_lines_with_cursor(20);
+        assert_eq!(
+            lines,
+            vec![
+                "adjust the file ",
+                "values and add tests ",
+                "for the parser"
+            ]
+        );
+        // Every row but the last ends in the space that broke it.
+        let (lines, _, _) =
+            typed("fix the file values and add tests here").visual_lines_with_cursor(26);
+        assert_eq!(lines, vec!["fix the file values and ", "add tests here"]);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_row_hard_breaks() {
+        let c = typed("see supercalifragilistic ok");
+        let (lines, _, _) = c.visual_lines_with_cursor(10);
+        assert_eq!(lines, vec!["see ", "supercalif", "ragilistic ", "ok"]);
+    }
+
+    #[test]
+    fn chinese_text_without_spaces_wraps_by_width() {
+        let c = typed("这是一个没有空格的很长的句子");
+        let (lines, row, col) = c.visual_lines_with_cursor(10);
+        assert_eq!(lines, vec!["这是一个没", "有空格的很", "长的句子"]);
+        assert!(
+            lines
+                .iter()
+                .all(|l| unicode_width::UnicodeWidthStr::width(l.as_str()) <= 10)
+        );
+        assert_eq!((row, col), (2, 8));
+    }
+
+    #[test]
+    fn cursor_at_and_after_the_wrap_point() {
+        // "hello " | "world" at width 8.
+        let before_space = at("hello world", 5).visual_layout(8);
+        assert_eq!((before_space.cursor_row, before_space.cursor_col), (0, 5));
+        let after_space = at("hello world", 6).visual_layout(8);
+        assert_eq!((after_space.cursor_row, after_space.cursor_col), (1, 0));
+        let inside_word = at("hello world", 8).visual_layout(8);
+        assert_eq!((inside_word.cursor_row, inside_word.cursor_col), (1, 2));
+        let end = at("hello world", 11).visual_layout(8);
+        assert_eq!((end.cursor_row, end.cursor_col), (1, 5));
+    }
+
+    #[test]
+    fn a_space_typed_at_the_end_of_a_full_row_stays_on_that_row() {
+        let c = typed("hello "); // width 5: the row is full before the space
+        let layout = c.visual_layout(5);
+        assert_eq!(
+            layout
+                .rows
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hello ", ""]
+        );
+        // The cursor sits on the fresh row, not on a row that starts with " ".
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 0));
+        // Before the space it stays on the first row.
+        let before = at("hello world", 5).visual_layout(5);
+        assert_eq!((before.cursor_row, before.cursor_col), (0, 4));
+    }
+
+    #[test]
+    fn height_and_cursor_row_come_from_the_same_layout() {
+        for width in 3..30 {
+            let c = typed(SENTENCE);
+            let layout = c.visual_layout(width);
+            assert_eq!(c.visual_line_count(width), layout.rows.len());
+            assert!(layout.cursor_row < layout.rows.len());
+        }
+    }
+
+    #[test]
+    fn up_and_down_move_between_wrapped_rows() {
+        // "alpha beta " | "gamma delta" at width 12.
+        let mut c = typed("alpha beta gamma delta");
+        assert_eq!(c.cursor(), 22);
+        assert!(c.up(12));
+        // End of row 1 is col 11; row 0 is only 11 wide, so it clamps there.
+        assert_eq!(c.visual_layout(12).cursor_row, 0);
+        assert!(!c.up(12));
+        assert!(c.down(12));
+        assert_eq!(c.visual_layout(12).cursor_row, 1);
+        assert!(!c.down(12));
+
+        // The column is kept across rows.
+        let mut c = at("alpha beta gamma delta", 14); // "gamma delta" col 3
+        assert_eq!(c.visual_layout(12).cursor_col, 3);
+        assert!(c.up(12));
+        assert_eq!(c.cursor(), 3);
+        assert!(c.down(12));
+        assert_eq!(c.cursor(), 14);
+    }
+
+    #[test]
+    fn up_and_down_cross_cjk_rows_by_display_column() {
+        let mut c = at("这是一个没有空格的很长的句子", 7); // row 1: "有空格的很" col 2
+        let layout = c.visual_layout(10);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 4));
+        assert!(c.up(10));
+        assert_eq!(c.cursor(), 2); // col 4 of "这是一个没" = after two chars
+        assert!(c.down(10));
+        assert_eq!(c.cursor(), 7);
+    }
+
+    #[test]
+    fn index_at_visual_follows_the_wrapped_rows() {
+        let c = typed("hello world");
+        // width 8: "hello " | "world"
+        assert_eq!(c.index_at_visual(8, 0, 2), 2);
+        assert_eq!(c.index_at_visual(8, 1, 0), 6);
+        assert_eq!(c.index_at_visual(8, 1, 3), 9);
+        // Past the end of a soft-wrapped row stays on that row.
+        assert_eq!(c.index_at_visual(8, 0, 7), 5);
+        // Past the last row lands at the end of the text.
+        assert_eq!(c.index_at_visual(8, 5, 0), 11);
+        // Wide characters: either cell of a wide char hits the same char.
+        let cjk = typed("这是一个没有");
+        assert_eq!(cjk.index_at_visual(10, 0, 3), 1);
+        assert_eq!(cjk.index_at_visual(10, 0, 4), 2);
+        assert_eq!(cjk.index_at_visual(10, 1, 0), 5);
+    }
+
+    #[test]
+    fn cursor_and_click_round_trip_on_every_index() {
+        let c = typed("write the file 值 values 和 add tests\nnext line is here");
+        for width in [6, 9, 15] {
+            for index in 0..=c.chars.len() {
+                let mut at_index = typed(&c.text());
+                at_index.set_cursor_index(index);
+                let layout = at_index.visual_layout(width);
+                // A cursor past the last cell of a full row (before a hanging
+                // space, or before the newline that ends it) is drawn on that
+                // last cell, which belongs to the character before it.
+                let row = &layout.rows[layout.cursor_row];
+                let clamped = layout.cursor_col == width - 1
+                    && row.width >= width
+                    && (index == row.end
+                        || c.chars.get(index).is_some_and(|ch| ch.is_whitespace()));
+                if clamped {
+                    continue;
+                }
+                let back = layout.index_at(layout.cursor_row, layout.cursor_col);
+                assert_eq!(back, at_index.cursor(), "width {width} index {index}");
+            }
+        }
     }
 }

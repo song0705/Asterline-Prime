@@ -19,6 +19,11 @@ pub const PLAN_MODE_HINT: &str = "Plan the work as a checklist now: emit one \
 Do not do the work yourself. After the reviewer approves, a configured Builder receives the \
 whole checklist automatically; with no Builder, this is a reviewed plan only.";
 
+/// Openers of the two sub-agent messages (a parent's task, a child's result);
+/// the fake runner keys on them. The sender's name and id follow, then `]`.
+pub const SUB_AGENT_TASK_MARKER: &str = "[task from ";
+pub const HANDBACK_MARKER: &str = "[hand-back from ";
+
 /// Markers for brainstorm generation waves; the fake runner keys on them.
 pub const BRAINSTORM_PROPOSE_HINT: &str = "BRAINSTORM_WAVE: SEED";
 pub const BRAINSTORM_BUILD_HINT: &str = "BRAINSTORM_WAVE: BUILD";

@@ -9,6 +9,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::config::{MAIN_MEMBER_ID, upper_first};
 use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
 
 /// Mode selected for the lifetime of the current conversation.
@@ -250,6 +251,7 @@ fn plan_config_is_empty(config: &PlanModeConfig) -> bool {
 
 fn brainstorm_config_is_empty(config: &BrainstormModeConfig) -> bool {
     config.participants.is_none()
+        && config.participant_count.is_none()
         && config.generation_rounds.is_none()
         && config.ideas_per_round.is_none()
 }
@@ -354,6 +356,7 @@ fn merge_brainstorm(
                 .participants
                 .clone()
                 .or_else(|| base.participants.clone()),
+            participant_count: over.participant_count.or(base.participant_count),
             generation_rounds: over.generation_rounds.or(base.generation_rounds),
             ideas_per_round: over.ideas_per_round.or(base.ideas_per_round),
         }),
@@ -385,12 +388,12 @@ fn merge_team(
 /// text so the panel can paint them in yellow.
 pub fn format_mode_binding(config: &TeamConfig, mode: TerminalMode) -> String {
     match mode {
-        TerminalMode::Normal => "plain text goes to the last @target".to_string(),
+        TerminalMode::Normal => "plain text goes to the agent you're viewing".to_string(),
         TerminalMode::Review => match resolve_mode_roles(config, CollabMode::Review) {
             Ok((roles, limits)) => format!(
                 "builder {} · reviewer {} · {} iterations{}",
                 member_label(config, &roles.builder),
-                member_label(config, &roles.reviewer),
+                seat_label(config, &roles, &roles.reviewer),
                 limits.max_iterations,
                 limits
                     .reviewer_hint
@@ -429,11 +432,23 @@ pub fn format_mode_binding(config: &TeamConfig, mode: TerminalMode) -> String {
                 let people = roles
                     .participants
                     .iter()
-                    .map(|id| member_label(config, id))
+                    .map(|id| member_label_in(config, &roles, id))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let new_seats = roles.auto_seats.len();
+                let opening = match new_seats {
+                    0 => String::new(),
+                    1 => format!(
+                        " (1 new sub-agent, {}'s model)",
+                        member_label(config, &auto_seat_parent(config))
+                    ),
+                    n => format!(
+                        " ({n} new sub-agents, {}'s model)",
+                        member_label(config, &auto_seat_parent(config))
+                    ),
+                };
                 format!(
-                    "{people} · {} waves × {} cards",
+                    "{people}{opening} · {} waves × {} cards",
                     limits.rounds, limits.ideas_per_round
                 )
             }
@@ -481,6 +496,28 @@ fn member_label(config: &TeamConfig, id: &MemberId) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
+/// Like [`member_label`], but a seat still to be opened shows the name it
+/// will get.
+fn member_label_in(config: &TeamConfig, roles: &ResolvedModeRoles, id: &MemberId) -> String {
+    match roles.auto_seats.iter().find(|seat| &seat.id == id) {
+        Some(seat) => seat.display_name(),
+        None => member_label(config, id),
+    }
+}
+
+/// A single seat's label, with a note when its sub-agent is yet to be opened.
+fn seat_label(config: &TeamConfig, roles: &ResolvedModeRoles, id: &MemberId) -> String {
+    let label = member_label_in(config, roles, id);
+    if roles.auto_seats.iter().any(|seat| &seat.id == id) {
+        format!(
+            "{label} (new sub-agent, {}'s model)",
+            member_label(config, &auto_seat_parent(config))
+        )
+    } else {
+        label
+    }
+}
+
 /// Review-only role and iteration settings stored in `team.json`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -503,13 +540,13 @@ pub struct ReviewModeConfig {
     pub auto_verify: Option<bool>,
 }
 
-/// Plan leader, required execution builder, optional reviewer, and execution settings stored in `team.json`.
+/// Plan leader, execution builder (the leader when unset), optional reviewer, and execution settings stored in `team.json`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanModeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leader: Option<MemberId>,
-    /// Required member that executes the finalized plan checklist.
+    /// Member that executes the finalized plan checklist. Defaults to the leader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder: Option<MemberId>,
     /// Optional plan-only reviewer. When omitted, a completed checklist goes
@@ -536,6 +573,10 @@ pub struct PlanModeConfig {
 pub struct BrainstormModeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub participants: Option<Vec<MemberId>>,
+    /// How many participants a run has when `participants` is not set
+    /// (2 to 9, default 3). Members the roster lacks are opened as sub-agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant_count: Option<u32>,
     /// Number of generation waves (default 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_rounds: Option<u32>,
@@ -607,7 +648,37 @@ pub struct ResolvedModeRoles {
     pub reviewer: MemberId,
     pub leader: MemberId,
     pub participants: Vec<MemberId>,
+    /// Seats whose sub-agent does not exist yet; the ids are already used in
+    /// the roles above. The runtime opens them before the run starts.
+    pub auto_seats: Vec<AutoSeat>,
 }
+
+/// A mode seat nobody on the roster can fill: a sub-agent the runtime opens
+/// under the main member, with the main member's model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoSeat {
+    pub id: MemberId,
+    /// Role text for the new sub-agent.
+    pub role: String,
+}
+
+impl AutoSeat {
+    /// Name shown for the sub-agent, capitalised like any other sub-agent.
+    pub fn display_name(&self) -> String {
+        upper_first(self.id.as_str())
+    }
+}
+
+/// Most brainstorm participants the setting allows.
+pub const MAX_PARTICIPANT_COUNT: u32 = 9;
+/// Fewest brainstorm participants the setting allows.
+pub const MIN_PARTICIPANT_COUNT: u32 = 2;
+/// Brainstorm participants when `participant_count` is not set and the roster
+/// has fewer than two members.
+pub const DEFAULT_PARTICIPANT_COUNT: u32 = 3;
+
+const REVIEWER_SEAT_ROLE: &str = "independent code reviewer for review mode";
+const IDEATOR_SEAT_ROLE: &str = "brainstorm participant";
 
 /// Budget knobs for a mode run after config/default resolution.
 ///
@@ -708,6 +779,10 @@ pub struct ModeStatusSummary {
 }
 
 /// Resolve the fields relevant to `mode`; unrelated mode settings are never read.
+///
+/// Seats no distinct top-level member can fill come back as ids in the roles
+/// plus an entry in `auto_seats` (or, when a sub-agent of that name already
+/// exists under the main member, just the id: it is reused).
 pub fn resolve_mode_roles(
     config: &TeamConfig,
     mode: CollabMode,
@@ -718,6 +793,9 @@ pub fn resolve_mode_roles(
 
     let mut roles = derive_roles(config);
     let mut limits = ModeLimits::default();
+    let mut reviewer_bound = false;
+    let mut participants_bound = false;
+    let mut participant_count = None;
     match mode {
         CollabMode::Review => {
             limits.auto_verify = false;
@@ -727,6 +805,7 @@ pub fn resolve_mode_roles(
                     resolve_or_derived(config, settings.builder.as_ref(), &roles.builder)?;
                 roles.reviewer =
                     resolve_or_derived(config, settings.reviewer.as_ref(), &roles.reviewer)?;
+                reviewer_bound = settings.reviewer.is_some();
                 limits.max_iterations =
                     positive_or_default("max_iterations", settings.max_iterations, 3)?;
                 limits.reviewer_hint = settings
@@ -753,6 +832,10 @@ pub fn resolve_mode_roles(
                     settings.participants.as_ref(),
                     &roles.participants,
                 )?;
+                participants_bound = settings.participants.is_some();
+                if let Some(count) = settings.participant_count {
+                    participant_count = Some(validate_participant_count(count)?);
+                }
                 limits.rounds = settings.generation_rounds.unwrap_or(3);
                 limits.ideas_per_round =
                     positive_or_default("ideas_per_round", settings.ideas_per_round, 4)?;
@@ -768,27 +851,165 @@ pub fn resolve_mode_roles(
     }
 
     if mode == CollabMode::Review && roles.builder == roles.reviewer {
-        return Err("review mode needs two distinct members (builder and reviewer)".to_string());
+        if reviewer_bound {
+            return Err(
+                "review mode needs two distinct members (builder and reviewer)".to_string(),
+            );
+        }
+        // No bound reviewer: another top-level member if there is one,
+        // otherwise a reviewer sub-agent.
+        let other = config
+            .members
+            .iter()
+            .rev()
+            .find(|member| member.parent.is_none() && member.id != roles.builder)
+            .map(|member| member.id.clone());
+        roles.reviewer = match other {
+            Some(other) => other,
+            None => {
+                let parent = auto_seat_parent(config);
+                let names = std::iter::once("reviewer".to_string())
+                    .chain((2..).map(|n| format!("reviewer-{n}")));
+                let (id, seat) = claim_seat(config, &parent, names, REVIEWER_SEAT_ROLE);
+                roles.auto_seats.extend(seat);
+                id
+            }
+        };
+    }
+    if mode == CollabMode::Brainstorm && !participants_bound {
+        let parent = auto_seat_parent(config);
+        // Without a count, a roster that already has two members runs as it
+        // is; a lone member is topped up to the default.
+        let target = match participant_count {
+            Some(count) => count as usize,
+            None if roles.participants.len() >= MIN_PARTICIPANT_COUNT as usize => {
+                roles.participants.len()
+            }
+            None => DEFAULT_PARTICIPANT_COUNT as usize,
+        };
+        let mut next = 1u32;
+        while roles.participants.len() < target {
+            let name = format!("ideator-{next}");
+            next += 1;
+            match seat_state(config, &parent, &name) {
+                SeatState::Taken => {}
+                SeatState::Reuse => roles.participants.push(MemberId::new(name)),
+                SeatState::Free => {
+                    roles.participants.push(MemberId::new(name.clone()));
+                    roles.auto_seats.push(AutoSeat {
+                        id: MemberId::new(name),
+                        role: IDEATOR_SEAT_ROLE.to_string(),
+                    });
+                }
+            }
+        }
     }
     if mode == CollabMode::Brainstorm && roles.participants.len() < 2 {
         return Err(
-            "brainstorm mode needs at least two participants with distinct member identities"
-                .to_string(),
+            "brainstorm mode needs at least two participants (distinct members)".to_string(),
         );
     }
     Ok((roles, limits))
 }
 
-/// Resolve the required Plan-mode execution builder. Plan has no derived
-/// fallback so a configuration cannot silently dispatch implementation work.
-pub fn resolve_plan_builder(config: &TeamConfig) -> Result<MemberId, String> {
+fn validate_participant_count(count: u32) -> Result<u32, String> {
+    if (MIN_PARTICIPANT_COUNT..=MAX_PARTICIPANT_COUNT).contains(&count) {
+        Ok(count)
+    } else {
+        Err(format!(
+            "participant_count must be between {MIN_PARTICIPANT_COUNT} and {MAX_PARTICIPANT_COUNT}"
+        ))
+    }
+}
+
+/// The member that opens auto-seat sub-agents: `main` if the roster has it,
+/// else the default-target member, else the first top-level member.
+pub fn auto_seat_parent(config: &TeamConfig) -> MemberId {
+    let top_level = |id: &MemberId| config.member(id).filter(|member| member.parent.is_none());
+    let main = MemberId::new(MAIN_MEMBER_ID);
+    if top_level(&main).is_some() {
+        return main;
+    }
+    if let Some(DefaultTarget::Member(id)) = &config.default_target
+        && top_level(id).is_some()
+    {
+        return id.clone();
+    }
     config
+        .members
+        .iter()
+        .find(|member| member.parent.is_none())
+        .map(|member| member.id.clone())
+        .unwrap_or_else(|| config.members[0].id.clone())
+}
+
+enum SeatState {
+    /// No member has this name: a new sub-agent can take it.
+    Free,
+    /// It is already a sub-agent of the seat parent: use it as it is.
+    Reuse,
+    /// Some other member holds the name.
+    Taken,
+}
+
+fn seat_state(config: &TeamConfig, parent: &MemberId, name: &str) -> SeatState {
+    match config.find(name) {
+        None => SeatState::Free,
+        Some(member) if member.id.as_str() == name && member.parent.as_ref() == Some(parent) => {
+            SeatState::Reuse
+        }
+        Some(_) => SeatState::Taken,
+    }
+}
+
+/// Take the first of `names` that is free or already our sub-agent. The seat
+/// is `Some` only when the sub-agent still has to be opened.
+fn claim_seat(
+    config: &TeamConfig,
+    parent: &MemberId,
+    names: impl Iterator<Item = String>,
+    role: &str,
+) -> (MemberId, Option<AutoSeat>) {
+    for name in names {
+        match seat_state(config, parent, &name) {
+            SeatState::Taken => {}
+            SeatState::Reuse => return (MemberId::new(name), None),
+            SeatState::Free => {
+                let id = MemberId::new(name);
+                let seat = AutoSeat {
+                    id: id.clone(),
+                    role: role.to_string(),
+                };
+                return (id, Some(seat));
+            }
+        }
+    }
+    unreachable!("the name sequences are unbounded")
+}
+
+/// Resolve the Plan-mode execution builder: the bound member, else the leader
+/// (who plans and then carries the plan out).
+pub fn resolve_plan_builder(config: &TeamConfig) -> Result<MemberId, String> {
+    if let Some(id) = config
         .modes
         .plan
         .as_ref()
         .and_then(|settings| settings.builder.as_ref())
-        .map(|id| resolve_bound_member(config, id))
-        .ok_or_else(|| "plan mode needs a builder".to_string())?
+    {
+        return resolve_bound_member(config, id);
+    }
+    if config.members.is_empty() {
+        return Err("team has no members".to_string());
+    }
+    match config
+        .modes
+        .plan
+        .as_ref()
+        .and_then(|settings| settings.leader.as_ref())
+    {
+        Some(id) => resolve_bound_member(config, id),
+        None => Ok(derive_roles(config).leader),
+    }
 }
 
 /// Resolve the optional Plan reviewer. Unlike Review mode, an omitted Plan
@@ -897,6 +1118,10 @@ fn role_contains(role: &str, needle: &str) -> bool {
 
 /// Role-heuristic defaults used when neither override nor config binding sets a field.
 fn derive_roles(config: &TeamConfig) -> ResolvedModeRoles {
+    // Sub-agents belong to their parent's conversation; modes fill their seats
+    // from the top-level roster only.
+    let top_level = config.without_sub_agents();
+    let config = &top_level;
     let first = config.members[0].id.clone();
 
     // Prefer a role-tagged reviewer so builder can avoid that seat; otherwise
@@ -933,6 +1158,7 @@ fn derive_roles(config: &TeamConfig) -> ResolvedModeRoles {
         reviewer,
         leader,
         participants: config.all_member_ids(),
+        auto_seats: Vec::new(),
     }
 }
 
@@ -1096,6 +1322,7 @@ mod tests {
             participants: Some(vec![MemberId::new("builder"), MemberId::new("reviewer")]),
             generation_rounds: Some(4),
             ideas_per_round: Some(6),
+            ..BrainstormModeConfig::default()
         });
         let (roles, limits) = resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap();
         assert_eq!(
@@ -1119,11 +1346,15 @@ mod tests {
             "brainstorm participant resolves more than once: builder"
         );
 
-        let single =
+        let mut single =
             TeamConfig::new("solo", "/tmp/ws").with_member(member("builder", "implementation"));
+        single.modes.brainstorm = Some(BrainstormModeConfig {
+            participants: Some(vec![MemberId::new("builder")]),
+            ..BrainstormModeConfig::default()
+        });
         assert_eq!(
             resolve_mode_roles(&single, CollabMode::Brainstorm).unwrap_err(),
-            "brainstorm mode needs at least two participants with distinct member identities"
+            "brainstorm mode needs at least two participants (distinct members)"
         );
     }
 
@@ -1139,11 +1370,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_builder_is_required_and_reviewer_is_optional() {
+    fn plan_builder_defaults_to_the_leader_and_reviewer_is_optional() {
         let config = mixed_roster();
         assert_eq!(
-            resolve_plan_builder(&config).unwrap_err(),
-            "plan mode needs a builder"
+            resolve_plan_builder(&config).unwrap(),
+            MemberId::new("planner")
         );
         assert_eq!(resolve_plan_reviewer(&config).unwrap(), None);
 
@@ -1169,13 +1400,182 @@ mod tests {
         );
     }
 
+    fn lone_main() -> TeamConfig {
+        let mut config = TeamConfig::new("solo", "/tmp/ws").with_member(TeamMember::new(
+            "main",
+            "Main",
+            BackendKind::Codex,
+            "general",
+        ));
+        config.default_target = Some(DefaultTarget::Member(MemberId::new("main")));
+        config
+    }
+
+    fn sub_agent(id: &str, parent: &str) -> TeamMember {
+        let mut child = member(id, "sub-agent");
+        child.display_name = upper_first(id);
+        child.parent = Some(MemberId::new(parent));
+        child
+    }
+
     #[test]
-    fn review_with_single_member_errors() {
+    fn review_with_a_lone_member_opens_a_reviewer_seat() {
         let config = TeamConfig::new("solo", "/tmp/ws").with_member(member("only", "review"));
-        let err = resolve_mode_roles(&config, CollabMode::Review).unwrap_err();
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.builder, MemberId::new("only"));
+        assert_eq!(roles.reviewer, MemberId::new("reviewer"));
         assert_eq!(
-            err,
+            roles.auto_seats,
+            vec![AutoSeat {
+                id: MemberId::new("reviewer"),
+                role: REVIEWER_SEAT_ROLE.to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn explicit_same_builder_and_reviewer_still_errors() {
+        let mut config = lone_main();
+        config.modes.review = Some(ReviewModeConfig {
+            reviewer: Some(MemberId::new("main")),
+            ..ReviewModeConfig::default()
+        });
+        assert_eq!(
+            resolve_mode_roles(&config, CollabMode::Review).unwrap_err(),
             "review mode needs two distinct members (builder and reviewer)"
+        );
+    }
+
+    #[test]
+    fn existing_reviewer_sub_agent_is_reused_and_foreign_names_get_a_suffix() {
+        let mut config = lone_main();
+        config.members.push(sub_agent("reviewer", "main"));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.reviewer, MemberId::new("reviewer"));
+        assert!(roles.auto_seats.is_empty());
+
+        // A top-level member named reviewer is not main's sub-agent.
+        let mut config = lone_main();
+        config.members.push(member("reviewer", "qa"));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(
+            roles.reviewer,
+            MemberId::new("reviewer"),
+            "distinct member wins"
+        );
+        assert!(roles.auto_seats.is_empty());
+
+        // A sub-agent of someone else holds the name (hand-built roster).
+        let mut config = lone_main();
+        config.members.push(sub_agent("reviewer", "ghost"));
+        config.members.push(sub_agent("reviewer-2", "main"));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
+        assert_eq!(roles.reviewer, MemberId::new("reviewer-2"));
+        assert!(roles.auto_seats.is_empty());
+    }
+
+    #[test]
+    fn plan_with_a_lone_main_makes_the_leader_the_builder() {
+        let config = lone_main();
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Plan).unwrap();
+        assert_eq!(roles.leader, MemberId::new("main"));
+        assert_eq!(
+            resolve_plan_builder(&config).unwrap(),
+            MemberId::new("main")
+        );
+        assert_eq!(resolve_plan_reviewer(&config).unwrap(), None);
+        assert!(roles.auto_seats.is_empty());
+    }
+
+    #[test]
+    fn brainstorm_fills_missing_participants_with_ideator_seats() {
+        let (roles, _) = resolve_mode_roles(&lone_main(), CollabMode::Brainstorm).unwrap();
+        let ids: Vec<&str> = roles.participants.iter().map(MemberId::as_str).collect();
+        assert_eq!(ids, ["main", "ideator-1", "ideator-2"]);
+        assert_eq!(roles.auto_seats.len(), 2);
+
+        let mut config = lone_main();
+        config.modes.brainstorm = Some(BrainstormModeConfig {
+            participant_count: Some(4),
+            ..BrainstormModeConfig::default()
+        });
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap();
+        assert_eq!(roles.participants.len(), 4);
+        assert_eq!(roles.auto_seats.len(), 3);
+
+        // Existing ideators count and are not opened again.
+        config.members.push(sub_agent("ideator-1", "main"));
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap();
+        assert_eq!(roles.participants.len(), 4);
+        assert_eq!(roles.auto_seats.len(), 2);
+        assert!(
+            roles
+                .auto_seats
+                .iter()
+                .all(|seat| seat.id.as_str() != "ideator-1")
+        );
+    }
+
+    #[test]
+    fn brainstorm_keeps_a_larger_legacy_roster_and_explicit_participants() {
+        let (roles, _) = resolve_mode_roles(&mixed_roster(), CollabMode::Brainstorm).unwrap();
+        assert_eq!(roles.participants.len(), 3);
+        assert!(roles.auto_seats.is_empty());
+
+        let mut config = lone_main();
+        config.members.push(member("bob", "x"));
+        config.modes.brainstorm = Some(BrainstormModeConfig {
+            participants: Some(vec![MemberId::new("main"), MemberId::new("bob")]),
+            participant_count: Some(5),
+            ..BrainstormModeConfig::default()
+        });
+        let (roles, _) = resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap();
+        assert_eq!(
+            roles.participants.len(),
+            2,
+            "explicit binding ignores the count"
+        );
+        assert!(roles.auto_seats.is_empty());
+    }
+
+    #[test]
+    fn participant_count_must_be_between_two_and_nine() {
+        for bad in [0, 1, 10] {
+            let mut config = lone_main();
+            config.modes.brainstorm = Some(BrainstormModeConfig {
+                participant_count: Some(bad),
+                ..BrainstormModeConfig::default()
+            });
+            assert_eq!(
+                resolve_mode_roles(&config, CollabMode::Brainstorm).unwrap_err(),
+                "participant_count must be between 2 and 9"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_binding_text_names_seats_that_are_yet_to_open() {
+        let mut config = lone_main();
+        assert_eq!(
+            format_mode_binding(&config, TerminalMode::Review),
+            "builder Main · reviewer Reviewer (new sub-agent, Main's model) · 3 iterations"
+        );
+        assert!(!mode_binding_is_error(&config, TerminalMode::Review));
+        assert_eq!(
+            format_mode_binding(&config, TerminalMode::Brainstorm),
+            "Main, Ideator-1, Ideator-2 (2 new sub-agents, Main's model) · 3 waves × 4 cards"
+        );
+        assert_eq!(
+            format_mode_binding(&config, TerminalMode::Plan),
+            "leader Main · builder Main · reviewer none · auto execute · 3 iterations"
+        );
+        assert!(!mode_binding_is_error(&config, TerminalMode::Plan));
+        validate_terminal_mode(&config, TerminalMode::Brainstorm).unwrap();
+
+        config.members.push(sub_agent("reviewer", "main"));
+        assert_eq!(
+            format_mode_binding(&config, TerminalMode::Review),
+            "builder Main · reviewer Reviewer · 3 iterations"
         );
     }
 

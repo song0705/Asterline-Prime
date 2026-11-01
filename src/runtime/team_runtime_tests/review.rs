@@ -866,7 +866,7 @@ fn restart_disables_dispatch_when_interrupted_run_cannot_be_blocked() {
     let mut restarted = TeamRuntime::new(team(), store).with_approvals(false);
     let conversation = restarted.store.active_conversation();
     let dispatch = restarted.on_ui_command(user("must not overlap interrupted run"));
-    let new_chat = restarted.on_ui_command(UiCommand::NewSession);
+    let new_chat = restarted.on_ui_command(UiCommand::NewSession { prompt: None });
 
     assert!(dispatch.actions.is_empty());
     assert!(dispatch.events.iter().any(|event| matches!(

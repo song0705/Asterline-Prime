@@ -291,18 +291,26 @@ fn plan_request_changes_returns_to_leader() {
 }
 
 #[test]
-fn plan_without_builder_is_rejected_before_leader_dispatch() {
+fn plan_without_builder_lets_the_leader_execute_its_own_plan() {
     let mut rt =
         TeamRuntime::new(plan_team(), SqliteStore::in_memory().unwrap()).with_approvals(false);
+    let planner = MemberId::new("planner");
 
     let step = rt.on_ui_command(run_plan("produce a plan"));
 
-    assert!(step.actions.is_empty());
-    assert!(step.events.iter().any(|event| matches!(
+    assert!(
+        step.actions.iter().any(|a| a.member == planner),
+        "the leader gets the task: {:?}",
+        step.events
+    );
+    assert!(!step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text) if text == "plan mode needs a builder"
+        RuntimeEvent::Notice(text) if text.contains("needs a builder")
     )));
-    assert!(rt.store.latest_run().unwrap().is_none());
+    let session = rt.mode_sessions.values().next().expect("plan session");
+    assert_eq!(session.leader, planner);
+    assert_eq!(session.plan_builder.as_ref(), Some(&planner));
+    assert_eq!(rt.config.sub_agent_count(), 0);
 }
 
 #[test]
@@ -474,7 +482,7 @@ fn brainstorm_discards_cards_beyond_ideas_per_round() {
     );
     assert!(completed.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text)
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. }
             if text.contains("2 extra brainstorm card") && text.contains("kept 3")
     )));
     let rendered = completed
@@ -1111,7 +1119,7 @@ fn plan_keeps_going_when_a_member_is_denied_a_command() {
     assert!(
         step.events.iter().any(|event| matches!(
             event,
-            RuntimeEvent::Notice(text)
+            RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. }
                 if text.contains("denied permission to run")
                     && text.contains("node -c snake-game/game.js")
                     && text.contains("the run continues")

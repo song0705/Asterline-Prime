@@ -19,35 +19,41 @@ use crate::adapter::parser::{
     format_permission_denial, is_permission_denied_tool,
 };
 use crate::domain::config::{
-    ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_ROSTER_PATH, brainstorm_skill_text,
-    inject_team_protocol, strip_team_protocol, strip_team_protocols, team_skill_hint,
+    ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_ROSTER_PATH, MAIN_MEMBER_ID, brainstorm_skill_text,
+    inject_team_protocol, replace_model_style_name, strip_team_protocol, strip_team_protocols,
+    sub_agent_member, team_skill_hint,
 };
 use crate::domain::event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ImportedMessage, LogEntry,
-    MemberStatus, MemberSummary, MessageId, MessageTarget, RunId, RunStatus, RunStepRequest,
-    RunStepStatus, RunStepSummary, RunSummary, RuntimeEvent, TurnId, UiCommand,
+    MemberStatus, MemberSummary, MessageId, MessageTarget, RouteTo, RunId, RunStatus,
+    RunStepRequest, RunStepStatus, RunStepSummary, RunSummary, RuntimeEvent, SpawnRequest,
+    TeamMessage, TurnId, UiCommand,
 };
 use crate::domain::mode::{
-    BrainstormCard, CollabMode, ModeStatusSummary, ModesConfig, ReviewVerdict, ReviewVerdictKind,
-    TerminalMode, apply_mode_overrides, clear_mode_overrides, format_mode_binding, merge_modes,
-    mode_overrides_for, prune_empty_mode_overrides, resolve_mode_roles, resolve_plan_auto_execute,
+    AutoSeat, BrainstormCard, CollabMode, ModeStatusSummary, ModesConfig, ReviewVerdict,
+    ReviewVerdictKind, TerminalMode, apply_mode_overrides, auto_seat_parent, clear_mode_overrides,
+    format_mode_binding, merge_modes, mode_binding_is_error, mode_overrides_for,
+    prune_empty_mode_overrides, resolve_mode_roles, resolve_plan_auto_execute,
     resolve_plan_builder, resolve_plan_reviewer, resolve_team_allow_add_members,
     resolve_team_coordinator, resolve_team_limits, validate_mode_overrides, validate_terminal_mode,
 };
 use crate::domain::team::{
-    BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig, TeamMember,
+    BackendKind, DefaultTarget, Effort, MAX_SUB_AGENTS, MemberId, SessionPolicy, TeamConfig,
+    TeamMember,
 };
 use crate::fs_safety;
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
+use crate::runtime::context_recap::{self, NOT_CARRIED_OVER, Recap, SYSTEM_SENDER};
 use crate::runtime::mode_prompts::{
-    brainstorm_build_prompt, brainstorm_propose_prompt, brainstorm_stretch_prompt,
-    brainstorm_synthesis_prompt, brainstorm_vote_prompt, plan_iteration_prompt, plan_nudge_prompt,
-    plan_plan_prompt, plan_progress_prompt, plan_review_prompt, plan_step_nudge_prompt,
-    plan_verify_failure_prompt, review_iteration_prompt, review_prompt, review_task_prompt,
-    step_dispatch_prompt, verdict_nudge_prompt, verify_failure_prompt,
+    HANDBACK_MARKER, SUB_AGENT_TASK_MARKER, brainstorm_build_prompt, brainstorm_propose_prompt,
+    brainstorm_stretch_prompt, brainstorm_synthesis_prompt, brainstorm_vote_prompt,
+    plan_iteration_prompt, plan_nudge_prompt, plan_plan_prompt, plan_progress_prompt,
+    plan_review_prompt, plan_step_nudge_prompt, plan_verify_failure_prompt,
+    review_iteration_prompt, review_prompt, review_task_prompt, step_dispatch_prompt,
+    verdict_nudge_prompt, verify_failure_prompt,
 };
 use crate::runtime::session_registry::SessionRegistry;
-use crate::store::sqlite::{SqliteStore, StoredConversationSession};
+use crate::store::sqlite::SqliteStore;
 
 pub(super) const MAX_IMPORTED_ITEMS: usize = 1_000;
 pub(super) const MAX_IMPORTED_ITEM_BYTES: usize = 1024 * 1024;
@@ -67,7 +73,7 @@ pub struct RuntimeStep {
 /// A runner map mutation requested after a live roster edit.
 pub enum RunnerChange {
     Upsert {
-        member: TeamMember,
+        member: Box<TeamMember>,
         workspace: PathBuf,
     },
     Remove(MemberId),
@@ -124,11 +130,20 @@ struct RunningState {
     denied_reason: Option<String>,
     permission_noticed: bool,
     raw_persistence_failed: bool,
+    /// The member whose message started this run; `None` for the user and for
+    /// engine dispatch. A sub-agent's reply goes back to its parent only when
+    /// the parent is the origin.
+    origin: Option<MemberId>,
+    /// The member already sent its origin a message of its own this run.
+    messaged_origin: bool,
+    /// The latest non-empty visible reply of this run.
+    last_reply: String,
 }
 
 struct QueuedPrompt {
     turn: TurnId,
     prompt: String,
+    origin: Option<MemberId>,
 }
 
 struct PendingUserMessage {
@@ -273,10 +288,19 @@ impl TeamRuntime {
             }
         }
         let mut sessions = SessionRegistry::from_store(&store, &config.members);
+        // Sessions saved before watermarks existed are taken to have seen the
+        // chat as it is now; a configured session that is new to the member
+        // carries its own history, so the chat so far counts as seen too.
+        let latest = store.latest_message_id().unwrap_or(0);
+        let mut watermarks_changed = sessions.resolve_unknown_seen(latest);
         for member in &config.members {
             if let Some(id) = &member.session_id {
                 let session = AgentSessionId(id.clone());
-                sessions.set(member.id.clone(), session.clone());
+                if sessions.get(&member.id).as_ref() == Some(&session) {
+                    continue;
+                }
+                sessions.set_external(member.id.clone(), session.clone(), latest);
+                watermarks_changed = true;
                 if let Err(err) = store.upsert_session(&member.id, member.backend, &session) {
                     startup_notices.push(format!(
                         "could not save configured session for {}: {err}",
@@ -284,6 +308,11 @@ impl TeamRuntime {
                     ));
                 }
             }
+        }
+        if watermarks_changed
+            && let Err(err) = store.save_session_rows(&sessions.to_stored(&config.members))
+        {
+            startup_notices.push(format!("could not save session watermarks: {err}"));
         }
         let members = config
             .members
@@ -475,6 +504,7 @@ impl TeamRuntime {
                 permission_mode: m.permission_mode,
                 approvals_reviewer: m.approvals_reviewer,
                 session_policy: m.session_policy,
+                parent: m.parent.clone(),
             })
             .collect();
         RuntimeEvent::Ready {
@@ -497,7 +527,7 @@ impl TeamRuntime {
             &cmd,
             UiCommand::UserMessage { .. }
                 | UiCommand::Retry
-                | UiCommand::NewSession
+                | UiCommand::NewSession { .. }
                 | UiCommand::ResumeConversation { .. }
                 | UiCommand::RequestAttach { .. }
                 | UiCommand::Approve {
@@ -573,9 +603,27 @@ impl TeamRuntime {
             UiCommand::ReplaceTeam {
                 members,
                 default_target,
-            } => self.handle_replace_team(members, default_target, &mut step),
-            UiCommand::NewSession => self.handle_new_session(&mut step),
-            UiCommand::RequestResume => self.handle_request_resume(&mut step),
+            } => {
+                let members = self.with_existing_sub_agents(members);
+                self.handle_replace_team(members, default_target, &mut step)
+            }
+            UiCommand::NewSession { prompt } => {
+                // The prompt goes out only once the reset has succeeded, so it
+                // can never land in the chat being left.
+                if self.handle_new_session(&mut step)
+                    && let Some(prompt) = prompt
+                {
+                    let target = self.main_message_target();
+                    self.handle_active_user_message(target, prompt, &mut step);
+                }
+            }
+            UiCommand::RequestSavedChats => self.handle_request_saved_chats(&mut step),
+            UiCommand::DeleteConversation { conversation } => {
+                self.handle_delete_conversation(conversation, &mut step)
+            }
+            UiCommand::RenameConversation { conversation, name } => {
+                self.handle_rename_conversation(conversation, name, &mut step)
+            }
             UiCommand::ResumeConversation { conversation } => {
                 self.handle_resume_conversation(conversation, &mut step)
             }
@@ -648,17 +696,18 @@ impl TeamRuntime {
         step
     }
 
+    /// The one-line transcript notice for a mode switch: what the mode does,
+    /// or, when this roster cannot run it, why in plain words.
     fn mode_switch_notice(&self, mode: TerminalMode) -> String {
-        match mode {
-            TerminalMode::Normal => {
-                "mode → normal — next plain text uses the last @target".to_string()
-            }
-            _ => {
-                let binding = format_mode_binding(&self.effective_config(), mode);
-                format!(
-                    "mode → {mode} — next plain text starts this run ({binding}); @member still sends directly"
-                )
-            }
+        if mode == TerminalMode::Normal {
+            return "Mode: normal — plain text goes to the agent you're viewing".to_string();
+        }
+        let config = self.effective_config();
+        let binding = format_mode_binding(&config, mode);
+        if mode_binding_is_error(&config, mode) {
+            format!("Mode: {mode} — can't run with this roster yet: {binding}")
+        } else {
+            format!("Mode: {mode} — next plain text starts a run ({binding})")
         }
     }
 
@@ -717,7 +766,7 @@ impl TeamRuntime {
             )));
             return;
         }
-        step.persist_team = Some(strip_team_protocols(self.config.clone()));
+        step.persist_team = Some(strip_team_protocols(self.config.without_sub_agents()));
         step.events.push(self.emit_modes_updated());
         step.events.push(RuntimeEvent::Notice(format!(
             "saved {mode} defaults to team.json"
@@ -908,11 +957,16 @@ impl TeamRuntime {
                 if let Some(running) = &state.running {
                     running.cancel.store(true, Ordering::Relaxed);
                     let queued = state.queue.len();
-                    step.events.push(RuntimeEvent::Notice(if queued == 0 {
-                        format!("cancelling {member}")
-                    } else {
-                        format!("cancelling {member} · {queued} queued message(s) will send next")
-                    }));
+                    step.events.push(RuntimeEvent::MemberNotice {
+                        member: member.clone(),
+                        text: if queued == 0 {
+                            format!("cancelling {member}")
+                        } else {
+                            format!(
+                                "cancelling {member} · {queued} queued message(s) will send next"
+                            )
+                        },
+                    });
                     None
                 } else if !state.queue.is_empty() {
                     state.queue.pop_front()
@@ -932,7 +986,7 @@ impl TeamRuntime {
             };
             if let Some(queued) = start_queued {
                 self.emit_queue_updated(&member, step);
-                self.start_run(&member, queued.turn, queued.prompt, step);
+                self.start_run(&member, queued.turn, queued.prompt, queued.origin, step);
             }
         }
         if roster_changed {
@@ -950,23 +1004,40 @@ impl TeamRuntime {
         }
     }
 
-    fn handle_new_session(&mut self, step: &mut RuntimeStep) {
+    /// Where `/new <prompt>` sends its prompt: the main member (else the first
+    /// top-level member), or the team's default target when neither exists.
+    fn main_message_target(&self) -> MessageTarget {
+        self.config
+            .members
+            .iter()
+            .find(|member| member.id.as_str() == MAIN_MEMBER_ID)
+            .or_else(|| self.config.members.iter().find(|m| m.parent.is_none()))
+            .map_or(MessageTarget::Default, |member| {
+                MessageTarget::Member(member.id.clone())
+            })
+    }
+
+    /// Start a fresh chat. Returns whether it did; a refusal has already
+    /// pushed its notice.
+    fn handle_new_session(&mut self, step: &mut RuntimeStep) -> bool {
         if self.has_active_work() {
             step.events.push(RuntimeEvent::Notice(
                 "cannot start a new chat while members or runs are active; press Esc to cancel work first"
                     .to_string(),
             ));
-            return;
+            return false;
         }
         if let Err(err) = self.persist_conversation_snapshot() {
             step.events.push(RuntimeEvent::Notice(format!(
                 "could not save the current chat before /new: {err}"
             )));
-            return;
+            return false;
         }
         // A fresh chat: a new conversation (so the transcript starts clean and
         // restart shows only this chat) plus new backend sessions for everyone.
-        let mut snapshot_team = strip_team_protocols(self.config.clone());
+        // Sub-agents belong to the chat being left; the new one starts with
+        // the top-level members only.
+        let mut snapshot_team = strip_team_protocols(self.config.without_sub_agents());
         for member in &mut snapshot_team.members {
             member.session_id = None;
             member.session_policy = SessionPolicy::Fresh;
@@ -981,15 +1052,40 @@ impl TeamRuntime {
                 step.events.push(RuntimeEvent::Notice(format!(
                     "could not start a new chat: {err}"
                 )));
-                return;
+                return false;
             }
         }
         let previous_mode = self.active_mode;
         self.active_mode = TerminalMode::Normal;
         self.sessions = SessionRegistry::new();
+        let removed_sub_agents: Vec<MemberId> = self
+            .config
+            .members
+            .iter()
+            .filter(|member| member.parent.is_some())
+            .map(|member| member.id.clone())
+            .collect();
+        self.config.members.retain(|member| member.parent.is_none());
+        for id in &removed_sub_agents {
+            self.members.remove(id);
+            step.runner_changes.push(RunnerChange::Remove(id.clone()));
+        }
         for member in &mut self.config.members {
             member.session_id = None;
             member.session_policy = SessionPolicy::Fresh;
+        }
+        if !removed_sub_agents.is_empty() {
+            // Parents' protocol text lists their sub-agents; refresh it.
+            inject_team_protocol(&mut self.config);
+            if let Err(err) = self.store.upsert_team(&self.config) {
+                self.report_store_error("update the saved roster", err, step);
+            }
+            for member in self.config.members.clone() {
+                step.runner_changes.push(RunnerChange::Upsert {
+                    member: Box::new(member),
+                    workspace: self.config.workspace.clone(),
+                });
+            }
         }
         for state in self.members.values_mut() {
             state.status = MemberStatus::Idle;
@@ -1006,20 +1102,89 @@ impl TeamRuntime {
             });
         }
         step.events.push(RuntimeEvent::SessionReset);
+        if !removed_sub_agents.is_empty() {
+            step.events.push(self.ready_event());
+        }
         step.events.push(self.emit_modes_updated());
         self.note_roster_write(step);
+        true
     }
 
-    fn handle_request_resume(&self, step: &mut RuntimeStep) {
-        self.persist_snapshot_or_notice("save the current chat", step);
+    fn handle_request_saved_chats(&self, step: &mut RuntimeStep) {
         match self.store.resumable_conversations() {
-            Ok(conversations) => step
-                .events
-                .push(RuntimeEvent::ResumeChoices { conversations }),
+            Ok(conversations) => step.events.push(RuntimeEvent::SavedChats { conversations }),
             Err(err) => step.events.push(RuntimeEvent::Notice(format!(
                 "could not list saved chats: {err}"
             ))),
         }
+    }
+
+    /// The event telling the TUI the current chat's name, when it has one
+    /// (an unnamed chat is the default, so nothing is sent for it).
+    pub fn chat_name_event(&self) -> Option<RuntimeEvent> {
+        let name = self
+            .store
+            .conversation_name(self.store.active_conversation())
+            .ok()
+            .flatten()?;
+        Some(RuntimeEvent::ConversationRenamed { name: Some(name) })
+    }
+
+    fn handle_delete_conversation(&mut self, conversation: i64, step: &mut RuntimeStep) {
+        if conversation == self.store.active_conversation() {
+            step.events.push(RuntimeEvent::Notice(
+                "cannot delete the current chat".to_string(),
+            ));
+            return;
+        }
+        match self.store.delete_conversation(conversation) {
+            Ok(true) => {}
+            Ok(false) => step.events.push(RuntimeEvent::Notice(format!(
+                "saved chat {conversation} is no longer available"
+            ))),
+            Err(err) => {
+                self.report_store_error("delete the saved chat", err, step);
+                return;
+            }
+        }
+        self.handle_request_saved_chats(step);
+    }
+
+    fn handle_rename_conversation(
+        &mut self,
+        conversation: Option<i64>,
+        name: Option<String>,
+        step: &mut RuntimeStep,
+    ) {
+        let current = self.store.active_conversation();
+        let target = conversation.unwrap_or(current);
+        let name = name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        match self.store.set_conversation_name(target, name.as_deref()) {
+            Ok(true) => {}
+            Ok(false) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "saved chat {target} is no longer available"
+                )));
+                return;
+            }
+            Err(err) => {
+                self.report_store_error("rename the chat", err, step);
+                return;
+            }
+        }
+        if target == current {
+            step.events
+                .push(RuntimeEvent::ConversationRenamed { name: name.clone() });
+            if conversation.is_none() {
+                step.events.push(RuntimeEvent::Notice(match &name {
+                    Some(name) => format!("named this chat \"{name}\""),
+                    None => "cleared this chat's name".to_string(),
+                }));
+            }
+        }
+        self.handle_request_saved_chats(step);
     }
 
     fn handle_resume_conversation(&mut self, conversation: i64, step: &mut RuntimeStep) {
@@ -1070,15 +1235,9 @@ impl TeamRuntime {
                 return;
             }
         };
-        let restored_sessions: Vec<StoredConversationSession> = snapshot
-            .sessions
-            .into_iter()
-            .filter(|saved| {
-                raw_config
-                    .find(saved.member.as_str())
-                    .is_some_and(|member| member.backend == saved.backend)
-            })
-            .collect();
+        let restored_registry =
+            SessionRegistry::from_stored_for(&snapshot.sessions, &raw_config.members);
+        let restored_sessions = restored_registry.to_stored(&raw_config.members);
         let mut operational_config = raw_config.clone();
         inject_team_protocol(&mut operational_config);
         let rejected = match self.store.activate_runtime_team_state(
@@ -1113,10 +1272,13 @@ impl TeamRuntime {
             .iter()
             .map(|member| (member.id.clone(), MemberState::new(member.effort)))
             .collect();
-        self.sessions = SessionRegistry::new();
-        for saved in restored_sessions {
-            self.sessions
-                .set(saved.member, AgentSessionId(saved.session_id));
+        self.sessions = restored_registry;
+        // A chat saved before watermarks existed: its sessions saw all of it.
+        if self
+            .sessions
+            .resolve_unknown_seen(self.store.latest_message_id().unwrap_or(0))
+        {
+            self.persist_session_rows_or_notice(step);
         }
         self.relay = RelayGuard::new(self.config.max_auto_relays);
         self.paused_routes.clear();
@@ -1129,18 +1291,16 @@ impl TeamRuntime {
         self.last_user = None;
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
-                member,
+                member: Box::new(member),
                 workspace: self.config.workspace.clone(),
             });
         }
-        step.persist_team = Some(raw_config);
+        step.persist_team = Some(raw_config.without_sub_agents());
         step.events
             .push(RuntimeEvent::ConversationResumed { conversation, chat });
+        step.events.extend(self.chat_name_event());
         step.events.push(self.ready_event());
         step.events.push(RuntimeEvent::ModeChanged { mode });
-        step.events.push(RuntimeEvent::Notice(format!(
-            "resumed saved chat {conversation}"
-        )));
         self.note_roster_write(step);
     }
 
@@ -1156,19 +1316,7 @@ impl TeamRuntime {
             return Ok(());
         }
         let team = strip_team_protocols(config.clone());
-        let sessions = config
-            .members
-            .iter()
-            .filter_map(|member| {
-                self.sessions
-                    .get(&member.id)
-                    .map(|session| StoredConversationSession {
-                        member: member.id.clone(),
-                        backend: member.backend,
-                        session_id: session.0,
-                    })
-            })
-            .collect::<Vec<_>>();
+        let sessions = self.sessions.to_stored(&config.members);
         self.store.save_conversation_snapshot(
             &team,
             &sessions,
@@ -1180,6 +1328,81 @@ impl TeamRuntime {
     fn persist_snapshot_or_notice(&self, context: &str, step: &mut RuntimeStep) {
         if let Err(err) = self.persist_conversation_snapshot() {
             self.report_store_error(context, err, step);
+        }
+    }
+
+    /// Save the session ids with their watermarks and refresh the chat snapshot.
+    fn persist_session_rows_or_notice(&self, step: &mut RuntimeStep) {
+        if let Err(err) = self
+            .store
+            .save_session_rows(&self.sessions.to_stored(&self.config.members))
+        {
+            self.report_store_error("save the session watermarks", err, step);
+        }
+        self.persist_snapshot_or_notice("save the chat session", step);
+    }
+
+    /// Note that the member's native session has now seen the chat up to its
+    /// newest message: it took part in everything the member's conversation
+    /// holds. The watermark only moves forward and is saved with the session.
+    fn advance_seen(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        if self.sessions.get(member).is_none() {
+            return;
+        }
+        let latest = match self.store.latest_message_id() {
+            Ok(latest) => latest,
+            Err(err) => {
+                self.report_store_error("read the chat position", err, step);
+                return;
+            }
+        };
+        if self.sessions.seen(member) >= latest {
+            return;
+        }
+        self.sessions.mark_seen(member, latest);
+        if let Err(err) = self.store.set_session_seen(member, latest) {
+            self.report_store_error("save the session watermark", err, step);
+        }
+        self.persist_snapshot_or_notice("save the chat session", step);
+    }
+
+    /// A recap of the part of `member`'s conversation after `seen`, left out
+    /// the rows of `skip_turn` (the message being sent now). `None` when
+    /// there is nothing to carry over.
+    fn recap_since(
+        &self,
+        member: &MemberId,
+        seen: i64,
+        skip_turn: Option<TurnId>,
+        config: &TeamConfig,
+    ) -> Result<Option<Recap>, rusqlite::Error> {
+        let items: Vec<ChatItem> = self
+            .store
+            .history_after(seen, skip_turn)?
+            .into_iter()
+            .map(|entry| entry.item)
+            .collect();
+        Ok(context_recap::build_recap(&items, member, config))
+    }
+
+    /// `prompt`, with a recap of what the member's current native session has
+    /// not seen in front of it. The recap is for the model only; it is not
+    /// stored and not shown.
+    fn prompt_with_recap(
+        &self,
+        member: &MemberId,
+        turn: TurnId,
+        prompt: String,
+        step: &mut RuntimeStep,
+    ) -> String {
+        let seen = self.sessions.seen(member);
+        match self.recap_since(member, seen, Some(turn), &self.config) {
+            Ok(Some(recap)) => recap.prepend_to(&prompt),
+            Ok(None) => prompt,
+            Err(err) => {
+                self.report_store_error("read the earlier conversation", err, step);
+                prompt
+            }
         }
     }
 
@@ -1223,8 +1446,48 @@ impl TeamRuntime {
         default_target: Option<DefaultTarget>,
         step: &mut RuntimeStep,
     ) {
+        self.replace_team(members, default_target, true, step);
+    }
+
+    /// Carry the conversation's sub-agents across a roster edit that only
+    /// knows the top-level members (the `/team` editor). A sub-agent the edit
+    /// does mention (a `/model` change) is taken as given.
+    fn with_existing_sub_agents(&self, mut members: Vec<TeamMember>) -> Vec<TeamMember> {
+        let mentioned: HashSet<MemberId> = members.iter().map(|member| member.id.clone()).collect();
+        let previous = strip_team_protocols(self.config.clone());
+        members.extend(
+            previous
+                .members
+                .into_iter()
+                .filter(|member| member.parent.is_some() && !mentioned.contains(&member.id)),
+        );
+        members
+    }
+
+    /// Replace the live roster with `members` (top-level members and
+    /// sub-agents). A sub-agent whose parent is not a top-level member of the
+    /// new roster is dropped with it. Returns whether the roster was applied.
+    fn replace_team(
+        &mut self,
+        members: Vec<TeamMember>,
+        default_target: Option<DefaultTarget>,
+        announce: bool,
+        step: &mut RuntimeStep,
+    ) -> bool {
         let mut raw_config = self.config.clone();
         raw_config.members = self.merge_member_config(members);
+        let top_level: HashSet<MemberId> = raw_config
+            .members
+            .iter()
+            .filter(|member| member.parent.is_none())
+            .map(|member| member.id.clone())
+            .collect();
+        raw_config.members.retain(|member| {
+            member
+                .parent
+                .as_ref()
+                .is_none_or(|parent| top_level.contains(parent))
+        });
         raw_config.default_target = default_target.or_else(|| {
             raw_config
                 .members
@@ -1236,7 +1499,7 @@ impl TeamRuntime {
         if let Err(err) = raw_config.validate() {
             step.events
                 .push(RuntimeEvent::Notice(format!("team update rejected: {err}")));
-            return;
+            return false;
         }
 
         let previous_raw = strip_team_protocols(self.config.clone());
@@ -1251,7 +1514,7 @@ impl TeamRuntime {
                 step.events.push(RuntimeEvent::Notice(format!(
                     "cannot remove {removed} while it is active"
                 )));
-                return;
+                return false;
             }
         }
 
@@ -1269,7 +1532,7 @@ impl TeamRuntime {
                     "cannot update {} while it is active",
                     member.id
                 )));
-                return;
+                return false;
             }
         }
 
@@ -1280,19 +1543,35 @@ impl TeamRuntime {
             .cloned()
             .map(|member| (member.id.clone(), member))
             .collect();
-        let reset_session_ids: Vec<MemberId> = raw_config
-            .members
-            .iter()
-            .filter(|member| {
-                old_members.get(&member.id).is_some_and(|old| {
-                    old.backend != member.backend
-                        || (old.session_policy != SessionPolicy::Fresh
-                            && member.session_policy == SessionPolicy::Fresh)
-                        || old.session_id != member.session_id
-                })
-            })
-            .map(|member| member.id.clone())
-            .collect();
+        // The sessions after this edit. A CLI switch parks the old CLI's
+        // session (it stays resumable if the member switches back) and starts
+        // the new CLI with nothing seen; same-CLI model changes keep the
+        // session and its watermark, so they carry the conversation as is.
+        let latest_message = self.store.latest_message_id().unwrap_or(0);
+        let mut next_registry = self.sessions.clone();
+        for member in &raw_config.members {
+            let Some(old) = old_members.get(&member.id) else {
+                continue;
+            };
+            if old.backend != member.backend {
+                next_registry.switch_backend(&member.id, old.backend, member.backend);
+            } else if member.session_id.is_none()
+                && ((old.session_policy != SessionPolicy::Fresh
+                    && member.session_policy == SessionPolicy::Fresh)
+                    || old.session_id.is_some())
+            {
+                next_registry.clear(&member.id);
+            }
+        }
+        for member in &raw_config.members {
+            // A session named in the roster carries its own history.
+            if let Some(id) = &member.session_id {
+                let session = AgentSessionId(id.clone());
+                if next_registry.get(&member.id).as_ref() != Some(&session) {
+                    next_registry.set_external(member.id.clone(), session, latest_message);
+                }
+            }
+        }
 
         let removed_ids: Vec<MemberId> = old_ids.difference(&new_ids).cloned().collect();
         let removed_set: HashSet<MemberId> = removed_ids.iter().cloned().collect();
@@ -1318,26 +1597,28 @@ impl TeamRuntime {
             .map(|(id, _, _)| *id)
             .chain(native_to_reject.iter().copied())
             .collect();
-        let next_sessions: Vec<StoredConversationSession> = raw_config
-            .members
-            .iter()
-            .filter_map(|member| {
-                let session_id = member.session_id.clone().or_else(|| {
-                    (!reset_session_ids.contains(&member.id))
-                        .then(|| {
-                            self.sessions
-                                .get(&member.id)
-                                .map(|session| session.0.clone())
-                        })
+        for removed in &removed_ids {
+            next_registry.drop_member(removed);
+        }
+        // A CLI switch whose recap will have to drop the oldest messages is
+        // told to the user with the confirmation below.
+        let partial_recap = announce
+            && raw_config.members.iter().any(|member| {
+                old_members
+                    .get(&member.id)
+                    .is_some_and(|old| old.backend != member.backend)
+                    && self
+                        .recap_since(
+                            &member.id,
+                            next_registry.seen(&member.id),
+                            None,
+                            &raw_config,
+                        )
+                        .ok()
                         .flatten()
-                })?;
-                Some(StoredConversationSession {
-                    member: member.id.clone(),
-                    backend: member.backend,
-                    session_id,
-                })
-            })
-            .collect();
+                        .is_some_and(|recap| recap.truncated)
+            });
+        let next_sessions = next_registry.to_stored(&raw_config.members);
         let mut operational_config = raw_config.clone();
         inject_team_protocol(&mut operational_config);
         if let Err(err) = self.store.replace_runtime_team_state(
@@ -1349,7 +1630,7 @@ impl TeamRuntime {
             &approval_ids,
         ) {
             self.report_store_error("save the updated team atomically", err, step);
-            return;
+            return false;
         }
 
         let mut cleanup_turns: HashSet<TurnId> = approvals_to_reject
@@ -1404,13 +1685,7 @@ impl TeamRuntime {
             step.runner_changes.push(RunnerChange::Remove(id.clone()));
         }
 
-        self.sessions = SessionRegistry::new();
-        for saved in &next_sessions {
-            self.sessions.set(
-                saved.member.clone(),
-                AgentSessionId(saved.session_id.clone()),
-            );
-        }
+        self.sessions = next_registry;
 
         for member in &raw_config.members {
             self.members
@@ -1423,20 +1698,24 @@ impl TeamRuntime {
         self.manual_approvals |= self.config.approvals.manual;
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
-                member,
+                member: Box::new(member),
                 workspace: self.config.workspace.clone(),
             });
         }
         for turn in cleanup_turns {
             self.check_turn_complete(turn, step);
         }
-        step.persist_team = Some(raw_config);
+        step.persist_team = Some(raw_config.without_sub_agents());
         step.events.push(self.ready_event());
-        step.events.push(RuntimeEvent::Notice(format!(
-            "team updated: {} member(s)",
-            self.config.members.len()
-        )));
+        if announce {
+            let mut text = format!("team updated: {} member(s)", self.config.members.len());
+            if partial_recap {
+                text.push_str(&format!(" · {NOT_CARRIED_OVER}"));
+            }
+            step.events.push(RuntimeEvent::Notice(text));
+        }
         self.note_roster_write(step);
+        true
     }
 
     fn merge_member_config(&self, members: Vec<TeamMember>) -> Vec<TeamMember> {
@@ -1572,6 +1851,8 @@ impl TeamRuntime {
             )));
         }
         step.events.push(RuntimeEvent::TurnFinished { turn });
+        // The imported messages come from the member's own native session.
+        self.advance_seen(&id, step);
     }
 
     fn handle_import_session(
@@ -1612,10 +1893,15 @@ impl TeamRuntime {
         }
         let count = native.len();
         let agent_session = AgentSessionId(session_id.clone());
-        self.sessions.set(member_id.clone(), agent_session.clone());
+        // An imported session carries its own history, so the chat so far
+        // counts as seen by it.
+        let latest = self.store.latest_message_id().unwrap_or(0);
+        self.sessions
+            .set_external(member_id.clone(), agent_session.clone(), latest);
         let _ = self
             .store
             .upsert_session(&member_id, backend, &agent_session);
+        let _ = self.store.set_session_seen(&member_id, latest);
         let _ = self
             .store
             .set_native_import_cursor(&member_id, &agent_session, count);
@@ -1850,7 +2136,13 @@ impl TeamRuntime {
                 route.to_labels.join(", ")
             )));
             for member in route.to_members {
-                self.enqueue_prompt(&member, route.turn, route.prompt.clone(), step);
+                self.enqueue_prompt_from(
+                    &member,
+                    route.turn,
+                    route.prompt.clone(),
+                    Some(route.from.clone()),
+                    step,
+                );
             }
         } else {
             step.events.push(RuntimeEvent::Notice(format!(
@@ -2271,6 +2563,7 @@ impl TeamRuntime {
 
         let has_controls = !parsed.messages.is_empty()
             || !parsed.members.is_empty()
+            || !parsed.spawns.is_empty()
             || !parsed.run_steps.is_empty()
             || !parsed.reviews.is_empty()
             || !parsed.brainstorm_votes.is_empty()
@@ -2282,9 +2575,12 @@ impl TeamRuntime {
                 .and_then(|state| state.running.as_ref())
                 .is_some_and(|running| running.raw_persistence_failed);
             if raw_persistence_failed {
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "ignored controls from {member} because their raw source could not be saved"
-                )));
+                step.events.push(RuntimeEvent::MemberNotice {
+                    member: member.clone(),
+                    text: format!(
+                        "ignored controls from {member} because their raw source could not be saved"
+                    ),
+                });
                 self.fail_completed_message(member, msg, step);
                 return;
             }
@@ -2299,9 +2595,12 @@ impl TeamRuntime {
             let extra = parsed.brainstorm_cards.len().saturating_sub(limit);
             if extra > 0 {
                 parsed.brainstorm_cards.truncate(limit);
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "{member} emitted {extra} extra brainstorm card(s); kept {limit}"
-                )));
+                step.events.push(RuntimeEvent::MemberNotice {
+                    member: member.clone(),
+                    text: format!(
+                        "{member} emitted {extra} extra brainstorm card(s); kept {limit}"
+                    ),
+                });
             }
         }
         let visible_text =
@@ -2331,12 +2630,18 @@ impl TeamRuntime {
         {
             running.message = None;
             running.text.clear();
+            if !visible_text.trim().is_empty() {
+                running.last_reply = visible_text.clone();
+            }
         }
 
         self.mode_record_message(member, turn, &visible_text, &parsed, step);
 
         for member_request in parsed.members {
             self.request_team_member_from_agent(member, turn, member_request, step);
+        }
+        for spawn in parsed.spawns {
+            self.handle_spawn(member, turn, spawn, step);
         }
         let mut checklist_run = None;
         for request in parsed.run_steps {
@@ -2345,10 +2650,10 @@ impl TeamRuntime {
             }
         }
         if let Some(run) = checklist_run {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{member} updated {} checklist",
-                run.label()
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: member.clone(),
+                text: format!("{member} updated {} checklist", run.label()),
+            });
         }
         for tmsg in parsed.messages {
             self.route_team_message(member, turn, tmsg, step);
@@ -2385,10 +2690,13 @@ impl TeamRuntime {
             return;
         }
         if self.active_mode == TerminalMode::Team && !self.team_allows_add_members() {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{from} could not add teammate {}: team mode is locked to the current roster",
-                member.id
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: from.clone(),
+                text: format!(
+                    "{from} could not add teammate {}: team mode is locked to the current roster",
+                    member.id
+                ),
+            });
             return;
         }
         self.add_team_member_from_agent(from, member, step);
@@ -2405,17 +2713,23 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) -> bool {
         if self.config.find(member.id.as_str()).is_some() {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{from} could not add teammate {}: member already exists",
-                member.id
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: from.clone(),
+                text: format!(
+                    "{from} could not add teammate {}: member already exists",
+                    member.id
+                ),
+            });
             return false;
         }
         if self.config.find(&member.display_name).is_some() {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{from} could not add teammate {}: display name already exists",
-                member.display_name
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: from.clone(),
+                text: format!(
+                    "{from} could not add teammate {}: display name already exists",
+                    member.display_name
+                ),
+            });
             return false;
         }
         true
@@ -2440,9 +2754,10 @@ impl TeamRuntime {
         self.handle_replace_team(members, default_target, step);
 
         if self.config.member(&id).is_some() {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{from} added teammate {id} ({backend}, {role})"
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: from.clone(),
+                text: format!("{from} added teammate {id} ({backend}, {role})"),
+            });
         }
     }
 
@@ -2497,43 +2812,80 @@ impl TeamRuntime {
             return;
         }
 
-        let prompt = relay_prompt(
-            from,
-            &self.member_display(from),
-            tmsg.kind.as_deref(),
-            &tmsg.body,
-        );
+        self.note_origin_messaged(from, &resolved.members);
+
+        // A parent's sub-agents are told their reply comes back on its own;
+        // everyone else gets the usual relay wording.
+        let from_display = self.member_display(from);
+        let (children, others): (Vec<MemberId>, Vec<MemberId>) =
+            resolved.members.into_iter().partition(|id| {
+                self.config
+                    .member(id)
+                    .is_some_and(|member| member.parent.as_ref() == Some(from))
+            });
+        let mut dispatches: Vec<(Vec<MemberId>, String)> = Vec::new();
+        if !children.is_empty() {
+            dispatches.push((
+                children,
+                sub_agent_task_prompt(from, &from_display, &tmsg.body),
+            ));
+        }
+        if !others.is_empty() {
+            let prompt = if tmsg.kind.as_deref() == Some(HANDBACK_KIND) {
+                handback_prompt(from, &from_display, &tmsg.body)
+            } else {
+                relay_prompt(from, &from_display, tmsg.kind.as_deref(), &tmsg.body)
+            };
+            dispatches.push((others, prompt));
+        }
+
         if self.relay_paused {
-            self.pause_route(
-                turn,
-                from,
-                resolved.members,
-                to_labels,
-                prompt,
-                "relay paused by user",
-                step,
-            );
+            for (members, prompt) in dispatches {
+                self.pause_route_to(turn, from, members, prompt, "relay paused by user", step);
+            }
             return;
         }
         match self.relay.record_auto_relay(turn, from) {
             RelayDecision::Continue { .. } => {
-                for member in resolved.members {
-                    self.enqueue_prompt(&member, turn, prompt.clone(), step);
+                for (members, prompt) in dispatches {
+                    for member in members {
+                        self.enqueue_prompt_from(
+                            &member,
+                            turn,
+                            prompt.clone(),
+                            Some(from.clone()),
+                            step,
+                        );
+                    }
                 }
             }
             RelayDecision::Pause { count } => {
                 // Ungated: resume via /retry is an explicit human decision.
-                self.pause_route(
-                    turn,
-                    from,
-                    resolved.members,
-                    to_labels,
-                    prompt,
-                    &format!("auto-relay limit reached ({count})"),
-                    step,
-                );
+                for (members, prompt) in dispatches {
+                    self.pause_route_to(
+                        turn,
+                        from,
+                        members,
+                        prompt,
+                        &format!("auto-relay limit reached ({count})"),
+                        step,
+                    );
+                }
             }
         }
+    }
+
+    fn pause_route_to(
+        &mut self,
+        turn: TurnId,
+        from: &MemberId,
+        members: Vec<MemberId>,
+        prompt: String,
+        reason: &str,
+        step: &mut RuntimeStep,
+    ) {
+        let labels = members.iter().map(|m| m.to_string()).collect();
+        self.pause_route(turn, from, members, labels, prompt, reason, step);
     }
 
     fn apply_run_step_from_agent(
@@ -2544,9 +2896,10 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) -> Option<crate::domain::event::RunSummary> {
         let Some(run_id) = self.run_turns.get(&turn).copied() else {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{from} ignored run step update: no active run"
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: from.clone(),
+                text: format!("{from} ignored run step update: no active run"),
+            });
             return None;
         };
 
@@ -2559,9 +2912,10 @@ impl TeamRuntime {
         if let Some(owner) = requested_owner
             && self.config.member(owner).is_none()
         {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{from} could not update run {run_id}: unknown step owner {owner}"
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: from.clone(),
+                text: format!("{from} could not update run {run_id}: unknown step owner {owner}"),
+            });
             return None;
         }
 
@@ -2598,15 +2952,17 @@ impl TeamRuntime {
                 Some(run)
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "{from} could not update run {run_id}: step was not found"
-                )));
+                step.events.push(RuntimeEvent::MemberNotice {
+                    member: from.clone(),
+                    text: format!("{from} could not update run {run_id}: step was not found"),
+                });
                 None
             }
             Err(err) => {
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "{from} could not update run {run_id}: {err}"
-                )));
+                step.events.push(RuntimeEvent::MemberNotice {
+                    member: from.clone(),
+                    text: format!("{from} could not update run {run_id}: {err}"),
+                });
                 None
             }
         }
@@ -2658,16 +3014,20 @@ impl TeamRuntime {
             self.complete_message(member, text, step);
         }
 
+        let handback: SubAgentOutcome;
         let (turn, cancelled, failed, permission_denied, denied_reason, permission_noticed) =
             match self.members.get_mut(member).and_then(|s| s.running.take()) {
-                Some(running) => (
-                    running.turn,
-                    running.cancel.load(Ordering::Relaxed),
-                    running.failed,
-                    running.permission_denied,
-                    running.denied_reason,
-                    running.permission_noticed,
-                ),
+                Some(running) => {
+                    handback = SubAgentOutcome::new(&running);
+                    (
+                        running.turn,
+                        running.cancel.load(Ordering::Relaxed),
+                        running.failed,
+                        running.permission_denied,
+                        running.denied_reason,
+                        running.permission_noticed,
+                    )
+                }
                 None => return,
             };
 
@@ -2675,8 +3035,10 @@ impl TeamRuntime {
             // A user-requested cancel kills the process (no exit code); that is
             // expected, not an error.
             self.mode_mark_turn_cancelled(turn);
-            step.events
-                .push(RuntimeEvent::Notice(format!("{member} cancelled")));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: member.clone(),
+                text: format!("{member} cancelled"),
+            });
             true
         } else if failed {
             // A structured backend failure remains authoritative even when the
@@ -2687,9 +3049,12 @@ impl TeamRuntime {
             // exit non-zero; Plan must keep going instead of blocking.
             if !permission_noticed {
                 let reason = denied_reason.unwrap_or_else(|| "a command".to_string());
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "{member} was denied permission to run {reason}; the run continues"
-                )));
+                step.events.push(RuntimeEvent::MemberNotice {
+                    member: member.clone(),
+                    text: format!(
+                        "{member} was denied permission to run {reason}; the run continues"
+                    ),
+                });
             }
             true
         } else if !ok {
@@ -2715,6 +3080,11 @@ impl TeamRuntime {
             state.tools.clear();
             state.status = MemberStatus::Idle;
         }
+        // The native session took the prompt (with any recap) and answered it.
+        // A run that failed outright may not have, so its turn stays unseen.
+        if cancelled || permission_denied || (ok && !failed) {
+            self.advance_seen(member, step);
+        }
         step.events.push(RuntimeEvent::MemberStatus {
             member: member.clone(),
             status: MemberStatus::Idle,
@@ -2724,6 +3094,18 @@ impl TeamRuntime {
 
         if !terminal_state_saved {
             return;
+        }
+
+        // Hand a sub-agent's result back before the turn is judged finished,
+        // so the parent's follow-up run keeps the same turn open.
+        if !cancelled {
+            self.hand_back_to_parent(
+                member,
+                turn,
+                handback,
+                failed || (!ok && !permission_denied),
+                step,
+            );
         }
 
         // Finalize the completed turn before starting unrelated queued work.
@@ -2742,7 +3124,7 @@ impl TeamRuntime {
             .and_then(|s| s.queue.pop_front());
         if let Some(queued) = next {
             self.emit_queue_updated(member, step);
-            self.start_run(member, queued.turn, queued.prompt, step);
+            self.start_run(member, queued.turn, queued.prompt, queued.origin, step);
         }
     }
 
@@ -2777,9 +3159,10 @@ impl TeamRuntime {
             LogEntry::warn(member.as_str(), format!("tool permission denied: {detail}")),
             step,
         );
-        step.events.push(RuntimeEvent::Notice(format!(
-            "{member} was denied permission to run {reason}; the run continues"
-        )));
+        step.events.push(RuntimeEvent::MemberNotice {
+            member: member.clone(),
+            text: format!("{member} was denied permission to run {reason}; the run continues"),
+        });
     }
 
     fn emit_queue_updated(&self, member: &MemberId, step: &mut RuntimeStep) {
@@ -2831,9 +3214,10 @@ impl TeamRuntime {
             .get_mut(&member)
             .and_then(|state| state.queue.pop_back())
         else {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{member} has no queued message"
-            )));
+            step.events.push(RuntimeEvent::MemberNotice {
+                member: member.clone(),
+                text: format!("{member} has no queued message"),
+            });
             return;
         };
         self.check_turn_complete(queued.turn, step);
@@ -2865,6 +3249,19 @@ impl TeamRuntime {
         prompt: String,
         step: &mut RuntimeStep,
     ) {
+        self.enqueue_prompt_from(member, turn, prompt, None, step);
+    }
+
+    /// Enqueue `prompt` for `member`. `origin` is the member that sent it
+    /// (`None` for the user and for engine dispatch).
+    fn enqueue_prompt_from(
+        &mut self,
+        member: &MemberId,
+        turn: TurnId,
+        prompt: String,
+        origin: Option<MemberId>,
+        step: &mut RuntimeStep,
+    ) {
         let stripped_prompt = strip_routing_prefix(&prompt);
         let busy = self
             .members
@@ -2876,12 +3273,13 @@ impl TeamRuntime {
                 state.queue.push_back(QueuedPrompt {
                     turn,
                     prompt: stripped_prompt,
+                    origin,
                 });
             }
             self.emit_queue_updated(member, step);
             self.note_roster_write(step);
         } else {
-            self.start_run(member, turn, stripped_prompt, step);
+            self.start_run(member, turn, stripped_prompt, origin, step);
         }
     }
 
@@ -2890,6 +3288,7 @@ impl TeamRuntime {
         member: &MemberId,
         turn: TurnId,
         prompt: String,
+        origin: Option<MemberId>,
         step: &mut RuntimeStep,
     ) {
         if !self.members.contains_key(member) {
@@ -2930,6 +3329,9 @@ impl TeamRuntime {
                 denied_reason: None,
                 permission_noticed: false,
                 raw_persistence_failed: false,
+                origin,
+                messaged_origin: false,
+                last_reply: String::new(),
             });
             state.status = MemberStatus::Running;
             state.tools.clear();
@@ -2940,6 +3342,7 @@ impl TeamRuntime {
         });
         self.note_roster_write(step);
         let prompt = normalize_backend_command(self.member_backend(member), prompt);
+        let prompt = self.prompt_with_recap(member, turn, prompt, step);
         step.actions.push(RunAction {
             member: member.clone(),
             prompt,
@@ -3020,8 +3423,13 @@ impl TeamRuntime {
         } else {
             member.allowed_tools.join(",")
         };
+        let parent = member
+            .parent
+            .as_ref()
+            .map(|parent| format!(" parent={parent}"))
+            .unwrap_or_default();
         format!(
-            "id={} display_name={:?} backend={} role={:?} status={} model={} effort={} cwd={:?} sandbox={} permission_mode={} session_policy={} allowed_tools={}",
+            "id={} display_name={:?} backend={} role={:?} status={} model={} effort={} cwd={:?} sandbox={} permission_mode={} session_policy={} allowed_tools={}{parent}",
             member.id,
             member.display_name,
             member.backend.as_str(),
@@ -3187,6 +3595,9 @@ include!("team_runtime_runs.inc.rs");
 
 // Collaboration-mode engine (review, plan, brainstorm, and team).
 include!("team_runtime_modes.inc.rs");
+
+// Sub-agents (`@@spawn`) and the automatic hand-back of their results.
+include!("team_runtime_sub_agents.inc.rs");
 
 fn relay_prompt(from: &MemberId, from_display: &str, kind: Option<&str>, body: &str) -> String {
     let reply_instruction = if kind == Some("reply") {

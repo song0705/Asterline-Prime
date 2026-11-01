@@ -234,6 +234,7 @@ pub fn export_chat_items_to_root(
             }
             ChatItem::Thinking { .. }
             | ChatItem::Route { .. }
+            | ChatItem::Spawn { .. }
             | ChatItem::Notice { .. }
             | ChatItem::Error { .. }
             | ChatItem::Verdict { .. } => {}

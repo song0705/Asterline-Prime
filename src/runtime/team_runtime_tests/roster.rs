@@ -346,7 +346,7 @@ fn abort_blocks_team_run_and_continue_resumes_it() {
 fn explicit_run_id_cannot_modify_another_conversation() {
     let mut rt = runtime();
     let old_run = rt.store.create_run("old chat", None).unwrap();
-    let reset = rt.on_ui_command(UiCommand::NewSession);
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert!(
         reset
             .events
@@ -660,7 +660,11 @@ fn batched_run_step_updates_emit_one_checklist_notice() {
         .events
         .iter()
         .filter_map(|event| match event {
-            RuntimeEvent::Notice(text) if text.contains("checklist") => Some(text.as_str()),
+            RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. }
+                if text.contains("checklist") =>
+            {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -781,7 +785,86 @@ fn agent_run_step_envelope_outside_a_run_is_ignored() {
     );
     assert!(step.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::Notice(text)
+        RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. }
             if text.contains("ignored run step update: no active run")
     )));
+}
+
+fn builder_with(model: &str, effort: Option<Effort>, session: Option<&str>) -> Vec<TeamMember> {
+    let mut builder = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
+    builder.model = Some(model.to_string());
+    builder.effort = effort;
+    builder.session_id = session.map(str::to_string);
+    let mut members = team().members;
+    members[0] = builder;
+    members
+}
+
+#[test]
+fn replace_team_effort_reaches_the_next_codex_turn_for_an_existing_session() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+    // The member has a native session and no effort yet.
+    rt.on_ui_command(user("first"));
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::SessionDiscovered(AgentSessionId("thread-1".to_string())),
+    );
+    complete_ok(&mut rt, &builder, "ok");
+    assert_eq!(rt.on_ui_command(user("again")).actions[0].effort, None);
+    complete_ok(&mut rt, &builder, "ok");
+
+    // `/model` pins the model together with the effort the row showed.
+    rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: builder_with("gpt-6.1-sol", Some(Effort::High), Some("thread-1")),
+        default_target: Some(DefaultTarget::Member(builder.clone())),
+    });
+
+    assert_eq!(rt.members.get(&builder).unwrap().effort, Some(Effort::High));
+    assert_eq!(
+        rt.config.member(&builder).unwrap().effort,
+        Some(Effort::High)
+    );
+    let next = rt.on_ui_command(user("after the switch"));
+    let action = &next.actions[0];
+    assert_eq!(action.member, builder);
+    assert_eq!(action.effort, Some(Effort::High));
+    assert_eq!(action.session, Some(AgentSessionId("thread-1".to_string())));
+}
+
+#[test]
+fn replace_team_effort_reaches_the_next_turn_of_a_fresh_session() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+
+    rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: builder_with("gpt-6.1-sol", Some(Effort::Xhigh), None),
+        default_target: Some(DefaultTarget::Member(builder.clone())),
+    });
+    let first = rt.on_ui_command(user("hello"));
+
+    assert_eq!(first.actions[0].effort, Some(Effort::Xhigh));
+    assert_eq!(first.actions[0].session, None);
+    // The Ready event the UI reads carries the same value.
+    assert!(rt.ready_event_members_effort(&builder, Some(Effort::Xhigh)));
+
+    // A later switch to a model with no levels clears it.
+    complete_ok(&mut rt, &builder, "ok");
+    rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: builder_with("gpt-mini", None, None),
+        default_target: Some(DefaultTarget::Member(builder)),
+    });
+    assert_eq!(rt.on_ui_command(user("again")).actions[0].effort, None);
+}
+
+impl TeamRuntime {
+    /// Whether the roster snapshot sent to the UI shows `effort` for `member`.
+    fn ready_event_members_effort(&self, member: &MemberId, effort: Option<Effort>) -> bool {
+        match self.ready_event() {
+            RuntimeEvent::Ready { members, .. } => members
+                .iter()
+                .any(|summary| &summary.id == member && summary.effort == effort),
+            _ => false,
+        }
+    }
 }

@@ -8,9 +8,11 @@ use ratatui::text::{Line, Span};
 
 use crate::domain::event::UiCommand;
 use crate::domain::mode::{
-    BrainstormModeConfig, ModesConfig, PlanModeConfig, ReviewModeConfig, TeamModeConfig,
-    TerminalMode, apply_mode_overrides, format_mode_binding, merge_modes, mode_binding_is_error,
-    mode_field_source, prune_empty_mode_overrides, validate_mode_overrides, validate_terminal_mode,
+    AutoSeat, BrainstormModeConfig, CollabMode, DEFAULT_PARTICIPANT_COUNT, MAX_PARTICIPANT_COUNT,
+    MIN_PARTICIPANT_COUNT, ModesConfig, PlanModeConfig, ReviewModeConfig, TeamModeConfig,
+    TerminalMode, apply_mode_overrides, auto_seat_parent, format_mode_binding, merge_modes,
+    mode_binding_is_error, mode_field_source, prune_empty_mode_overrides, resolve_mode_roles,
+    validate_mode_overrides, validate_terminal_mode,
 };
 use crate::domain::team::{DefaultTarget, MemberId, TeamConfig, TeamMember};
 use crate::tui::team_builder::EditState;
@@ -42,6 +44,7 @@ enum ModeField {
     PlanAutoExecute,
     PlanMaxIterations,
     BrainstormParticipants,
+    BrainstormParticipantCount,
     BrainstormRounds,
     BrainstormIdeas,
     TeamCoordinator,
@@ -68,6 +71,7 @@ impl ModeField {
             ],
             TerminalMode::Brainstorm => &[
                 Self::BrainstormParticipants,
+                Self::BrainstormParticipantCount,
                 Self::BrainstormRounds,
                 Self::BrainstormIdeas,
             ],
@@ -86,6 +90,7 @@ impl ModeField {
             Self::PlanLeader => "leader",
             Self::TeamCoordinator => "coordinator",
             Self::BrainstormParticipants => "participants",
+            Self::BrainstormParticipantCount => "participant_count",
             Self::ReviewMaxIterations | Self::PlanMaxIterations | Self::TeamMaxIterations => {
                 "max_iterations"
             }
@@ -127,6 +132,7 @@ impl ModeField {
             Self::ReviewMaxIterations
                 | Self::PlanMaxIterations
                 | Self::TeamMaxIterations
+                | Self::BrainstormParticipantCount
                 | Self::BrainstormRounds
                 | Self::BrainstormIdeas
         )
@@ -370,8 +376,9 @@ impl ModeEditor {
         self.normalize_field();
         self.field_mode = true;
         if self.fields().is_empty() {
-            self.notice =
-                Some("normal has no knobs — plain text uses the last @target".to_string());
+            self.notice = Some(
+                "normal has no knobs — plain text goes to the agent you're viewing".to_string(),
+            );
         }
     }
 
@@ -525,15 +532,16 @@ impl ModeEditor {
     }
 
     fn open_member_picker(&mut self, multi: bool) {
-        if self.members.is_empty() {
-            self.notice = Some("team has no members".to_string());
-            return;
-        }
         let options = self
             .members
             .iter()
+            .filter(|member| member.parent.is_none())
             .map(|member| (member.id.clone(), member.display_name.clone()))
             .collect::<Vec<_>>();
+        if options.is_empty() {
+            self.notice = Some("team has no members".to_string());
+            return;
+        }
         let current_ids = if multi {
             self.effective_participants()
         } else if let Some(field) = self.selected_field() {
@@ -578,12 +586,14 @@ impl ModeEditor {
     fn number_default(field: ModeField) -> u32 {
         match field {
             ModeField::BrainstormIdeas => 4,
+            ModeField::BrainstormParticipantCount => DEFAULT_PARTICIPANT_COUNT,
             _ => 3,
         }
     }
 
     fn number_bounds(&self, field: ModeField) -> (u32, u32) {
         match field {
+            ModeField::BrainstormParticipantCount => (MIN_PARTICIPANT_COUNT, MAX_PARTICIPANT_COUNT),
             ModeField::BrainstormRounds => (2, MAX_ROUNDS),
             ModeField::BrainstormIdeas => (3, MAX_IDEAS),
             _ => (1, MAX_ITERATIONS),
@@ -605,6 +615,7 @@ impl ModeEditor {
             ModeField::ReviewMaxIterations
             | ModeField::PlanMaxIterations
             | ModeField::TeamMaxIterations
+            | ModeField::BrainstormParticipantCount
             | ModeField::BrainstormRounds
             | ModeField::BrainstormIdeas => {
                 let _ = self.set_number_field(field, None);
@@ -709,6 +720,9 @@ impl ModeEditor {
             ModeField::ReviewMaxIterations => self.review_mut().max_iterations = value,
             ModeField::PlanMaxIterations => self.plan_mut().max_iterations = value,
             ModeField::TeamMaxIterations => self.team_mut().max_iterations = value,
+            ModeField::BrainstormParticipantCount => {
+                self.brainstorm_mut().participant_count = value;
+            }
             ModeField::BrainstormRounds => self.brainstorm_mut().generation_rounds = value,
             ModeField::BrainstormIdeas => self.brainstorm_mut().ideas_per_round = value,
             _ => {}
@@ -794,6 +808,12 @@ impl ModeEditor {
                 .brainstorm
                 .as_ref()
                 .and_then(|cfg| cfg.participants.as_ref())
+                .is_some(),
+            ModeField::BrainstormParticipantCount => self
+                .pending
+                .brainstorm
+                .as_ref()
+                .and_then(|cfg| cfg.participant_count)
                 .is_some(),
             ModeField::BrainstormRounds => self
                 .pending
@@ -890,6 +910,12 @@ impl ModeEditor {
                 .as_ref()
                 .and_then(|cfg| cfg.participants.as_ref())
                 .is_some(),
+            ModeField::BrainstormParticipantCount => self
+                .defaults
+                .brainstorm
+                .as_ref()
+                .and_then(|cfg| cfg.participant_count)
+                .is_some(),
             ModeField::BrainstormRounds => self
                 .defaults
                 .brainstorm
@@ -976,6 +1002,7 @@ impl ModeEditor {
         .unwrap_or_else(|_| {
             self.members
                 .iter()
+                .filter(|member| member.parent.is_none())
                 .map(|member| member.id.clone())
                 .collect()
         })
@@ -999,6 +1026,14 @@ impl ModeEditor {
             ModeField::TeamMaxIterations => crate::domain::mode::resolve_team_limits(&config)
                 .ok()
                 .map(|limits| limits.max_iterations),
+            ModeField::BrainstormParticipantCount => Some(
+                config
+                    .modes
+                    .brainstorm
+                    .as_ref()
+                    .and_then(|cfg| cfg.participant_count)
+                    .unwrap_or(DEFAULT_PARTICIPANT_COUNT),
+            ),
             ModeField::BrainstormRounds => crate::domain::mode::resolve_mode_roles(
                 &config,
                 crate::domain::mode::CollabMode::Brainstorm,
@@ -1037,13 +1072,27 @@ impl ModeEditor {
         }
     }
 
+    /// Sub-agents the selected mode would open right now.
+    fn auto_seats(&self) -> Vec<AutoSeat> {
+        let mode = match self.selected_mode() {
+            TerminalMode::Review => CollabMode::Review,
+            TerminalMode::Brainstorm => CollabMode::Brainstorm,
+            _ => return Vec::new(),
+        };
+        resolve_mode_roles(&self.preview_config(), mode)
+            .map(|(roles, _)| roles.auto_seats)
+            .unwrap_or_default()
+    }
+
+    fn new_seat_note(&self) -> String {
+        let config = self.preview_config();
+        format!(
+            "new sub-agent, {}'s model",
+            self.member_name(&auto_seat_parent(&config))
+        )
+    }
+
     fn field_value_text(&self, field: ModeField) -> (String, Option<String>) {
-        if field == ModeField::PlanBuilder && self.effective_member(field).is_none() {
-            return (
-                String::new(),
-                Some("required — choose a builder".to_string()),
-            );
-        }
         if field == ModeField::PlanReviewer && self.effective_member(field).is_none() {
             return (
                 String::new(),
@@ -1051,19 +1100,31 @@ impl ModeEditor {
             );
         }
         if field.is_member() {
+            let seats = self.auto_seats();
             let name = self
                 .effective_member(field)
-                .map(|id| self.member_name(&id))
+                .map(|id| match seats.iter().find(|seat| seat.id == id) {
+                    Some(seat) => format!("{} ({})", seat.display_name(), self.new_seat_note()),
+                    None => self.member_name(&id),
+                })
                 .unwrap_or_else(|| "—".to_string());
             return (name, None);
         }
         if field.is_participants() {
-            let names = self
+            let seats = self.auto_seats();
+            let mut names = self
                 .effective_participants()
                 .iter()
-                .map(|id| self.member_name(id))
+                .map(|id| match seats.iter().find(|seat| &seat.id == id) {
+                    Some(seat) => seat.display_name(),
+                    None => self.member_name(id),
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
+            if !seats.is_empty() {
+                let plural = if seats.len() == 1 { "" } else { "s" };
+                names.push_str(&format!(" ({} new sub-agent{plural})", seats.len()));
+            }
             return (names, None);
         }
         if field.is_number() {
@@ -1124,7 +1185,7 @@ impl ModeEditor {
         let mut lines = Vec::new();
         let dirty = if self.dirty() { "modified" } else { "saved" };
         lines.push(Line::from(vec![
-            Span::styled(" Mode  ", theme::accent_bold()),
+            Span::styled("  Mode  ", theme::accent_bold()),
             Span::styled(format!("(this chat: {})", self.active_mode), theme::muted()),
             Span::raw("  "),
             Span::styled(
@@ -1139,24 +1200,9 @@ impl ModeEditor {
         if let Some(banner) = run_banner {
             lines.push(Line::styled(format!(" {banner}"), theme::warning()));
         }
-        lines.push(Line::styled(
-            if self.member_picker.is_some() {
-                if self.member_picker.as_ref().is_some_and(|p| p.multi) {
-                    " ↑/↓ member · Space toggle · Enter confirm · Esc cancel"
-                } else {
-                    " ↑/↓ member · Enter choose · Esc cancel"
-                }
-            } else if self.field_mode {
-                " ↑/↓ field · Enter edit · ←/→ step · r revert · s select + apply · w team.json · Esc list"
-            } else {
-                " ↑/↓ select · Enter fields · Esc close"
-            },
-            theme::muted(),
-        ));
         if let Some(notice) = &self.notice {
             lines.push(Line::styled(format!(" {notice}"), theme::warning()));
         }
-        lines.push(Line::raw(""));
 
         if let Some(picker) = &self.member_picker {
             lines.extend(member_picker_lines(picker));
@@ -1214,7 +1260,7 @@ impl ModeEditor {
             ));
             if matches!(mode, TerminalMode::Normal) {
                 lines.push(Line::styled(
-                    " Plain text goes to the last @target. Collaboration runs stay off.",
+                    " Plain text goes to the agent you're viewing. Collaboration runs stay off.",
                     theme::muted(),
                 ));
             }
@@ -1310,7 +1356,7 @@ fn member_picker_lines(picker: &MemberPicker) -> Vec<Line<'static>> {
                 },
             ),
             Span::styled(format!("{name} "), style),
-            Span::styled(format!("@{id}"), theme::muted()),
+            Span::styled(id.to_string(), theme::muted()),
         ]));
     }
     lines
@@ -1462,7 +1508,7 @@ mod tests {
         );
         editor.selected = 3; // brainstorm
         editor.enter_fields();
-        editor.field = 1; // rounds
+        editor.field = 2; // rounds
         editor.handle_key(KeyCode::Left, KeyModifiers::NONE);
         assert_eq!(
             editor
@@ -1500,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_builder_is_required_and_reviewer_is_optional() {
+    fn plan_builder_defaults_to_the_leader_and_reviewer_is_optional() {
         let mut editor = editor();
         editor.selected = 2; // plan
         editor.enter_fields();
@@ -1508,10 +1554,7 @@ mod tests {
 
         assert_eq!(
             editor.field_value_text(ModeField::PlanBuilder),
-            (
-                String::new(),
-                Some("required — choose a builder".to_string())
-            )
+            ("planner".to_string(), None)
         );
 
         editor.set_member_field(ModeField::PlanBuilder, Some(MemberId::new("builder")));
@@ -1526,5 +1569,105 @@ mod tests {
                 Some("not set — skip plan review".to_string())
             )
         );
+    }
+
+    fn lone_main_editor(active: TerminalMode, sub_agents: Vec<TeamMember>) -> ModeEditor {
+        let mut members = vec![TeamMember::new(
+            "main",
+            "Main",
+            BackendKind::Codex,
+            "general",
+        )];
+        members.extend(sub_agents);
+        ModeEditor::new(
+            "solo",
+            "/tmp/ws",
+            Some(DefaultTarget::Member(MemberId::new("main"))),
+            members,
+            ModesConfig::default(),
+            ModesConfig::default(),
+            active,
+        )
+    }
+
+    #[test]
+    fn unset_reviewer_shows_the_sub_agent_it_resolves_to() {
+        let mut editor = lone_main_editor(TerminalMode::Review, Vec::new());
+        editor.selected = 1; // review
+        assert_eq!(
+            editor.field_value_text(ModeField::ReviewReviewer).0,
+            "Reviewer (new sub-agent, Main's model)"
+        );
+        let rows = editor
+            .lines(None)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rows.contains("reviewer Reviewer (new sub-agent, Main's model)"),
+            "{rows}"
+        );
+
+        let mut existing = member("reviewer", "sub-agent");
+        existing.display_name = "Reviewer".to_string();
+        existing.parent = Some(MemberId::new("main"));
+        let mut editor = lone_main_editor(TerminalMode::Review, vec![existing]);
+        editor.selected = 1;
+        assert_eq!(
+            editor.field_value_text(ModeField::ReviewReviewer).0,
+            "Reviewer"
+        );
+        // The pickers offer top-level members only.
+        editor.enter_fields();
+        editor.field = 1;
+        editor.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(editor.member_picker().unwrap().options().len(), 1);
+    }
+
+    #[test]
+    fn participant_count_field_steps_within_two_to_nine() {
+        let mut editor = lone_main_editor(TerminalMode::Brainstorm, Vec::new());
+        editor.selected = 3; // brainstorm
+        editor.enter_fields();
+        editor.field = 1;
+        assert_eq!(
+            editor.selected_field(),
+            Some(ModeField::BrainstormParticipantCount)
+        );
+        assert_eq!(
+            editor
+                .field_value_text(ModeField::BrainstormParticipantCount)
+                .0,
+            "3"
+        );
+        for _ in 0..20 {
+            editor.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        }
+        let count = |editor: &ModeEditor| {
+            editor
+                .pending
+                .brainstorm
+                .as_ref()
+                .and_then(|cfg| cfg.participant_count)
+        };
+        assert_eq!(count(&editor), Some(9));
+        for _ in 0..20 {
+            editor.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        }
+        assert_eq!(count(&editor), Some(2));
+        assert!(
+            editor
+                .set_number_field(ModeField::BrainstormParticipantCount, Some(10))
+                .is_err()
+        );
+        assert!(
+            editor
+                .set_number_field(ModeField::BrainstormParticipantCount, Some(1))
+                .is_err()
+        );
+        editor.handle_key(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(count(&editor), None);
+        assert!(!editor.dirty());
     }
 }

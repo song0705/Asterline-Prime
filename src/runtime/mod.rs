@@ -7,6 +7,7 @@
 
 pub mod agent_runner;
 pub mod approval;
+pub mod context_recap;
 pub mod mode_prompts;
 pub mod session_registry;
 pub mod team_runtime;
@@ -369,6 +370,7 @@ fn run_loop(
     let mut agent_workers: Vec<JoinHandle<()>> = Vec::new();
     let mut pending_events = VecDeque::new();
     let mut startup_events = vec![runtime.ready_event()];
+    startup_events.extend(runtime.chat_name_event());
     if runtime.active_mode() != TerminalMode::Normal {
         startup_events.push(RuntimeEvent::ModeChanged {
             mode: runtime.active_mode(),
@@ -485,7 +487,7 @@ fn run_loop(
         };
         let mut release_attach_after_step = false;
         let mut step = match input {
-            RuntimeInput::Ui(UiCommand::NewSession) if !active_verifications.is_empty() => {
+            RuntimeInput::Ui(UiCommand::NewSession { .. }) if !active_verifications.is_empty() => {
                 RuntimeStep {
                     events: vec![RuntimeEvent::Notice(
                         "cannot start a new chat while verification is active; press Esc to cancel it first"
@@ -582,7 +584,7 @@ fn run_loop(
         }
         if let Some(config) = step.persist_team.take()
             && let Some(path) = &options.team_save_path
-            && let Err(err) = save_team_config(path, &config)
+            && let Err(err) = save_team_config(path, &config.without_sub_agents())
         {
             // TeamRuntime has already committed its matching SQLite state.
             // Do not run with a different on-disk boot config: withhold runner

@@ -17,6 +17,9 @@ use crate::domain::mode::ModesConfig;
 /// single turn before the runtime pauses and asks the user to continue.
 pub const DEFAULT_MAX_AUTO_RELAYS: u32 = 6;
 
+/// The most sub-agents (members opened with `@@spawn`) one conversation holds.
+pub const MAX_SUB_AGENTS: usize = 8;
+
 /// Which CLI backend drives a member.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -363,6 +366,16 @@ impl Effort {
         }
     }
 
+    /// Whether `backend` accepts this level: Agy stops at high, and ultra is
+    /// Codex-only.
+    pub fn supported_by(self, backend: BackendKind) -> bool {
+        match backend {
+            BackendKind::Agy => matches!(self, Self::Low | Self::Medium | Self::High),
+            BackendKind::Codex => true,
+            BackendKind::Claude | BackendKind::Grok => self != Self::Ultra,
+        }
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "low" => Some(Self::Low),
@@ -394,6 +407,9 @@ pub struct TeamMember {
     /// Optional native CLI session/conversation id to resume explicitly.
     pub session_id: Option<String>,
     pub effort: Option<Effort>,
+    /// The member that opened this one with `@@spawn`. Sub-agents live in one
+    /// conversation: they are never written to team.json.
+    pub parent: Option<MemberId>,
 }
 
 impl Serialize for TeamMember {
@@ -413,6 +429,7 @@ impl Serialize for TeamMember {
         let include_session = self.session_policy != SessionPolicy::default();
         let include_session_id = self.session_id.is_some();
         let include_effort = self.effort.is_some();
+        let include_parent = self.parent.is_some();
 
         let field_count = 3
             + usize::from(include_id)
@@ -425,7 +442,8 @@ impl Serialize for TeamMember {
             + usize::from(include_allowed_tools)
             + usize::from(include_session)
             + usize::from(include_session_id)
-            + usize::from(include_effort);
+            + usize::from(include_effort)
+            + usize::from(include_parent);
         let mut state = serializer.serialize_struct("TeamMember", field_count)?;
         if include_id {
             state.serialize_field("id", &self.id)?;
@@ -463,6 +481,9 @@ impl Serialize for TeamMember {
         if include_effort {
             state.serialize_field("effort", &self.effort)?;
         }
+        if include_parent {
+            state.serialize_field("parent", &self.parent)?;
+        }
         state.end()
     }
 }
@@ -499,6 +520,8 @@ impl<'de> Deserialize<'de> for TeamMember {
             session_id: Option<String>,
             #[serde(default)]
             effort: Option<Effort>,
+            #[serde(default)]
+            parent: Option<MemberId>,
         }
 
         let input = TeamMemberInput::deserialize(deserializer)?;
@@ -530,6 +553,7 @@ impl<'de> Deserialize<'de> for TeamMember {
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
             effort: input.effort,
+            parent: input.parent,
         })
     }
 }
@@ -557,6 +581,7 @@ impl TeamMember {
             session_policy: SessionPolicy::default(),
             session_id: None,
             effort: None,
+            parent: None,
         }
     }
 
@@ -762,6 +787,11 @@ pub enum TeamConfigError {
     DuplicateDisplayName(String),
     AmbiguousDisplayName(String),
     UnknownDefaultTarget(String),
+    /// A sub-agent names a parent that is missing or is itself a sub-agent.
+    InvalidParent {
+        member: String,
+        parent: String,
+    },
     UnsupportedEffort {
         member: String,
         backend: BackendKind,
@@ -797,6 +827,10 @@ impl fmt::Display for TeamConfigError {
             Self::UnknownDefaultTarget(id) => {
                 write!(f, "default target refers to unknown member: {id}")
             }
+            Self::InvalidParent { member, parent } => write!(
+                f,
+                "sub-agent {member} has parent {parent}, which is not a top-level member"
+            ),
             Self::UnsupportedEffort {
                 member,
                 backend,
@@ -874,9 +908,7 @@ impl TeamConfig {
                 ));
             }
             if let Some(effort) = member.effort
-                && ((member.backend == BackendKind::Agy
-                    && !matches!(effort, Effort::Low | Effort::Medium | Effort::High))
-                    || (effort == Effort::Ultra && member.backend != BackendKind::Codex))
+                && !effort.supported_by(member.backend)
             {
                 return Err(TeamConfigError::UnsupportedEffort {
                     member: member.id.to_string(),
@@ -900,6 +932,19 @@ impl TeamConfig {
             }
         }
 
+        for member in &self.members {
+            if let Some(parent) = &member.parent
+                && self
+                    .member(parent)
+                    .is_none_or(|owner| owner.parent.is_some() || owner.id == member.id)
+            {
+                return Err(TeamConfigError::InvalidParent {
+                    member: member.id.to_string(),
+                    parent: parent.to_string(),
+                });
+            }
+        }
+
         if let Some(DefaultTarget::Member(id)) = &self.default_target
             && self.member(id).is_none()
         {
@@ -907,6 +952,31 @@ impl TeamConfig {
         }
 
         Ok(())
+    }
+
+    /// The roster without sub-agents: what team.json holds.
+    pub fn without_sub_agents(&self) -> Self {
+        let mut top = self.clone();
+        top.members.retain(|member| member.parent.is_none());
+        top
+    }
+
+    /// Sub-agents opened by `parent`, in roster order.
+    pub fn sub_agents_of<'a>(
+        &'a self,
+        parent: &'a MemberId,
+    ) -> impl Iterator<Item = &'a TeamMember> + 'a {
+        self.members
+            .iter()
+            .filter(move |member| member.parent.as_ref() == Some(parent))
+    }
+
+    /// How many sub-agents the conversation holds.
+    pub fn sub_agent_count(&self) -> usize {
+        self.members
+            .iter()
+            .filter(|member| member.parent.is_some())
+            .count()
     }
 
     pub fn member(&self, id: &MemberId) -> Option<&TeamMember> {
@@ -1345,5 +1415,61 @@ mod tests {
         assert_eq!(member.permission_native_label(), "Approve for me");
         member.cycle_codex_permissions();
         assert_eq!(member.permission_native_label(), "Full Access");
+    }
+
+    #[test]
+    fn parent_is_serialized_only_for_sub_agents_and_old_files_still_load() {
+        let top = TeamMember::new("main", "Main", BackendKind::Codex, "general");
+        assert!(!serde_json::to_string(&top).unwrap().contains("parent"));
+
+        let mut child = TeamMember::new("rev", "rev", BackendKind::Claude, "review");
+        child.parent = Some(MemberId::new("main"));
+        let json = serde_json::to_string(&child).unwrap();
+        assert!(json.contains(r#""parent":"main""#));
+        let back: TeamMember = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, child);
+
+        let old: TeamMember =
+            serde_json::from_str(r#"{"display_name":"Old","backend":"codex","role":"impl"}"#)
+                .unwrap();
+        assert_eq!(old.parent, None);
+    }
+
+    #[test]
+    fn sub_agent_parents_must_be_top_level_members() {
+        let mut child = codex("kid", "sub-agent");
+        child.parent = Some(MemberId::new("lead"));
+        let mut config = TeamConfig::new("t", "/tmp/ws")
+            .with_member(codex("lead", "impl"))
+            .with_member(child.clone());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.sub_agent_count(), 1);
+        assert_eq!(config.without_sub_agents().members.len(), 1);
+        assert_eq!(config.sub_agents_of(&MemberId::new("lead")).count(), 1);
+
+        let mut grandchild = codex("baby", "sub-agent");
+        grandchild.parent = Some(MemberId::new("kid"));
+        config.members.push(grandchild);
+        assert!(matches!(
+            config.validate(),
+            Err(TeamConfigError::InvalidParent { .. })
+        ));
+
+        let mut orphan = TeamConfig::new("t", "/tmp/ws").with_member(codex("lead", "impl"));
+        child.parent = Some(MemberId::new("ghost"));
+        orphan.members.push(child);
+        assert!(matches!(
+            orphan.validate(),
+            Err(TeamConfigError::InvalidParent { .. })
+        ));
+    }
+
+    #[test]
+    fn effort_support_follows_the_backend() {
+        assert!(Effort::Ultra.supported_by(BackendKind::Codex));
+        assert!(!Effort::Ultra.supported_by(BackendKind::Claude));
+        assert!(Effort::High.supported_by(BackendKind::Agy));
+        assert!(!Effort::Xhigh.supported_by(BackendKind::Agy));
+        assert!(Effort::Max.supported_by(BackendKind::Grok));
     }
 }

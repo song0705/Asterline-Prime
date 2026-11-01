@@ -1,8 +1,8 @@
 ---
 name: asterline-team
-description: Use when acting as an Asterline team member who actually needs to message teammates, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
+description: Use when acting as an Asterline team member who actually needs to message teammates, open a sub-agent for a side task, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 20
+  version: 23
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -18,7 +18,9 @@ Do not send `@@team_message` merely because teammates are listed, another member
 
 ## Every Received Message Must Be Answered
 
-When you receive an Asterline relay from another member, remember the sender. Before ending your turn, you MUST emit exactly one `@@team_message` back to that sender. This rule applies in normal chat and every collaboration mode.
+Two kinds of message need no `@@team_message` back. A message that opens with `[task from ...]` is a task from the member that opened you as a sub-agent; your final reply is handed back to it automatically (see "Open A Sub-Agent"). A message that opens with `[hand-back from ...]` is a sub-agent's result for you; read it and carry on, without acknowledging it.
+
+For every other relay from another member, remember the sender. Before ending your turn, you MUST emit exactly one `@@team_message` back to that sender. This rule applies in normal chat and every collaboration mode.
 
 ```text
 @@team_message {"to":"original-sender","kind":"reply","body":"The full deliverable, decision, question, or blocker"}
@@ -45,6 +47,34 @@ When the messaging policy above permits it, send necessary work or questions to 
 ```
 
 `to` accepts a member id, display name, array of ids/names, or `all`.
+
+## Open A Sub-Agent
+
+A top-level member can open sub-agents for side work. They belong to the current chat only: they are not saved in `team.json`, `/resume` brings them back, and `/new` removes them.
+
+```text
+@@spawn {"name":"reviewer","task":"Review the diff in src/router and list real bugs only.","backend":"claude","model":"opus","effort":"high","role":"review"}
+```
+
+Name a sub-agent after its job, short: `reviewer`, `test-writer`, `researcher`. Never use a model, model family, or CLI name (`sol`, `opus`, `gpt-6-1`, `codex`): the Agents list already shows each sub-agent's model, and the name goes stale when the model changes. Use `helper` when there is no specific job. If you do, Asterline renames it to `helper` (`helper-2`, ... when taken) and tells you the real name once.
+
+Required fields: `name` and `task`. Optional fields: `backend` (`codex`, `claude`, `grok`, or `agy`), `model`, `effort`, `role`. Omitted `backend`, `model`, and `effort` follow you; a different backend gets that backend's default permissions, and the same backend keeps yours.
+
+When it is worth it:
+- Independent pieces of work can run in parallel.
+- A second model's perspective, or an independent review, would catch more than you alone.
+- Do not open one for something you can finish yourself in a few steps.
+
+How it works:
+- The sub-agent's id is the `name` lowercased with spaces turned into `-`; its display name is the `name` with the first letter of each `-`/`_`-separated part capitalised (`test-writer` shows as `Test-Writer`). The `task` reaches it as a message from you.
+- When it finishes, its final reply comes back to you automatically as a `[hand-back from ...]` message. It does not need to message you itself, and you should not poll or wait for it.
+- To give an existing sub-agent more work, send `@@spawn` again with the same `name` (the other fields are ignored), or an `@@team_message`. It keeps its context.
+- A chat holds at most 8 sub-agents. A sub-agent cannot open sub-agents. If Asterline refuses a request, you receive one short `[system message from Asterline]` saying why; do not retry the same request.
+- In `/mode team`, `@@spawn` follows the same roster lock as `@@team_member`. Review, plan, and brainstorm runs do not accept it.
+- Review and brainstorm runs on a roster too small for their seats open `reviewer` and `ideator-N` sub-agents by themselves (Asterline does this, not you); do not spawn those names yourself during such a run.
+- The user can open any sub-agent from the Agents list (`←` on an empty composer) and keep chatting with it. Its replies to the user are not forwarded to you.
+
+If you are a sub-agent (your prompt says who opened you), just do the task and give your final reply as plain text.
 
 ## Add A Teammate
 
@@ -125,7 +155,7 @@ When you are waiting:
 
 - Do not retry the same tool, command, or handoff.
 - Do not assume the action succeeded or failed.
-- Do not send another `@@team_message` or `@@team_member` just to nudge.
+- Do not send another `@@team_message`, `@@spawn`, or `@@team_member` just to nudge.
 - Stop and wait for the next prompt. After approval, the tool result or next
   dispatch arrives normally. After rejection, treat the action as denied and
   continue another way.

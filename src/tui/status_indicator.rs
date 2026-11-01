@@ -16,6 +16,23 @@ pub(crate) fn spinner() -> &'static str {
     spinner_at_millis(millis)
 }
 
+/// The pulsing running icon of the Agents list. It advances on the spinner's
+/// clock, one icon every `PULSE_SPINNER_TICKS` spinner ticks.
+const PULSE: [&str; 4] = ["◇", "◈", "◆", "◈"];
+const PULSE_SPINNER_TICKS: u128 = 3;
+
+pub(crate) fn pulse() -> &'static str {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    pulse_at_millis(millis)
+}
+
+fn pulse_at_millis(millis: u128) -> &'static str {
+    PULSE[((millis / 80 / PULSE_SPINNER_TICKS) % PULSE.len() as u128) as usize]
+}
+
 fn spinner_at_millis(millis: u128) -> &'static str {
     let idx = ((millis / 80) % SPINNER.len() as u128) as usize;
     SPINNER[idx]
@@ -37,34 +54,29 @@ pub(crate) fn fmt_elapsed_compact(secs: u64) -> String {
     }
 }
 
+/// The live row for a member that is working, e.g. `⠹ Working · 1s`. The
+/// model and the interrupt keys are shown elsewhere (header and composer
+/// hints), so the row only says what is happening and for how long.
 pub(crate) fn member_activity_text(
     status: MemberStatus,
     reasoning: Option<&str>,
     show_reasoning: bool,
     elapsed_secs: Option<u64>,
     spin: &str,
-    runtime_profile: Option<&str>,
 ) -> String {
-    let runtime_profile = runtime_profile.filter(|text| !text.is_empty());
+    let elapsed = elapsed_secs.map(fmt_elapsed_compact);
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-        let context = activity_context(elapsed_secs, runtime_profile);
+        let timed = with_elapsed("Thinking", elapsed.as_deref());
         if !show_reasoning {
-            return format!("{spin} Thinking{context} · Ctrl+T expand");
+            return format!("{spin} {timed} · Ctrl+T expand");
         }
-        return format!("{spin} Thinking{context}: {reasoning}");
+        return format!("{spin} {timed}: {reasoning}");
     }
 
     match status {
         MemberStatus::Running => {
-            let elapsed = elapsed_secs
-                .map(fmt_elapsed_compact)
-                .unwrap_or_else(|| "0s".to_string());
-            let mut parts = vec![elapsed];
-            if let Some(profile) = runtime_profile {
-                parts.push(profile.to_string());
-            }
-            parts.push("Esc/Ctrl+C to interrupt".to_string());
-            format!("{spin} Working ({})", parts.join(" • "))
+            let elapsed = elapsed.unwrap_or_else(|| "0s".to_string());
+            format!("{spin} Working · {elapsed}")
         }
         MemberStatus::Queued => format!("{spin} Queued"),
         MemberStatus::Waiting => format!("{spin} Waiting"),
@@ -74,60 +86,11 @@ pub(crate) fn member_activity_text(
     }
 }
 
-fn activity_context(elapsed_secs: Option<u64>, runtime_profile: Option<&str>) -> String {
-    let mut parts = Vec::new();
-    if let Some(elapsed) = elapsed_secs.map(fmt_elapsed_compact) {
-        parts.push(elapsed);
+fn with_elapsed(label: &str, elapsed: Option<&str>) -> String {
+    match elapsed {
+        Some(elapsed) => format!("{label} · {elapsed}"),
+        None => label.to_string(),
     }
-    if let Some(profile) = runtime_profile {
-        parts.push(profile.to_string());
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join(" • "))
-    }
-}
-
-pub(crate) fn running_footer_text(
-    running_count: usize,
-    elapsed_secs: Option<u64>,
-    names: &[String],
-    spin: &str,
-) -> Option<String> {
-    footer_text("Working", running_count, elapsed_secs, names, spin)
-}
-
-pub(crate) fn active_footer_text(
-    active_count: usize,
-    elapsed_secs: Option<u64>,
-    names: &[String],
-    spin: &str,
-) -> Option<String> {
-    footer_text("Active", active_count, elapsed_secs, names, spin)
-}
-
-fn footer_text(
-    label: &str,
-    count: usize,
-    elapsed_secs: Option<u64>,
-    names: &[String],
-    spin: &str,
-) -> Option<String> {
-    if count == 0 {
-        return None;
-    }
-
-    let noun = if count == 1 { "member" } else { "members" };
-    let elapsed = elapsed_secs
-        .map(fmt_elapsed_compact)
-        .unwrap_or_else(|| "0s".to_string());
-    let mut text = format!("{spin} {label} {count} {noun} ({elapsed} • Esc/Ctrl+C to interrupt)");
-    if !names.is_empty() {
-        text.push_str(" · ");
-        text.push_str(&names.join(", "));
-    }
-    Some(text)
 }
 
 #[cfg(test)]
@@ -142,10 +105,18 @@ mod tests {
     }
 
     #[test]
-    fn activity_text_keeps_interrupt_hint_stable() {
+    fn activity_text_is_the_state_and_the_time() {
         assert_eq!(
-            member_activity_text(MemberStatus::Running, None, true, Some(64), "⠋", None),
-            "⠋ Working (1m 04s • Esc/Ctrl+C to interrupt)"
+            member_activity_text(MemberStatus::Running, None, true, Some(64), "⠋"),
+            "⠋ Working · 1m 04s"
+        );
+        assert_eq!(
+            member_activity_text(MemberStatus::Running, None, true, Some(1), "⠹"),
+            "⠹ Working · 1s"
+        );
+        assert_eq!(
+            member_activity_text(MemberStatus::Running, None, true, None, "⠋"),
+            "⠋ Working · 0s"
         );
         assert_eq!(
             member_activity_text(
@@ -153,70 +124,27 @@ mod tests {
                 Some("reading files"),
                 true,
                 Some(64),
-                "⠋",
-                None
+                "⠋"
             ),
-            "⠋ Thinking (1m 04s): reading files"
+            "⠋ Thinking · 1m 04s: reading files"
         );
         assert_eq!(
             member_activity_text(
                 MemberStatus::Running,
                 Some("reading files"),
                 false,
-                Some(64),
-                "⠋",
-                None
+                Some(1),
+                "⠹"
             ),
-            "⠋ Thinking (1m 04s) · Ctrl+T expand"
-        );
-        assert_eq!(
-            member_activity_text(
-                MemberStatus::Running,
-                None,
-                true,
-                Some(64),
-                "⠋",
-                Some("model: gpt-5-codex • effort: high")
-            ),
-            "⠋ Working (1m 04s • model: gpt-5-codex • effort: high • Esc/Ctrl+C to interrupt)"
+            "⠹ Thinking · 1s · Ctrl+T expand"
         );
     }
 
     #[test]
-    fn footer_text_names_running_members() {
-        assert_eq!(
-            running_footer_text(
-                2,
-                Some(3723),
-                &["Builder".to_string(), "QA".to_string()],
-                "⠋"
-            ),
-            Some(
-                "⠋ Working 2 members (1h 02m 03s • Esc/Ctrl+C to interrupt) · Builder, QA"
-                    .to_string()
-            )
-        );
-        assert_eq!(running_footer_text(0, None, &[], "⠋"), None);
-    }
-
-    #[test]
-    fn active_footer_names_non_running_active_states() {
-        assert_eq!(
-            active_footer_text(
-                3,
-                Some(8),
-                &[
-                    "Builder queued".to_string(),
-                    "Reviewer waiting".to_string(),
-                    "QA approval".to_string(),
-                ],
-                "⠋"
-            ),
-            Some(
-                "⠋ Active 3 members (8s • Esc/Ctrl+C to interrupt) · Builder queued, Reviewer waiting, QA approval"
-                    .to_string()
-            )
-        );
+    fn the_row_repeats_neither_the_model_nor_the_interrupt_keys() {
+        let text = member_activity_text(MemberStatus::Running, None, true, Some(5), "⠋");
+        assert!(!text.contains("model"), "{text}");
+        assert!(!text.contains("interrupt"), "{text}");
     }
 
     #[test]
@@ -224,5 +152,14 @@ mod tests {
         assert_eq!(spinner_at_millis(0), "⠋");
         assert_eq!(spinner_at_millis(80), "⠙");
         assert_eq!(spinner_at_millis(800), "⠋");
+    }
+
+    #[test]
+    fn pulse_cycles_through_four_icons_on_the_spinner_clock() {
+        assert_eq!(pulse_at_millis(0), "◇");
+        assert_eq!(pulse_at_millis(240), "◈");
+        assert_eq!(pulse_at_millis(480), "◆");
+        assert_eq!(pulse_at_millis(720), "◈");
+        assert_eq!(pulse_at_millis(960), "◇");
     }
 }

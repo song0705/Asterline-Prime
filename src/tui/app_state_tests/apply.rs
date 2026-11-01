@@ -10,22 +10,6 @@ fn ready_populates_header() {
 }
 
 #[test]
-fn active_member_profile_uses_the_discovered_cli_default() {
-    let mut state = AppState::new(Vec::new());
-    state.apply(ready());
-    state.model_catalog.seed(
-        BackendKind::Codex,
-        Path::new("/tmp/ws"),
-        vec!["gpt-5.6-sol".to_string()],
-    );
-
-    assert_eq!(
-        state.member_runtime_profile(&state.members[0]),
-        "model: gpt-5.6-sol"
-    );
-}
-
-#[test]
 fn model_catalog_warms_every_detected_backend_once_per_ast_process() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -115,7 +99,7 @@ fn runtime_unavailable_disables_stale_controls_and_attach() {
     assert!(state.take_attach_request().is_none());
     assert!(state.chat().iter().any(|item| matches!(
         item,
-        ChatItem::Notice { text } if text.contains("runtime has stopped")
+        ChatItem::Notice { text, .. } if text.contains("runtime has stopped")
     )));
 }
 
@@ -131,7 +115,7 @@ fn consecutive_identical_notices_are_coalesced() {
         .chat()
         .iter()
         .filter_map(|item| match item {
-            ChatItem::Notice { text } => Some(text.as_str()),
+            ChatItem::Notice { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -156,7 +140,7 @@ fn consecutive_checklist_notices_for_the_same_run_are_coalesced() {
         .chat()
         .iter()
         .filter_map(|item| match item {
-            ChatItem::Notice { text } => Some(text.as_str()),
+            ChatItem::Notice { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -194,7 +178,7 @@ fn checklist_notices_skip_empty_agent_cells() {
         .chat()
         .iter()
         .filter_map(|item| match item {
-            ChatItem::Notice { text } => Some(text.as_str()),
+            ChatItem::Notice { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -216,6 +200,7 @@ fn new_chat_resets_visible_mode_to_normal() {
 #[test]
 fn new_chat_clears_conversation_scoped_controls() {
     let mut state = AppState::new(vec![ChatItem::Notice {
+        member: None,
         text: "old chat".to_string(),
     }]);
     state.apply(RuntimeEvent::ApprovalRequested {
@@ -271,6 +256,7 @@ fn new_chat_resets_member_sessions_to_fresh() {
             permission_mode: None,
             approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
+            parent: None,
         }],
         runs: Vec::new(),
     });
@@ -328,107 +314,6 @@ fn route_queue_update_clears_resolved_or_aborted_routes() {
     assert_eq!(state.paused_routes(), 1);
     state.apply(RuntimeEvent::RouteQueueUpdated { queued: 0 });
     assert_eq!(state.paused_routes(), 0);
-}
-
-#[test]
-fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
-    let mut state = AppState::new(vec![ChatItem::User {
-        body: "current".to_string(),
-        targets: Vec::new(),
-        interrupted: Vec::new(),
-    }]);
-    state.apply(RuntimeEvent::ResumeChoices {
-        conversations: vec![
-            ConversationSummary {
-                id: 7,
-                created_at: "2026-07-28 12:00:00".to_string(),
-                preview: "newer saved question".to_string(),
-                message_count: 4,
-                member_count: 2,
-            },
-            ConversationSummary {
-                id: 3,
-                created_at: "2026-07-27 09:00:00".to_string(),
-                preview: "older saved question".to_string(),
-                message_count: 9,
-                member_count: 3,
-            },
-        ],
-    });
-
-    assert_eq!(state.drawer(), Some(Drawer::Resume));
-    assert_eq!(
-        state.selected_resume_command(),
-        Some(UiCommand::ResumeConversation { conversation: 7 })
-    );
-    state.select_next_resume();
-    assert_eq!(
-        state.selected_resume_command(),
-        Some(UiCommand::ResumeConversation { conversation: 3 })
-    );
-    assert_eq!(
-        state.drawer_scroll(),
-        0,
-        "two short chats still fit; do not scroll just because we can"
-    );
-
-    state.apply(RuntimeEvent::ConversationResumed {
-        conversation: 3,
-        chat: vec![ChatItem::User {
-            body: "older saved question".to_string(),
-            targets: Vec::new(),
-            interrupted: Vec::new(),
-        }],
-    });
-    assert_eq!(state.drawer(), None);
-    assert_eq!(
-        state.chat(),
-        &[ChatItem::User {
-            body: "older saved question".to_string(),
-            targets: Vec::new(),
-            interrupted: Vec::new(),
-        }]
-    );
-}
-
-#[test]
-fn resume_scrolls_only_after_the_selection_hits_the_bottom() {
-    let conversations = (1..=12)
-        .map(|id| ConversationSummary {
-            id,
-            created_at: "2026-08-18 12:00:00".to_string(),
-            preview: format!("chat {id}"),
-            message_count: 1,
-            member_count: 1,
-        })
-        .collect();
-    let mut state = AppState::new(Vec::new());
-    state.apply(RuntimeEvent::ResumeChoices { conversations });
-    state.note_drawer_viewport(10);
-
-    assert_eq!(state.drawer_scroll(), 0);
-    state.select_next_resume();
-    assert_eq!(state.selected_resume(), 1);
-    assert_eq!(
-        state.drawer_scroll(),
-        0,
-        "the second card still fits; stay put"
-    );
-
-    state.select_next_resume();
-    assert_eq!(state.selected_resume(), 2);
-    assert_eq!(
-        state.drawer_scroll(),
-        1,
-        "the selected card crossed the bottom, so scroll just enough"
-    );
-
-    state.select_previous_resume();
-    assert_eq!(
-        state.drawer_scroll(),
-        1,
-        "moving up while still visible must not jump the list"
-    );
 }
 
 #[test]

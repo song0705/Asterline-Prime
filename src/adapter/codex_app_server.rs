@@ -252,6 +252,7 @@ fn parse_model_page(response: &Value) -> Result<Vec<DiscoveredModel>, String> {
                     .get("isDefault")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                alt_ids: Vec::new(),
             })
         })
         .collect())

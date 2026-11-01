@@ -12,11 +12,18 @@ coordination, and troubleshooting. For the product overview, return to the
 At startup, Asterline chooses a roster in this order:
 
 1. `--team <PATH>` loads that JSON file.
-2. `<workspace>/.asterline/team.json` is reused unless `--pick-team` is set.
-3. Supported backend executables are detected on `PATH` and the Team builder
-   opens.
+2. `<workspace>/.asterline/team.json` is reused if it exists.
+3. Otherwise supported backend executables are detected on `PATH` and
+   Asterline starts straight into a chat with one general-purpose `main`
+   agent on the first one found (Codex, then Claude, Grok, Agy), using that
+   CLI's own default model and its default permission preset. The roster is
+   saved to `team.json`.
 4. If no saved team and no supported executable exists, startup stops with a
    setup message.
+
+There is no setup screen. Use `/model` to change the viewed agent's model; the
+choice is saved. A hidden `--pick-team` flag ignores the saved roster and
+starts over from step 3.
 
 Use `/team` to modify the live roster. Asterline loads installed Agent CLIs
 and their model catalogs once when it starts; opening `/team` reuses that
@@ -147,8 +154,8 @@ Optional bindings for `/mode review`, `/mode plan`, `/mode brainstorm`, and `/mo
 omitted role fields are derived from member roles and `default_target`
 (the Review-mode builder ≈ default target or first non-reviewer; reviewer ≈
 role contains "review"; leader ≈ role contains "plan" or "lead", else first
-participant; participants = full roster). The Plan-mode `builder` is deliberately
-different: it is required and has no derived fallback. The Plan `reviewer` is optional:
+participant; participants = full roster). The Plan-mode `builder` defaults to the
+leader, who plans and then carries the checklist out. The Plan `reviewer` is optional:
 when omitted, a complete checklist proceeds directly to the Builder. `auto_execute` defaults
 to `true`; set it to `false` to require `/approve` before the Builder receives the finalized
 checklist. Defaults for budgets:
@@ -157,6 +164,27 @@ checklist. Defaults for budgets:
 Brainstorm requires at least two distinct resolved participants; repeating an
 ID or referring to the same member once by ID and once by display name is
 rejected.
+
+A roster of just `main` still runs every mode. When a seat has no suitable
+distinct top-level member and nothing is bound for it, Asterline opens a
+[sub-agent](#sub-agents) under `main` when the run starts, named after the seat,
+with the same CLI, model, and effort as `main`, and reuses it in later runs of
+the same chat (so a model you switched it to with `/model` stays):
+
+- Review: with no distinct member for the reviewer, a `reviewer` sub-agent.
+- Plan: the leader (default `main`) is also the builder, so no sub-agent is needed.
+- Brainstorm: without `participants`, every top-level member takes part. A lone
+  member is topped up to `participant_count` (default 3) with `ideator-1`,
+  `ideator-2`, …; a larger roster is used as it is unless `participant_count`
+  asks for more. An explicit `participants` list is used exactly and ignores
+  `participant_count`.
+- Team: `main` coordinates and may `@@spawn` as needed; nothing is opened for it.
+
+A name already taken by another member gets the next free suffix
+(`reviewer-2`). Sub-agents count against the chat's limit of 8; if a run needs
+more than are left, nothing starts and a notice says so. An explicit binding
+that points a seat at a member always wins (a `reviewer` equal to the builder is
+still refused).
 
 Brainstorm separates divergence from convergence. The first wave collects independent
 seeds; later waves expose each participant to a rotating anonymous peer sample
@@ -170,10 +198,11 @@ Markdown numbering.
 
 | Field               | Mode             | Meaning                                                     |
 | ------------------- | ---------------- | ----------------------------------------------------------- |
-| `builder`           | review/plan      | Review: implements. Plan: required checklist executor.      |
+| `builder`           | review/plan      | Review: implements. Plan: executor (default: the leader).   |
 | `reviewer`          | review/plan      | Emits verdicts; optional Plan-only checklist audit.         |
 | `leader`            | plan             | Member who writes and revises the checklist                 |
-| `participants`      | brainstorm       | Roster for all generation waves                             |
+| `participants`      | brainstorm       | Roster for all generation waves (default: all members)      |
+| `participant_count` | brainstorm       | Size when `participants` is unset (2–9; lone member: 3)     |
 | `generation_rounds` | brainstorm       | Seed/build/stretch wave budget (default 3, minimum 2)       |
 | `ideas_per_round`   | brainstorm       | Exact cards per member/wave (default 4); extras discarded.  |
 | `coordinator`       | team             | Member who coordinates the whole-team run                   |
@@ -352,8 +381,8 @@ the human-readable label rather than the CLI ID. Asterline matches it against
 the ID/label pairs returned by `agy models`, then displays that configured
 model as the startup default.
 
-The first-run Team builder also starts every installed catalog immediately;
-`/team` reuses the catalog loaded once at `ast` startup. The Agent field lists
+Startup starts every installed catalog immediately; `/model` and `/team`
+reuse the catalog loaded once at `ast` startup. The Agent field lists
 all four supported CLIs, includes installation status and
 discovered model/effort summaries, and disables missing CLIs. Open the
 member's `model` field to browse the already-loading catalog. Type to filter
@@ -433,7 +462,8 @@ cancellation first.
 `--no-restore` skips startup replay without deleting data. `--db <PATH>` moves
 the database outside the workspace.
 
-`/resume` opens the saved-chat picker. Restoring a chat also restores the
+`/resume` opens the Agents list on its saved chats (the **Inactive** section);
+`/new <prompt>` starts a clean chat and sends the prompt. Restoring a chat also restores the
 roster, full member configuration, and each member's native backend session ID
 that belonged to that chat.
 
@@ -509,7 +539,53 @@ Asterline validates duplicate IDs and names, starts the runner, saves the
 roster, and broadcasts the updated team. Omitted `sandbox` and
 `permission_mode` take that backend's write defaults (Agy: `accept-edits`,
 sandbox off). Agent envelopes can add members but cannot delete them;
-deletion remains a `/team` action.
+deletion remains a `/team` action. For short-lived helpers prefer
+[`@@spawn`](#sub-agents), which keeps the roster in `team.json` unchanged.
+
+### Sub-agents
+
+A top-level member (in `normal` or `team` mode) can open a sub-agent for a side
+task, such as an independent review or a piece of parallel work:
+
+```text
+@@spawn {"name":"reviewer","task":"Review the diff and list real bugs.","backend":"claude","model":"opus","effort":"high","role":"review"}
+```
+
+`name` and `task` are required. Omitted `backend`, `model`, and `effort` follow
+the member that opened it; a different `backend` gets that backend's default
+permissions, the same backend keeps the parent's. The sub-agent's id is the
+name lowercased (spaces become `-`), its display name is the name with the first
+letter of each `-`/`_`-separated part capitalised (`reviewer` is shown as
+`Reviewer`, `test-writer` as `Test-Writer`; routing by name ignores case), and the task reaches it as a message from the parent. When it finishes a turn that answered the parent, its final reply
+returns to the parent automatically as a hand-back message; if the turn failed
+or said nothing, the parent gets a one-line note instead. Messages you send a
+sub-agent yourself (open it from the Agents list, `←`) are answered only to you.
+The parent can give an existing sub-agent more work with `@@spawn` using the
+same name, or with `@@team_message`.
+
+Name a sub-agent after its job (`reviewer`, `test-writer`, `researcher`), not
+its model or CLI: the Agents list already shows the model, and a model name goes
+stale after `/model`. If the name is only a backend name (`codex`, `claude`,
+`grok`, `agy`) or model words (`sol` for `gpt-6.1-sol`, `opus`, `gpt-6-1-sol`),
+Asterline opens it as `helper` instead (`helper-2`, `helper-3`, ... when taken)
+and tells the parent the real name once. A name that adds a job, such as
+`opus-reviewer`, is kept, and a name that already belongs to the parent's
+sub-agent still reaches that sub-agent.
+
+Limits: 8 sub-agents per chat, and a sub-agent cannot open sub-agents. In
+`/mode team` the existing `allow_add_members` lock applies; review, plan, and
+brainstorm runs do not accept `@@spawn`. A refused request shows a notice and
+sends the parent one short explanation; hand-backs and refusals count against
+`max_auto_relays` like any other automatic relay.
+
+Sub-agents belong to the current chat only. They are never written to
+`.asterline/team.json` (not even after `/model` or `/team` changes), they are
+saved with the chat so `/resume` and a normal restart bring them back with
+their sessions, and `/new` removes them. `/model` on a viewed sub-agent changes
+only that sub-agent. The `/team` editor lists top-level members only; a
+sub-agent whose parent you remove is removed with it. In `team.json`, a
+`parent` member field marks a sub-agent and is written only to the chat
+snapshot.
 
 ### Run checklist updates
 
@@ -530,8 +606,7 @@ These updates appear in `/runs` and are recorded in the run timeline.
 
 | Option               | Description                                          |
 | -------------------- | ---------------------------------------------------- |
-| `--team <PATH>`      | Load a JSON team and skip the builder                |
-| `--pick-team`        | Ignore the saved roster and open the builder         |
+| `--team <PATH>`      | Load a JSON team instead of the saved one            |
 | `--workspace <PATH>` | Set the workspace; defaults to the current directory |
 | `--db <PATH>`        | Set the SQLite database path                         |
 | `--no-restore`       | Do not replay persisted chat on startup              |
@@ -545,7 +620,6 @@ Examples:
 
 ```bash
 asterline --workspace ~/code/api
-asterline --pick-team
 asterline --team ./team.json --db ~/.local/share/asterline/api.sqlite3
 asterline --fake --no-restore
 ```
@@ -566,8 +640,9 @@ Press `e` to enter a model name manually.
 
 ### The wrong roster opens
 
-Run `asterline --pick-team` to rebuild the saved roster, or use `/team` and
-press `s` to apply changes.
+Edit `.asterline/team.json`, use `/model` to change the model, or use `/team`
+and press `s` to apply roster changes. Deleting `team.json` makes the next
+launch start from the default `main` agent again.
 
 ### Start without the previous transcript
 

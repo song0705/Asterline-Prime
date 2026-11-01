@@ -211,7 +211,6 @@ impl TeamEditor {
             let _ = tx.send(detect_backends());
         });
         self.backend_detection = Some(rx);
-        self.notice = Some("checking installed Agent CLIs…".to_string());
     }
 
     pub(crate) fn poll_agent_catalog(&mut self) {
@@ -232,11 +231,12 @@ impl TeamEditor {
                 .into_iter()
                 .filter(|backend| self.detected.contains(*backend))
                 .collect();
-                self.notice = Some(if self.available.is_empty() {
-                    "no supported Agent CLI found on PATH".to_string()
-                } else {
-                    "Agent CLIs ready · model catalogs were requested at startup".to_string()
-                });
+                // The availability line already reports which CLIs are ready;
+                // only the empty case needs a notice of its own.
+                self.notice = self
+                    .available
+                    .is_empty()
+                    .then(|| "no supported Agent CLI found on PATH".to_string());
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 self.backend_detection = None;
@@ -257,14 +257,6 @@ impl TeamEditor {
 
     pub(crate) fn session_picker(&self) -> Option<&SessionPicker> {
         self.session_picker.as_ref()
-    }
-
-    pub(crate) fn default_label(&self) -> String {
-        match self.normalized_default_target() {
-            Some(DefaultTarget::Member(id)) => id.to_string(),
-            Some(DefaultTarget::All) => "all".to_string(),
-            None => "first member".to_string(),
-        }
     }
 
     pub(crate) fn selected_field(&self) -> Field {
@@ -352,17 +344,6 @@ impl TeamEditor {
             }
             KeyCode::Char('d') if !self.field_mode => {
                 self.delete_member();
-                TeamEditorOutcome::Consumed(None)
-            }
-            KeyCode::Char('t') if !self.field_mode => {
-                self.set_default_to_selected();
-                TeamEditorOutcome::Consumed(None)
-            }
-            KeyCode::Char('*') if !self.field_mode => {
-                self.default_target = Some(DefaultTarget::All);
-                self.dirty = true;
-                self.notice =
-                    Some("default target set to all members; press s to apply".to_string());
                 TeamEditorOutcome::Consumed(None)
             }
             KeyCode::Char('y') if !self.field_mode => {
@@ -641,16 +622,6 @@ impl TeamEditor {
         self.ensure_default_target();
         self.dirty = true;
         self.notice = Some("member removed; press s to apply".to_string());
-    }
-
-    fn set_default_to_selected(&mut self) {
-        let Some(member) = self.selected_member() else {
-            return;
-        };
-        let id = member.id.clone();
-        self.default_target = Some(DefaultTarget::Member(id.clone()));
-        self.dirty = true;
-        self.notice = Some(format!("default target set to {id}; press s to apply"));
     }
 
     fn activate_field(&mut self) {
@@ -942,18 +913,19 @@ mod tests {
     }
 
     #[test]
-    fn default_target_tracks_selected_member_and_all() {
+    fn target_keys_are_gone_and_the_default_target_follows_the_roster() {
         let mut editor = editor();
         editor.add_member();
-        editor.set_default_to_selected();
+        let before = editor.normalized_default_target();
+        for key in ['t', '*'] {
+            let outcome = editor.handle_key(KeyCode::Char(key), KeyModifiers::NONE);
+            assert_eq!(outcome, TeamEditorOutcome::Consumed(None));
+        }
+        assert_eq!(editor.normalized_default_target(), before);
         assert_eq!(
-            editor.normalized_default_target(),
-            Some(DefaultTarget::Member(editor.members[1].id.clone()))
+            editor.notice.as_deref(),
+            Some("member added; press s to apply")
         );
-
-        let outcome = editor.handle_key(KeyCode::Char('*'), KeyModifiers::NONE);
-        assert_eq!(outcome, TeamEditorOutcome::Consumed(None));
-        assert_eq!(editor.normalized_default_target(), Some(DefaultTarget::All));
     }
 
     #[test]
@@ -1059,11 +1031,8 @@ mod tests {
             editor.available,
             vec![BackendKind::Codex, BackendKind::Grok]
         );
-        assert!(
-            editor
-                .notice()
-                .is_some_and(|notice| notice.contains("ready"))
-        );
+        // The availability line says it; no extra "ready" notice repeats it.
+        assert!(editor.notice().is_none());
     }
 
     #[test]

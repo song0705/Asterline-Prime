@@ -208,6 +208,19 @@ pub struct TeamMessage {
     pub body: String,
 }
 
+/// A sub-agent request parsed from an `@@spawn` envelope. Backend and effort
+/// stay as the agent wrote them so the runtime can refuse a bad value with a
+/// reason the parent reads, instead of the line silently failing to parse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpawnRequest {
+    pub name: String,
+    pub task: String,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub role: Option<String>,
+}
+
 /// One edited path, optionally with the before/after text used to paint a
 /// Codex-style `+/-` hunk when the file-changes block is expanded. Native
 /// backends may instead provide a unified patch, which keeps its source line
@@ -306,12 +319,24 @@ pub enum UiCommand {
         default_target: Option<DefaultTarget>,
     },
     /// Start a fresh chat: a new conversation and new backend sessions, with the
-    /// transcript cleared. (codex's `/new`.)
-    NewSession,
-    /// Ask the runtime for saved chats so the TUI can open the `/resume` picker.
-    RequestResume,
-    /// Restore one chat selected from the `/resume` picker.
+    /// transcript cleared. (codex's `/new`.) With a `prompt`, the new chat's main
+    /// member is asked it as an ordinary user message once the reset succeeded;
+    /// a refused reset never sends it.
+    NewSession { prompt: Option<String> },
+    /// Ask the runtime for the saved chats shown as the Agents list's
+    /// "Inactive" section.
+    RequestSavedChats,
+    /// Restore one saved chat (an Inactive row, or `/resume <number>`).
     ResumeConversation { conversation: i64 },
+    /// Delete a saved chat and everything stored for it. The current chat is
+    /// refused. The runtime answers with a fresh `SavedChats` list.
+    DeleteConversation { conversation: i64 },
+    /// Name a chat (`None` conversation = the current one). An empty or
+    /// whitespace-only `name` clears it.
+    RenameConversation {
+        conversation: Option<i64>,
+        name: Option<String>,
+    },
     /// Import messages exchanged in a member's native session (after attaching),
     /// so they appear in the Asterline transcript and persist.
     ImportTranscript {
@@ -550,6 +575,8 @@ pub struct MemberSummary {
     pub permission_mode: Option<PermissionMode>,
     pub approvals_reviewer: crate::domain::team::CodexApprovalsReviewer,
     pub session_policy: SessionPolicy,
+    /// The member that opened this sub-agent; `None` for top-level members.
+    pub parent: Option<MemberId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -759,6 +786,13 @@ pub enum RuntimeEvent {
         to: Vec<String>,
         body: String,
     },
+    /// A top-level member opened a sub-agent; `summary` is its
+    /// `backend · model · effort`.
+    SubAgentSpawned {
+        parent: MemberId,
+        child: MemberId,
+        summary: String,
+    },
     /// A route referenced an unknown target.
     RouteError {
         turn: TurnId,
@@ -823,12 +857,24 @@ pub enum RuntimeEvent {
     Log(LogEntry),
     /// A human-readable system notice shown inline in the chat.
     Notice(String),
+    /// A notice about one member, shown in that member's window and in "All
+    /// messages" only.
+    MemberNotice {
+        member: MemberId,
+        text: String,
+    },
     /// Clear the transcript to begin a fresh chat (from `/new`). Members, logs,
     /// and prompt history are kept.
     SessionReset,
-    /// Saved chats available to the `/resume` picker.
-    ResumeChoices {
+    /// Saved chats other than the current one, newest first: the answer to
+    /// [`UiCommand::RequestSavedChats`].
+    SavedChats {
         conversations: Vec<ConversationSummary>,
+    },
+    /// The current chat's name (`None` = unnamed): sent at startup, after a
+    /// chat is resumed and when the current chat is renamed.
+    ConversationRenamed {
+        name: Option<String>,
     },
     /// Replace the visible transcript after restoring a saved chat.
     ConversationResumed {
@@ -837,14 +883,26 @@ pub enum RuntimeEvent {
     },
 }
 
-/// One row in the `/resume` saved-chat picker.
+/// One saved chat, listed as an "Inactive" row of the Agents list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationSummary {
     pub id: i64,
     pub created_at: String,
+    /// When the chat last changed: the newest message's time (UTC,
+    /// `YYYY-MM-DD HH:MM:SS`), else the chat's own `created_at`.
+    pub updated_at: String,
+    /// The chat's first real user message, as written.
     pub preview: String,
+    /// The name the user gave the chat (`/name`, Ctrl+R in the Agents list).
+    /// It titles the chat's row in place of the first message.
+    pub name: Option<String>,
     pub message_count: usize,
     pub member_count: usize,
+    /// The chat's main member (the first top-level member of its saved
+    /// roster): what its Model column is drawn from.
+    pub main_backend: Option<BackendKind>,
+    pub main_model: Option<String>,
+    pub main_effort: Option<Effort>,
 }
 
 /// A rendered conversation block in the single-column chat. The TUI builds these
@@ -893,8 +951,18 @@ pub enum ChatItem {
         to: Vec<String>,
         body: String,
     },
+    /// A sub-agent was opened. Live only: replay does not bring it back.
+    Spawn {
+        parent: MemberId,
+        child: MemberId,
+        summary: String,
+    },
     Notice {
         text: String,
+        /// The one member this notice is about (a model switch, a refused
+        /// spawn). A focused member's window shows only its own; `None` means
+        /// a general notice shown in every view.
+        member: Option<MemberId>,
     },
     Error {
         member: Option<MemberId>,

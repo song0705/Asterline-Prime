@@ -125,4 +125,34 @@ mod tests {
         ));
         worker.join().unwrap();
     }
+
+    #[test]
+    fn dispatch_forwards_the_members_effort_to_the_runner() {
+        use crate::adapter::fake::FakeRunner;
+        use crate::domain::team::{BackendKind, Effort};
+        use std::sync::Mutex;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let runner = FakeRunner::new(BackendKind::Codex, move |req| {
+            recorder.lock().unwrap().push(req.effort);
+            Vec::new()
+        });
+        let (input_tx, input_rx) = mpsc::sync_channel(8);
+        let worker = dispatch(
+            Arc::new(runner),
+            RunAction {
+                member: "builder".into(),
+                prompt: "test".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: Some(Effort::High),
+            },
+            input_tx,
+        );
+        worker.join().unwrap();
+        drop(input_rx);
+
+        assert_eq!(*seen.lock().unwrap(), vec![Some(Effort::High)]);
+    }
 }

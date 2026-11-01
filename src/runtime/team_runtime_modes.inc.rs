@@ -28,6 +28,9 @@ impl TeamRuntime {
                 return;
             }
         };
+        if !self.open_auto_seats(mode, &roles.auto_seats, step) {
+            return;
+        }
         let (plan_builder, plan_reviewer, auto_execute) = if mode == CollabMode::Plan {
             let config = self.effective_config();
             let builder = match resolve_plan_builder(&config) {
@@ -249,6 +252,7 @@ impl TeamRuntime {
         self.config
             .members
             .iter()
+            .filter(|m| m.parent.is_none())
             .map(|m| (m.id.to_string(), m.role.clone()))
             .collect()
     }
@@ -1266,7 +1270,7 @@ impl TeamRuntime {
              type a new topic to brainstorm again · /mode normal for regular chat · /runs for \
              details"
         );
-        if let Err(err) = self.store.record_notice(None, &notice) {
+        if let Err(err) = self.store.record_notice(None, None, &notice) {
             self.report_store_error("save the brainstorm completion notice", err, step);
         }
         step.events.push(RuntimeEvent::Notice(notice));

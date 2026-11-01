@@ -23,7 +23,7 @@ fn pure_conversation_does_not_show_work_separator() {
 
     let text = plain_text(&lines);
     assert!(!text.iter().any(|line| is_separator_text(line)));
-    assert!(text.iter().any(|line| line.contains("◆ You")));
+    assert!(!text.iter().any(|line| line.contains("◆ You")));
     assert!(
         text.iter()
             .any(|line| line.contains("explain this function"))
@@ -87,7 +87,7 @@ fn consecutive_agent_messages_keep_a_title_on_each_reply() {
 }
 
 #[test]
-fn same_member_reply_after_work_keeps_its_header_and_has_a_rail_gap() {
+fn same_member_reply_after_work_keeps_its_header_and_has_a_gap() {
     let member = MemberId::new("builder");
     let state = AppState::new(vec![
         ChatItem::Tool {
@@ -127,13 +127,8 @@ fn same_member_reply_after_work_keeps_its_header_and_has_a_rail_gap() {
         .skip(tool + 1)
         .find_map(|(index, line)| line.contains("Tests passed.").then_some(index))
         .expect("reply");
-    assert_eq!(reply, tool + 2, "the reply needs one rail gap: {text:?}");
+    assert_eq!(reply, tool + 2, "the reply needs one gap line: {text:?}");
     assert!(text[tool + 1].trim().is_empty());
-    assert_eq!(
-        lines[tool + 1].spans.first().and_then(|span| span.style.bg),
-        Some(member_rail_color(&state, &MemberId::new("builder"))),
-        "the gap must preserve the member rail",
-    );
 }
 
 #[test]
@@ -166,6 +161,8 @@ fn concurrent_members_keep_each_members_work_together() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![MemberId::new("builder")],
@@ -235,7 +232,7 @@ fn concurrent_members_keep_each_members_work_together() {
     let planer_start = joined.find("planer started").expect(&joined);
     let planer_tool = joined.find("docs").expect(&joined);
     assert!(
-        joined.contains("You → Builder") && joined.contains("You → Planer"),
+        joined.contains("to Builder") && joined.contains("to Planer"),
         "{joined}"
     );
     assert!(
@@ -279,6 +276,8 @@ fn incoming_relay_starts_a_fresh_target_work_block() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::MessageStarted {
         msg: MessageId(1),
         turn: TurnId(1),
@@ -321,9 +320,9 @@ fn incoming_relay_starts_a_fresh_target_work_block() {
     let text = plain_text(&lines);
     let joined = text.join("\n");
     let review = joined.find("planner review").expect(&joined);
-    let planner_to_builder = joined.find("planer → builder").expect(&joined);
+    let planner_to_builder = joined.find("Planer → Builder").expect(&joined);
     let builder_reply = joined.find("builder received review").expect(&joined);
-    let builder_to_planner = joined.find("builder → planer").expect(&joined);
+    let builder_to_planner = joined.find("Builder → Planer").expect(&joined);
     let planner_work = joined.find("planner implementation work").expect(&joined);
 
     assert!(
@@ -335,10 +334,10 @@ fn incoming_relay_starts_a_fresh_target_work_block() {
     );
     assert_eq!(
         text.iter()
-            .filter(|line| line.contains("Planer  · claude"))
+            .filter(|line| line.contains("Planer · claude"))
             .count(),
         2,
-        "the planner's post-relay work needs a new titled rail:\n{joined}"
+        "the planner's post-relay work needs a new titled header:\n{joined}"
     );
 }
 
@@ -382,6 +381,8 @@ fn broadcast_keeps_each_members_search_in_its_own_block() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![builder.clone(), planer.clone(), reviewer.clone()],
@@ -436,7 +437,7 @@ fn broadcast_keeps_each_members_search_in_its_own_block() {
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
     let joined = plain_text(&lines).join("\n");
-    assert!(joined.contains("You → all"), "{joined}");
+    assert!(joined.contains("to all"), "{joined}");
     let mut labeled = [
         (joined.find("builder found it").expect(&joined), 'b'),
         (joined.find("parser").expect(&joined), 'b'),
@@ -488,6 +489,8 @@ fn sequential_turns_stay_chronological_when_nobody_else_is_working() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![MemberId::new("builder")],
@@ -584,6 +587,8 @@ fn tool_block_introduces_its_member_before_the_tool_and_final_reply() {
         text: "final reply".to_string(),
     });
 
+    // The backend shows next to a name in the interleaved view.
+    state.set_focus(None);
     let mut lines = Vec::new();
     render_chat_history(&state, 70, 0, &mut lines);
     let text = plain_text(&lines);
@@ -726,6 +731,8 @@ fn empty_closed_agent_does_not_hide_the_following_tool_header() {
         text: "Asterline is a team TUI.".to_string(),
     });
 
+    // The backend shows next to a name in the interleaved view.
+    state.set_focus(None);
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
     let text = plain_text(&lines);
@@ -745,7 +752,7 @@ fn empty_closed_agent_does_not_hide_the_following_tool_header() {
 }
 
 #[test]
-fn member_activity_uses_one_full_height_unbroken_rail() {
+fn member_activity_has_no_coloured_rail() {
     let member = MemberId::new("builder");
     let state = AppState::new(vec![
         ChatItem::Agent {
@@ -784,29 +791,17 @@ fn member_activity_uses_one_full_height_unbroken_rail() {
         .iter()
         .position(|line| line.contains("follow-up failed"))
         .unwrap();
-    assert!(text[start..=end].iter().all(|line| !line.trim().is_empty()));
-    assert!(lines[start..=end].iter().all(|line| {
-        line.spans.first().is_some_and(|span| {
-            span.content.as_ref() == " "
-                && span.style.bg == Some(theme::backend_color(BackendKind::Codex))
-        })
-    }));
-
-    let rail_lines = lines[start..=end].to_vec();
-    let height = u16::try_from(rail_lines.len()).unwrap();
-    let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
-    terminal
-        .draw(|frame| {
-            frame.render_widget(Paragraph::new(rail_lines.clone()), frame.area());
-        })
-        .unwrap();
-    let buffer = terminal.backend().buffer();
-    for y in 0..height {
-        assert_eq!(
-            buffer.cell((0, y)).unwrap().bg,
-            theme::backend_color(BackendKind::Codex),
-            "rail cell at row {y} must have a full-cell background"
-        );
+    // No coloured speaker bar: the 2-column indent is plain unstyled space,
+    // entries are one blank row apart, and nothing in the block paints a
+    // background.
+    for (offset, line) in lines[start..=end].iter().enumerate() {
+        if text[start + offset].is_empty() {
+            continue;
+        }
+        let first = line.spans.first().expect("indent cell");
+        assert!(first.content.starts_with("  "), "{first:?}");
+        assert_eq!(first.style.bg, None);
+        assert!(line.spans.iter().all(|span| span.style.bg.is_none()));
     }
 }
 
@@ -930,6 +925,8 @@ fn reasoning_status_stays_with_its_member_then_disappears() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![builder.clone()],
@@ -1030,6 +1027,8 @@ fn live_working_status_follows_that_members_last_message() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![planer.clone()],
@@ -1325,7 +1324,7 @@ fn non_codex_reasoning_retains_collapsible_thinking_item() {
 }
 
 #[test]
-fn same_backend_members_use_different_rail_shades() {
+fn same_backend_members_use_different_header_shades() {
     use crate::domain::event::TurnId;
 
     let mut state = AppState::new(Vec::new());
@@ -1356,6 +1355,8 @@ fn same_backend_members_use_different_rail_shades() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![builder.clone(), extra.clone()],
@@ -1374,38 +1375,38 @@ fn same_backend_members_use_different_rail_shades() {
         summary: "coder-tool".to_string(),
     });
 
+    // Speaker labels exist in the All view only.
+    state.set_focus(None);
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
-    let builder_rail = lines
-        .iter()
-        .find(|line| {
-            plain_text(std::slice::from_ref(*line))
-                .join("")
-                .contains("builder-tool")
-        })
-        .and_then(|line| line.spans.first())
-        .and_then(|span| span.style.bg);
-    let coder_rail = lines
-        .iter()
-        .find(|line| {
-            plain_text(std::slice::from_ref(*line))
-                .join("")
-                .contains("coder-tool")
-        })
-        .and_then(|line| line.spans.first())
-        .and_then(|span| span.style.bg);
-    assert_eq!(builder_rail, Some(theme::backend_color(BackendKind::Codex)));
+    let header_color = |name: &str| {
+        lines
+            .iter()
+            .find(|line| {
+                plain_text(std::slice::from_ref(*line))
+                    .join("")
+                    .starts_with(&format!("  {name} · "))
+            })
+            .and_then(|line| line.spans.get(1))
+            .and_then(|span| span.style.fg)
+    };
+    let builder_color = header_color("Builder");
+    let coder_color = header_color("Coder");
     assert_eq!(
-        coder_rail,
+        builder_color,
+        Some(theme::backend_color(BackendKind::Codex))
+    );
+    assert_eq!(
+        coder_color,
         Some(theme::backend_color_shaded(BackendKind::Codex, 1))
     );
-    assert_ne!(builder_rail, coder_rail);
+    assert_ne!(builder_color, coder_color);
 }
 
 #[test]
 fn unrostered_agent_uses_its_event_backend_color() {
     let builder = MemberId::new("builder");
-    let state = AppState::new(vec![
+    let mut state = AppState::new(vec![
         ChatItem::User {
             body: "check this".to_string(),
             targets: vec![builder.clone()],
@@ -1418,6 +1419,8 @@ fn unrostered_agent_uses_its_event_backend_color() {
             text: "done".to_string(),
         },
     ]);
+    // The backend shows next to a name in the interleaved view.
+    state.set_focus(None);
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
 
@@ -1426,17 +1429,17 @@ fn unrostered_agent_uses_its_event_backend_color() {
         theme::backend_color(BackendKind::Grok)
     );
     let text = plain_text(&lines).join("\n");
-    assert!(text.contains("You → Builder"), "{text}");
+    assert!(text.contains("to Builder"), "{text}");
     let header = lines
         .iter()
         .find(|line| {
             plain_text(std::slice::from_ref(*line))
                 .join("")
-                .contains("Builder  · grok")
+                .contains("Builder · grok")
         })
         .expect("agent header");
     assert_eq!(
-        header.spans.first().and_then(|span| span.style.bg),
+        header.spans.get(1).and_then(|span| span.style.fg),
         Some(theme::backend_color(BackendKind::Grok))
     );
 }
@@ -1470,12 +1473,12 @@ fn file_changes_expand_by_default_and_toggle_with_ctrl_g() {
         "expanded file path must use the orange warning color"
     );
     assert_eq!(
-        path_line.spans[1].style.fg,
+        path_line.spans[0].style.fg,
         theme::text().fg,
         "the modified-file marker must use the white text color"
     );
     assert!(
-        path_line.spans[1].content.contains("Edit"),
+        path_line.spans[0].content.contains("Edit"),
         "modified-file marker must say Edit: {path_line:?}"
     );
 
@@ -1489,22 +1492,21 @@ fn file_changes_expand_by_default_and_toggle_with_ctrl_g() {
             })
             .unwrap_or_else(|| panic!("missing {content} in {expanded_text}"));
         assert!(
-            line.spans[2].content.as_ref().starts_with(content),
+            line.spans[1].content.as_ref().starts_with(content),
             "the highlighted content must start at the change marker: {expected}"
         );
         assert!(
-            line.spans[1].style.bg.is_none(),
+            line.spans[0].style.bg.is_none(),
             "line-number gutter is unfilled"
         );
         assert!(
-            line.spans[2].style.bg.is_some(),
+            line.spans[1].style.bg.is_some(),
             "changed text is highlighted"
         );
         assert_eq!(
-            theme::display_width(line.spans[2].content.as_ref()),
-            70 - theme::display_width(line.spans[0].content.as_ref())
-                - theme::display_width(line.spans[1].content.as_ref()),
-            "the changed-content background must reach the right edge"
+            theme::display_width(line.spans[1].content.as_ref()),
+            69 - theme::display_width(line.spans[0].content.as_ref()),
+            "the changed-content background must reach the right edge (less one margin column)"
         );
     }
 
@@ -1611,7 +1613,7 @@ fn failed_file_change_has_a_failure_marker() {
 }
 
 #[test]
-fn agent_markdown_header_and_table_share_one_continuous_rail() {
+fn agent_markdown_header_and_table_share_one_unstyled_margin() {
     let state = AppState::new(Vec::new());
     let item = ChatItem::Agent {
         member: MemberId::new("builder"),
@@ -1626,10 +1628,9 @@ fn agent_markdown_header_and_table_share_one_continuous_rail() {
 
     assert!(!lines.is_empty());
     assert!(lines.iter().all(|line| {
-        line.spans.first().is_some_and(|span| {
-            span.content.as_ref() == " "
-                && span.style.bg == Some(theme::backend_color(BackendKind::Codex))
-        })
+        line.spans
+            .first()
+            .is_some_and(|span| span.content.as_ref() == "  " && span.style.bg.is_none())
     }));
     let text = plain_text(&lines).join("\n");
     assert!(text.contains("read-only"));
@@ -1637,7 +1638,7 @@ fn agent_markdown_header_and_table_share_one_continuous_rail() {
 }
 
 #[test]
-fn completed_work_turn_gets_separator_before_next_user_message() {
+fn completed_work_turn_has_no_separator_before_next_user_message() {
     use crate::domain::event::TurnId;
 
     let mut state = AppState::new(Vec::new());
@@ -1684,23 +1685,15 @@ fn completed_work_turn_gets_separator_before_next_user_message() {
     render_chat_history(&state, 40, 0, &mut lines);
 
     let text = plain_text(&lines);
-    let separators: Vec<_> = text
+    // No rule between turns: the two user bands and the tools between them
+    // are separated by blank rows only.
+    assert!(!text.iter().any(|line| is_separator_text(line)), "{text:?}");
+    let shell = text.iter().position(|line| line.contains("Shell")).unwrap();
+    let second = text
         .iter()
-        .enumerate()
-        .filter(|(_, line)| is_separator_text(line))
-        .collect();
-    assert_eq!(separators.len(), 1);
-    let separator_index = separators[0].0;
-    assert!(
-        text[..separator_index]
-            .iter()
-            .any(|line| line.contains("Shell"))
-    );
-    assert!(
-        text[separator_index + 1..]
-            .iter()
-            .any(|line| line.contains("now summarize"))
-    );
+        .position(|line| line.contains("now summarize"))
+        .unwrap();
+    assert!(shell < second, "{text:?}");
 }
 
 #[test]
@@ -1964,6 +1957,8 @@ fn different_members_compact_tools_leave_a_gap_between_rails() {
             ),
         ],
     });
+    // These tests cover the interleaved transcript.
+    state.set_focus(None);
     state.apply(RuntimeEvent::UserMessage {
         turn: TurnId(1),
         targets: vec![MemberId::new("builder"), MemberId::new("planer")],

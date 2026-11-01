@@ -29,11 +29,15 @@ pub(super) fn ready() -> RuntimeEvent {
             permission_mode: Some(PermissionMode::Default),
             approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
+            parent: None,
         }],
     }
 }
 
 mod apply;
 mod chat;
+mod focus;
 mod mode_panel;
+mod model;
+mod tool_groups;
 mod ui;

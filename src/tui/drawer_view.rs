@@ -2,12 +2,12 @@
 //! member logs. The `/runs` drawer body lives in `run_view`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
-use crate::domain::event::{LogEntry, MemberStatus};
+use crate::domain::event::{LogEntry, LogLevel, MemberStatus};
 use crate::domain::team::MemberId;
 use crate::tui::app_state::AppState;
 use crate::tui::drawers::Drawer;
@@ -18,25 +18,130 @@ use crate::tui::team_builder::{backend_picker_lines, model_picker_lines, session
 use crate::tui::theme;
 use crate::tui::theme::pad_width;
 
-pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &Drawer) {
-    let popup = drawer_rect(area);
-    frame.render_widget(Clear, popup);
-    let title = match drawer {
-        Drawer::MemberLogs(member) => format!("Logs: {member}"),
-        _ => drawer.title().to_string(),
-    };
-    let block = Block::default()
-        .title(Span::styled(format!(" {title} "), theme::accent_bold()))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::muted());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+/// Drawers shown inline, above the composer (like the `/model` picker),
+/// instead of as an overlay on the chat. (The Agents list is neither: it
+/// takes over the whole frame, see `agents_view`.)
+pub(crate) fn is_inline(drawer: &Drawer) -> bool {
+    matches!(drawer, Drawer::Mode)
+}
 
-    // Reserve the bottom row of the drawer for the key hint.
-    let (content, hint_row) = if inner.height > 1 {
+/// Title line and body rows of an inline drawer, every row clipped to `width`.
+fn inline_parts(
+    state: &AppState,
+    drawer: &Drawer,
+    width: usize,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let clip = |line: Line<'static>| Line::from(clip_spans(line.spans, width));
+    // The editor leads with its own title line.
+    let mut lines = match drawer {
+        Drawer::Mode => drawer_mode(state),
+        _ => Vec::new(),
+    }
+    .into_iter();
+    let title = lines.next().unwrap_or_default();
+    (clip(title), lines.map(clip).collect())
+}
+
+/// Rows an inline drawer needs (title, content, hint), at most `max_rows`:
+/// as tall as its content, never a mostly empty box.
+pub(crate) fn inline_height(state: &AppState, drawer: &Drawer, width: u16, max_rows: u16) -> u16 {
+    let (_, body) = inline_parts(state, drawer, width as usize);
+    ((body.len() + 2) as u16).min(max_rows.max(3))
+}
+
+/// Paint an inline drawer into `area`: a title, the content (scrolled to keep
+/// the selection in view), and the key hint.
+pub(crate) fn render_inline_drawer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    drawer: &Drawer,
+) {
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let (title, body) = inline_parts(state, drawer, width);
+    frame.render_widget(
+        Paragraph::new(title),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let rows = area.height as usize - 2;
+    state.note_drawer_viewport(rows);
+    let max_scroll = body.len().saturating_sub(rows);
+    let offset = if matches!(drawer, Drawer::Mode) {
+        // Follow the editor's cursor row instead of a manual scroll.
+        body.iter()
+            .position(line_has_cursor)
+            .map_or(0, |row| (row + 1).saturating_sub(rows))
+    } else {
+        state.drawer_scroll()
+    }
+    .min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(body).scroll((offset as u16, 0)),
+        Rect::new(area.x, area.y + 1, area.width, rows as u16),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", drawer_hint(state, drawer, width)),
+            theme::muted(),
+        ))),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    );
+}
+
+/// Whether a drawer row starts with a selection marker.
+fn line_has_cursor(line: &Line<'static>) -> bool {
+    line.spans.first().is_some_and(|span| {
+        let text = span.content.trim_start();
+        text.starts_with('▶') || text.starts_with('›')
+    })
+}
+
+/// The body lines of an overlay drawer for a content area `width` columns wide.
+fn drawer_lines(state: &AppState, drawer: &Drawer, width: usize) -> Vec<Line<'static>> {
+    match drawer {
+        Drawer::Logs => drawer_logs(state, width),
+        Drawer::Team => drawer_team(state, width),
+        // The Agents list is full-screen; see `agents_view`.
+        Drawer::Agents => Vec::new(),
+        Drawer::Mode => drawer_mode(state),
+        Drawer::Runs => drawer_runs(state, width),
+        Drawer::Palette => drawer_palette(),
+        Drawer::Diff => drawer_diff(state),
+        Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id, width),
+    }
+}
+
+/// Rows a line takes once wrapped to `width` columns.
+fn visual_rows(lines: &[Line<'_>], width: usize) -> usize {
+    let width = width.max(1);
+    lines
+        .iter()
+        .map(|line| {
+            let w = line_width(line);
+            if w == 0 { 1 } else { w.div_ceil(width).max(1) }
+        })
+        .sum()
+}
+
+/// Columns of padding between an overlay's border and its text.
+const OVERLAY_PADDING: u16 = 1;
+
+/// The content area of an overlay drawn in `popup`: inside the border, one
+/// column of padding on each side, minus the hint row.
+fn overlay_content(popup: Rect) -> (Rect, Option<Rect>) {
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let padded = Rect::new(
+        inner.x + OVERLAY_PADDING.min(inner.width),
+        inner.y,
+        inner.width.saturating_sub(2 * OVERLAY_PADDING),
+        inner.height,
+    );
+    if padded.height > 1 {
         (
-            Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
+            Rect::new(padded.x, padded.y, padded.width, padded.height - 1),
             Some(Rect::new(
                 inner.x,
                 inner.y + inner.height - 1,
@@ -45,36 +150,55 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
             )),
         )
     } else {
-        (inner, None)
-    };
+        (padded, None)
+    }
+}
 
-    let lines = match drawer {
-        Drawer::Logs => drawer_logs(state),
-        Drawer::Team => drawer_team(state, content.width as usize),
-        Drawer::Mode => drawer_mode(state),
-        Drawer::Runs => drawer_runs(state, content.width as usize),
-        Drawer::Palette => drawer_palette(),
-        Drawer::Diff => drawer_diff(state),
-        Drawer::Resume => drawer_resume(state, content.width as usize),
-        Drawer::MemberLogs(member_id) => drawer_member_logs(state, member_id),
+/// The rectangle an overlay occupies inside `area` (the chat column): full
+/// width, as tall as its content (title, content, hint), anchored to the
+/// bottom so it sits against the composer. The team editor, whose pickers
+/// change its height, fills the column.
+pub(crate) fn overlay_rect(state: &AppState, drawer: &Drawer, area: Rect) -> Rect {
+    if matches!(drawer, Drawer::Team) {
+        return area;
+    }
+    // Width of the text once the border and padding are taken off.
+    let text_width = area.width.saturating_sub(2 + 2 * OVERLAY_PADDING) as usize;
+    let lines = drawer_lines(state, drawer, text_width);
+    // Two border rows and the hint row around the content.
+    let wanted = (visual_rows(&lines, text_width) + 3).min(u16::MAX as usize) as u16;
+    let height = wanted.clamp(4, area.height.max(1)).min(area.height);
+    Rect::new(area.x, area.y + area.height - height, area.width, height)
+}
+
+/// Paint an overlay drawer into the bottom of `area` (the chat column). Every
+/// cell it covers is cleared first, so no chat text shows through it.
+pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState, drawer: &Drawer) {
+    let popup = overlay_rect(state, drawer, area);
+    frame.render_widget(Clear, popup);
+    let title = match drawer {
+        Drawer::MemberLogs(member) => format!("Logs: {member}"),
+        Drawer::Palette => format!("Commands · Asterline {}", env!("CARGO_PKG_VERSION")),
+        _ => drawer.title().to_string(),
     };
+    let block = Block::default()
+        .title(Span::styled(format!(" {title} "), theme::accent_bold()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::muted());
+    frame.render_widget(block, popup);
+
+    // Text sits one column in from the border; the bottom row is the hint.
+    let (content, hint_row) = overlay_content(popup);
+
+    let lines = drawer_lines(state, drawer, content.width as usize);
     // Clamp the scroll offset so content can't be pushed entirely off-screen.
     // Account for line wrapping: the Paragraph widget wraps long lines, so the
     // visual line count can exceed `lines.len()`.
-    let content_width = content.width.max(1) as usize;
-    let visual_count: usize = lines
-        .iter()
-        .map(|line| {
-            let w = line_width(line);
-            if w == 0 {
-                1
-            } else {
-                w.div_ceil(content_width).max(1)
-            }
-        })
-        .sum();
+    let visual_count = visual_rows(&lines, content.width as usize);
     let max_scroll = visual_count.saturating_sub(content.height as usize);
     state.note_drawer_viewport(content.height as usize);
+    state.note_drawer_max_scroll(max_scroll);
     let offset = state.drawer_scroll().min(max_scroll) as u16;
     frame.render_widget(
         Paragraph::new(lines)
@@ -84,82 +208,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
     );
 
     if let Some(hint_row) = hint_row {
-        let hint = match drawer {
-            Drawer::Runs if state.runs_detail() => {
-                "x compact · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close"
-            }
-            Drawer::Runs => {
-                "x details · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close"
-            }
-            Drawer::Resume => "↑↓ choose · Enter resume · Esc close",
-            Drawer::Team
-                if state
-                    .team_editor()
-                    .is_some_and(|editor| editor.editing().is_some()) =>
-            {
-                "Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit"
-            }
-            Drawer::Team
-                if state
-                    .team_editor()
-                    .is_some_and(|editor| editor.backend_picker().is_some()) =>
-            {
-                "↑↓ choose Agent · Enter apply · Esc cancel"
-            }
-            Drawer::Team
-                if state
-                    .team_editor()
-                    .is_some_and(|editor| editor.model_picker().is_some()) =>
-            {
-                "↑↓ model · ←→ effort · type filter · Enter choose both · Esc cancel"
-            }
-            Drawer::Team
-                if state
-                    .team_editor()
-                    .is_some_and(|editor| editor.session_picker().is_some()) =>
-            {
-                "↑↓ choose session · type filter · Enter apply · Esc cancel"
-            }
-            Drawer::Team
-                if state
-                    .team_editor()
-                    .is_some_and(|editor| editor.field_mode()) =>
-            {
-                "↑↓ field · Enter edit/choose · Esc members"
-            }
-            Drawer::Team => "↑↓ member · Enter fields · Esc close",
-            Drawer::Mode
-                if state
-                    .mode_editor()
-                    .is_some_and(|editor| editor.editing().is_some()) =>
-            {
-                "Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit"
-            }
-            Drawer::Mode
-                if state
-                    .mode_editor()
-                    .is_some_and(|editor| editor.member_picker().is_some()) =>
-            {
-                if state
-                    .mode_editor()
-                    .and_then(|editor| editor.member_picker())
-                    .is_some_and(|picker| picker.multi())
-                {
-                    "↑↓ member · Space toggle · Enter confirm · Esc cancel"
-                } else {
-                    "↑↓ member · Enter choose · Esc cancel"
-                }
-            }
-            Drawer::Mode
-                if state
-                    .mode_editor()
-                    .is_some_and(|editor| editor.field_mode()) =>
-            {
-                "↑↓ field · Enter edit · ←/→ step · s select + apply · w team.json · Esc list"
-            }
-            Drawer::Mode => "↑↓ select · Enter fields · Esc close",
-            _ => "↑↓ scroll · Esc close",
-        };
+        let hint = drawer_hint(state, drawer, hint_row.width.saturating_sub(1) as usize);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!(" {hint}"), theme::muted()))),
             hint_row,
@@ -178,10 +227,87 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
     }
 }
 
-/// Exact outer rectangle used by every drawer. Mouse selection uses the same
-/// geometry so dragging inside an overlay cannot spill into the background UI.
-pub(crate) fn drawer_rect(area: Rect) -> Rect {
-    centered_rect(area, 86, 76)
+/// The first hint that fits in `width` columns (the shortest, clipped, when
+/// none does), so a hint never wraps or runs off the row.
+fn fit_hint(variants: &[&str], width: usize) -> String {
+    variants
+        .iter()
+        .find(|hint| theme::display_width(hint) <= width)
+        .map_or_else(
+            || theme::clip_width(variants.last().copied().unwrap_or(""), width),
+            |hint| hint.to_string(),
+        )
+}
+
+/// The single key-hint line of a drawer.
+fn drawer_hint(state: &AppState, drawer: &Drawer, width: usize) -> String {
+    let team = state.team_editor();
+    let mode = state.mode_editor();
+    let variants: &[&str] = match drawer {
+        Drawer::Runs if state.runs_detail() => &[
+            "x compact · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close",
+            "x compact · ↑↓ step · ←→ run · Enter status · Esc close",
+            "x compact · ↑↓ step · Esc close",
+        ],
+        Drawer::Runs => &[
+            "x details · ↑↓ step · ←→ run · Enter status · Tab dispatch · Pg scroll · Esc close",
+            "x details · ↑↓ step · ←→ run · Enter status · Esc close",
+            "x details · ↑↓ step · Esc close",
+        ],
+        Drawer::Agents => &[crate::tui::agents_view::HINTS],
+        Drawer::Team if team.is_some_and(|editor| editor.editing().is_some()) => &[
+            "Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit",
+            "Enter save · Esc cancel",
+        ],
+        Drawer::Team if team.is_some_and(|editor| editor.backend_picker().is_some()) => {
+            &["↑↓ choose Agent · Enter apply · Esc cancel"]
+        }
+        Drawer::Team if team.is_some_and(|editor| editor.model_picker().is_some()) => &[
+            "↑↓ model · ←→ effort · type filter · Enter choose both · Esc cancel",
+            "↑↓ model · ←→ effort · Enter choose · Esc cancel",
+        ],
+        Drawer::Team if team.is_some_and(|editor| editor.session_picker().is_some()) => &[
+            "↑↓ choose session · type filter · Enter apply · Esc cancel",
+            "↑↓ session · Enter apply · Esc cancel",
+        ],
+        Drawer::Team if team.is_some_and(|editor| editor.field_mode()) => &[
+            "↑↓ field · Enter edit/choose · y copy · t reload models · e manual entry · s apply · Esc members",
+            "↑↓ field · Enter edit · y copy · e manual · s apply · Esc back",
+            "↑↓ field · Enter edit · s apply · Esc back",
+        ],
+        Drawer::Team => &[
+            "↑↓ member · Enter fields · y copy session · a add · d delete · s apply · Esc close",
+            "↑↓ member · Enter fields · y copy · a add · d del · s apply · Esc close",
+            "↑↓ member · Enter fields · y copy · a add · d del · s apply · Esc",
+            "↑↓ member · Enter fields · a add · d del · s apply · Esc",
+            "↑↓ · Enter · a add · d del · s apply · Esc",
+        ],
+        Drawer::Mode if mode.is_some_and(|editor| editor.editing().is_some()) => &[
+            "Enter save · Esc cancel · ←/→ move · Ctrl+U/W/K edit",
+            "Enter save · Esc cancel",
+        ],
+        Drawer::Mode if mode.is_some_and(|editor| editor.member_picker().is_some()) => {
+            if mode
+                .and_then(|editor| editor.member_picker())
+                .is_some_and(|picker| picker.multi())
+            {
+                &[
+                    "↑↓ member · Space toggle · Enter confirm · Esc cancel",
+                    "↑↓ member · Space · Enter · Esc cancel",
+                ]
+            } else {
+                &["↑↓ member · Enter choose · Esc cancel"]
+            }
+        }
+        Drawer::Mode if mode.is_some_and(|editor| editor.field_mode()) => &[
+            "↑↓ field · Enter edit · ←/→ step · r revert · s select + apply · w team.json · Esc list",
+            "↑↓ field · Enter edit · ←/→ step · s apply · Esc list",
+            "↑↓ field · Enter edit · s apply · Esc list",
+        ],
+        Drawer::Mode => &["↑↓ select · Enter fields · Esc close"],
+        _ => &["↑↓ scroll · Esc close"],
+    };
+    fit_hint(variants, width)
 }
 
 /// Display width of all spans in a line (for scroll clamping with wrapping).
@@ -192,97 +318,83 @@ fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
-fn log_lines<'a>(entries: impl Iterator<Item = &'a LogEntry>) -> Vec<Line<'static>> {
-    entries
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {:<5} ", entry.level.as_str()),
-                    Style::default().fg(theme::log_color(entry.level)),
-                ),
-                Span::styled(format!("{} ", entry.source), theme::accent_bold()),
-                Span::styled(entry.message.clone(), theme::text()),
-            ])
-        })
-        .collect()
+/// Log rows, oldest first, wrapped to `width`. Only warnings and errors carry
+/// a level label; continuation lines align under the message text.
+fn log_lines<'a>(entries: impl Iterator<Item = &'a LogEntry>, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let mut prefix = Vec::new();
+        if matches!(entry.level, LogLevel::Warn | LogLevel::Error) {
+            prefix.push(Span::styled(
+                format!("{:<5} ", entry.level.as_str()),
+                Style::default().fg(theme::log_color(entry.level)),
+            ));
+        }
+        prefix.push(Span::styled(
+            format!("{} ", entry.source),
+            theme::accent_bold(),
+        ));
+        let prefix_width: usize = prefix
+            .iter()
+            .map(|span| theme::display_width(span.content.as_ref()))
+            .sum();
+        let room = width.saturating_sub(prefix_width).max(1);
+        let message = markdown::wrap(&entry.message, room);
+        let mut message = message.into_iter();
+        let mut first = prefix;
+        first.push(Span::styled(
+            message.next().unwrap_or_default(),
+            theme::text(),
+        ));
+        out.push(Line::from(first));
+        for line in message {
+            out.push(Line::from(vec![
+                Span::raw(" ".repeat(prefix_width)),
+                Span::styled(line, theme::text()),
+            ]));
+        }
+    }
+    out
 }
 
-fn drawer_logs(state: &AppState) -> Vec<Line<'static>> {
+/// The most recent entries shown, oldest first like the transcript.
+const LOG_ROWS: usize = 200;
+
+fn drawer_logs(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let logs = state.logs();
     if logs.is_empty() {
         return vec![Line::styled("no logs yet", theme::muted())];
     }
-    log_lines(logs.iter().rev().take(200))
+    log_lines(logs.iter().skip(logs.len().saturating_sub(LOG_ROWS)), width)
 }
 
-fn drawer_resume(state: &AppState, width: usize) -> Vec<Line<'static>> {
-    if state.resume_choices().is_empty() {
-        return vec![
-            Line::styled(" no other saved chats", theme::muted()),
-            Line::styled(
-                " Start another chat with /new, then /resume can return to this one.",
-                theme::muted(),
-            ),
-        ];
+/// Cut a row's spans to `width` display columns, ending with `…` when clipped.
+fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let total: usize = spans
+        .iter()
+        .map(|span| theme::display_width(&span.content))
+        .sum();
+    if total <= width {
+        return spans;
     }
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(" Saved chats", theme::accent_bold()),
-            Span::styled(
-                format!("  {} available", state.resume_choices().len()),
-                theme::muted(),
-            ),
-        ]),
-        Line::raw(""),
-    ];
-    let preview_width = width.saturating_sub(8).max(20);
-    for (index, conversation) in state.resume_choices().iter().enumerate() {
-        let selected = index == state.selected_resume();
-        let marker = if selected { "› " } else { "  " };
-        let marker_style = if selected {
-            theme::accent_bold()
+    let budget = width.saturating_sub(1);
+    let mut used = 0;
+    let mut out = Vec::new();
+    for span in spans {
+        let span_width = theme::display_width(&span.content);
+        if used + span_width <= budget {
+            used += span_width;
+            out.push(span);
         } else {
-            theme::muted()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(marker, marker_style),
-            Span::styled(
-                format!("#{}  {}", conversation.id, conversation.created_at),
-                if selected {
-                    theme::accent_bold()
-                } else {
-                    theme::text()
-                },
-            ),
-            Span::styled(
-                format!(
-                    "  ·  {} messages  ·  {} members",
-                    conversation.message_count, conversation.member_count
-                ),
-                theme::muted(),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                theme::clip_width(
-                    &conversation.preview.replace(['\n', '\r'], " "),
-                    preview_width,
-                ),
-                if selected {
-                    theme::text()
-                } else {
-                    theme::muted()
-                },
-            ),
-        ]));
-        lines.push(Line::raw(""));
+            let kept = theme::slice_display_cols(&span.content, 0, budget - used);
+            out.push(Span::styled(format!("{kept}…"), span.style));
+            break;
+        }
     }
-    lines
+    out
 }
 
-fn drawer_member_logs(state: &AppState, member_id: &MemberId) -> Vec<Line<'static>> {
+fn drawer_member_logs(state: &AppState, member_id: &MemberId, width: usize) -> Vec<Line<'static>> {
     let member_str = member_id.as_str();
     let filtered: Vec<&LogEntry> = state
         .logs()
@@ -296,7 +408,8 @@ fn drawer_member_logs(state: &AppState, member_id: &MemberId) -> Vec<Line<'stati
             theme::muted(),
         )];
     }
-    log_lines(filtered.into_iter().rev().take(200))
+    let skip = filtered.len().saturating_sub(LOG_ROWS);
+    log_lines(filtered.into_iter().skip(skip), width)
 }
 
 /// Build a table header line and its matching rule from column widths.
@@ -378,13 +491,8 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
             member.status == MemberStatus::Running,
         );
         let session = member.session.clone().unwrap_or_else(|| "—".to_string());
-        let model = member
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        let effort = member
-            .effort
-            .map(|effort| effort.as_str().to_string())
+        let model = state
+            .member_model_summary(member)
             .unwrap_or_else(|| "default".to_string());
         lines.push(Line::from(vec![
             Span::styled("  session ", theme::muted()),
@@ -392,9 +500,7 @@ fn drawer_team(state: &AppState, width: usize) -> Vec<Line<'static>> {
             Span::styled(" · ", theme::muted()),
             Span::styled(session, theme::text()),
             Span::styled("  ·  model ", theme::muted()),
-            Span::styled(model.to_string(), theme::text()),
-            Span::styled("  ·  effort ", theme::muted()),
-            Span::styled(effort, theme::text()),
+            Span::styled(model, theme::text()),
         ]));
         // Detail line 2: cwd
         lines.push(Line::from(vec![
@@ -444,18 +550,6 @@ fn drawer_team_editor(
             },
         ),
     ]));
-    lines.push(Line::styled(
-        if editor.field_mode() {
-            " ↑/↓ field · Enter edit/choose · y copy · t reload model · e manual model/session · s apply · Esc members"
-        } else {
-            " ↑/↓ member · Enter fields · y copy session · a add · d delete · t target · * all · s apply · Esc close"
-        },
-        theme::muted(),
-    ));
-    lines.push(Line::styled(
-        format!(" Default target: {}", editor.default_label()),
-        theme::text(),
-    ));
     lines.push(Line::styled(
         format!(" Agent tools: {}", editor.agent_availability_label()),
         theme::muted(),
@@ -515,11 +609,6 @@ fn drawer_team_editor(
             " Selected member fields",
             theme::accent_bold(),
         )));
-        lines.push(Line::from(vec![
-            Span::styled("     handle: ", theme::muted()),
-            Span::styled(format!("@{}", member.id), theme::accent()),
-            Span::styled(" (generated)", theme::muted()),
-        ]));
         let label_width = Field::label_width_for_backend(member.backend);
         for (idx, field) in editor.fields().iter().enumerate() {
             let selected = editor.field_mode() && idx == editor.field_index();
@@ -644,22 +733,34 @@ fn drawer_team_editor(
 fn drawer_palette() -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
-            " Start with @member, @all, /ask, or /all; later bare messages reuse the last target.",
+            " Type to talk to the agent you're viewing · ← switch agent",
             theme::muted(),
         ),
         Line::raw(""),
     ];
 
-    for (name, hint, takes_arg) in crate::tui::completion::COMMANDS {
-        let cmd = if *takes_arg {
-            format!("/{name} …")
-        } else {
-            format!("/{name}")
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:<24} ", cmd), theme::accent_bold()),
-            Span::styled(format!(" {hint}"), theme::text()),
-        ]));
+    for (index, (title, names)) in crate::tui::completion::COMMAND_GROUPS.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(format!("  {title}"), theme::muted()));
+        for name in *names {
+            let Some((name, hint, takes_arg)) = crate::tui::completion::COMMANDS
+                .iter()
+                .find(|(command, _, _)| command == name)
+            else {
+                continue;
+            };
+            let cmd = if *takes_arg {
+                format!("/{name} …")
+            } else {
+                format!("/{name}")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<24} ", cmd), theme::accent_bold()),
+                Span::styled(format!(" {hint}"), theme::text()),
+            ]));
+        }
     }
     lines
 }
@@ -743,25 +844,6 @@ fn file_extension(path: &str) -> String {
         .to_string()
 }
 
-fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,9 +881,65 @@ mod tests {
                 permission_mode: Some(PermissionMode::Default),
                 approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
+                parent: None,
             }],
         });
         state
+    }
+
+    #[test]
+    fn help_leads_with_the_viewing_hint_and_lists_commands_in_three_groups() {
+        let lines = drawer_palette();
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(
+            text[0].contains("Type to talk to the agent you're viewing"),
+            "{text:?}"
+        );
+        assert!(text[0].contains("← switch agent"), "{text:?}");
+        assert!(!text[0].contains("@member") && !text[0].contains("last target"));
+
+        // Group headings appear in order, each before its own commands.
+        let heading = |title: &str| {
+            text.iter()
+                .position(|line| line.trim() == title)
+                .unwrap_or_else(|| panic!("missing heading {title}: {text:?}"))
+        };
+        let (common, approvals, runs) = (
+            heading("Common"),
+            heading("Approvals & sessions"),
+            heading("Runs"),
+        );
+        assert!(common < approvals && approvals < runs);
+        let command_row = |name: &str| {
+            text.iter()
+                .position(|line| {
+                    line.trim_start()
+                        .strip_prefix('/')
+                        .and_then(|rest| rest.split_whitespace().next())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing /{name}: {text:?}"))
+        };
+        assert!(common < command_row("model") && command_row("exit") < approvals);
+        assert!(approvals < command_row("approve") && command_row("logs") < runs);
+        assert!(runs < command_row("runs") && command_row("block") > runs);
+        // Headings are dim (muted), not command-coloured.
+        assert_eq!(lines[common].style, theme::muted());
+
+        let names: Vec<&str> = text
+            .iter()
+            .filter_map(|line| line.trim_start().strip_prefix('/'))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        let expected: Vec<&str> = crate::tui::completion::COMMANDS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert_eq!(names, expected, "help follows the popup order");
+        for hidden in ["ask", "all", "agents", "focus"] {
+            assert!(!names.contains(&hidden), "/{hidden} must not be listed");
+        }
     }
 
     #[test]
@@ -978,6 +1116,7 @@ mod tests {
                     permission_mode: Some(PermissionMode::Default),
                     approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                     session_policy: SessionPolicy::Resume,
+                    parent: None,
                 },
                 MemberSummary {
                     id: MemberId::new("reviewer"),
@@ -993,6 +1132,7 @@ mod tests {
                     permission_mode: Some(PermissionMode::Default),
                     approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                     session_policy: SessionPolicy::Resume,
+                    parent: None,
                 },
             ],
         });

@@ -8,9 +8,11 @@ use std::sync::mpsc::SyncSender;
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::BackendKind;
+use crate::runtime::context_recap::without_recap;
 use crate::runtime::mode_prompts::{
     BRAINSTORM_BUILD_HINT, BRAINSTORM_PROPOSE_HINT, BRAINSTORM_STRETCH_HINT,
-    BRAINSTORM_SYNTHESIS_HINT, BRAINSTORM_VOTE_HINT, PLAN_MODE_HINT, REVIEW_PROTOCOL_HINT,
+    BRAINSTORM_SYNTHESIS_HINT, BRAINSTORM_VOTE_HINT, HANDBACK_MARKER, PLAN_MODE_HINT,
+    REVIEW_PROTOCOL_HINT, SUB_AGENT_TASK_MARKER,
 };
 
 type Responder = Box<dyn Fn(&RunRequest) -> Vec<AgentEvent> + Send + Sync>;
@@ -47,6 +49,11 @@ impl FakeRunner {
 
     /// Scripted teammate for `--fake`: recognizes mode prompts by their template
     /// markers (same constants the engine uses) and plays along; anything else echoes.
+    ///
+    /// Sub-agent flow: a plain message containing `spawn` makes the member open
+    /// a `reviewer` sub-agent (`spawn:<name>` picks the name) on another
+    /// backend; the sub-agent answers its task, and the parent acknowledges the
+    /// hand-back.
     pub fn team(backend: BackendKind) -> Self {
         Self::new(backend, move |req| {
             let session = AgentEvent::SessionDiscovered(AgentSessionId(format!(
@@ -54,7 +61,14 @@ impl FakeRunner {
                 backend.as_str()
             )));
             let text = team_response(backend, &req.prompt);
-            vec![session, AgentEvent::MessageCompleted(text)]
+            let mut events = vec![session];
+            // Only a plain echoed message plays the tool script, never a mode
+            // prompt that happens to mention tools.
+            if text.starts_with(&format!("[{backend} fake] ")) && asks_for_tools(&req.prompt) {
+                events.extend(tool_script());
+            }
+            events.push(AgentEvent::MessageCompleted(text));
+            events
         })
     }
 
@@ -64,7 +78,67 @@ impl FakeRunner {
     }
 }
 
+/// Words in a message that script the fake teammate.
+const ECHO_PROMPT_TRIGGER: &str = "echo-prompt";
+
+/// A message with the word `tools` makes the teammate run a batch of tool
+/// calls before it answers, so long tool groups can be seen offline.
+fn asks_for_tools(prompt: &str) -> bool {
+    without_recap(prompt)
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("tools"))
+}
+
+/// Eight finished calls of mixed kinds, one of them failing.
+fn tool_script() -> Vec<AgentEvent> {
+    let calls: [(&str, &str, bool); 8] = [
+        ("Read", "src/main.rs", true),
+        ("Read", "src/lib.rs", true),
+        ("Grep", "TODO", true),
+        ("Bash", "cargo build", true),
+        ("Read", "Cargo.toml", true),
+        ("Bash", "cargo test", false),
+        ("Grep", "fn main", true),
+        ("WebFetch", "https://example.com/docs", true),
+    ];
+    let mut events = Vec::new();
+    for (n, (name, summary, ok)) in calls.into_iter().enumerate() {
+        let id = format!("fake-tool-{n}");
+        events.push(AgentEvent::ToolStarted {
+            id: id.clone(),
+            name: name.to_string(),
+            summary: summary.to_string(),
+        });
+        events.push(AgentEvent::ToolCompleted {
+            id,
+            ok,
+            summary: if ok {
+                summary.to_string()
+            } else {
+                format!("error: {summary} failed")
+            },
+        });
+    }
+    events
+}
+
 fn team_response(backend: BackendKind, prompt: &str) -> String {
+    // A message containing `echo-prompt` is answered with the exact prompt the
+    // model received, recap included, so what a model switch carried over can
+    // be read off the screen. Only the message itself can trigger it, not an
+    // earlier one quoted in a recap.
+    if without_recap(prompt).contains(ECHO_PROMPT_TRIGGER) {
+        return prompt.to_string();
+    }
+    // Sub-agent messages first: their bodies may quote the word "spawn".
+    if prompt.contains(HANDBACK_MARKER) {
+        let result = prompt.split_once("\n\n").map_or(prompt, |(_, body)| body);
+        return format!("[{backend} fake] Got the sub-agent's result: {result}");
+    }
+    if prompt.contains(SUB_AGENT_TASK_MARKER) {
+        let task = prompt.split_once("\n\n").map_or(prompt, |(_, body)| body);
+        return format!("[{backend} fake sub-agent] Finished: {task}");
+    }
     if prompt.contains(REVIEW_PROTOCOL_HINT) {
         return "Reviewed the work.\n@@review {\"verdict\":\"approve\",\"summary\":\"fake approve\"}"
             .to_string();
@@ -109,7 +183,42 @@ fn team_response(backend: BackendKind, prompt: &str) -> String {
              @@brainstorm_card {{\"title\":\"Wild {backend} inversion\",\"proposal\":\"Invert the usual relationship\",\"mechanism\":\"Make the receiver initiate the exchange\",\"operation\":\"SEED\",\"sources\":[]}}"
         );
     }
-    format!("[{backend} fake] {prompt}")
+    // Keywords below belong to the new message, not to a recap in front of it.
+    let message = without_recap(prompt);
+    if let Some(spawn) = spawn_response(backend, message) {
+        return spawn;
+    }
+    format!("[{backend} fake] {message}")
+}
+
+/// Reply with one `@@spawn` line when a plain message asks to `spawn`.
+fn spawn_response(backend: BackendKind, prompt: &str) -> Option<String> {
+    let lower = prompt.to_ascii_lowercase();
+    // Bracketed prompts are relays and system notes, not the user asking.
+    if !lower.contains("spawn") || lower.trim_start().starts_with('[') {
+        return None;
+    }
+    let name = lower
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("spawn:"))
+        .map(|name| name.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_'))
+        .filter(|name| !name.is_empty())
+        .unwrap_or("reviewer");
+    let other = match backend {
+        BackendKind::Claude | BackendKind::Grok => BackendKind::Codex,
+        BackendKind::Codex | BackendKind::Agy => BackendKind::Claude,
+    };
+    // `spawn:sol` mimics a model that names its sub-agent after the model it
+    // asked for, so the name fallback can be exercised without a real backend.
+    let model = match name {
+        "sol" => ",\"model\":\"gpt-6.1-sol\"",
+        _ => "",
+    };
+    let task = prompt.replace(['"', '\\'], "'").replace('\n', " ");
+    Some(format!(
+        "Opening a {name} sub-agent.\n\
+         @@spawn {{\"name\":\"{name}\",\"task\":\"Look at this request and report back: {task}\",\"backend\":\"{other}\"{model},\"effort\":\"high\"}}"
+    ))
 }
 
 fn plan_plan_response(prompt: &str) -> String {
@@ -161,12 +270,28 @@ fn step_done_response(prompt: &str) -> String {
     lines.join("\n")
 }
 
+/// How long a prompt containing `slow` keeps the fake busy.
+const SLOW_REPLY: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl MemberRunner for FakeRunner {
     fn backend(&self) -> BackendKind {
         self.backend
     }
 
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
+        // A prompt that says `slow` makes the fake take about five seconds,
+        // so the running state can be looked at (and interrupted) offline.
+        if without_recap(&req.prompt)
+            .to_ascii_lowercase()
+            .contains("slow")
+        {
+            let started = std::time::Instant::now();
+            while started.elapsed() < SLOW_REPLY
+                && !req.cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         for event in (self.responder)(&req) {
             let _ = events.send(event);
         }
@@ -180,6 +305,7 @@ impl MemberRunner for FakeRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::context_recap::{RECAP_FOOTER, RECAP_HEADER};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -206,6 +332,31 @@ mod tests {
                 _ => None,
             })
             .expect("MessageCompleted")
+    }
+
+    #[test]
+    fn a_tools_message_runs_a_batch_of_mixed_calls_with_one_failure() {
+        let events = run(
+            &FakeRunner::team(BackendKind::Codex),
+            "use the tools please",
+        );
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+            .count();
+        let failed = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCompleted { ok: false, .. }))
+            .count();
+        assert_eq!((started, failed), (8, 1));
+        assert!(completed_text(&events).contains("use the tools please"));
+
+        let plain = run(&FakeRunner::team(BackendKind::Codex), "toolsmith");
+        assert!(
+            !plain
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+        );
     }
 
     #[test]
@@ -264,6 +415,68 @@ mod tests {
         assert!(text.contains("\"step\":2"));
         assert!(text.contains("\"step\":5"));
         assert!(text.contains("did the work"));
+    }
+
+    #[test]
+    fn team_spawn_keyword_emits_one_spawn_line() {
+        let events = run(
+            &FakeRunner::team(BackendKind::Codex),
+            "please spawn a helper",
+        );
+        let text = completed_text(&events);
+        let parsed = crate::router::parse_agent_output(text);
+        assert_eq!(parsed.spawns.len(), 1);
+        assert_eq!(parsed.spawns[0].name, "reviewer");
+        assert_eq!(parsed.spawns[0].backend.as_deref(), Some("claude"));
+
+        let named = run(&FakeRunner::team(BackendKind::Claude), "spawn:tester now");
+        let parsed = crate::router::parse_agent_output(completed_text(&named));
+        assert_eq!(parsed.spawns[0].name, "tester");
+        assert_eq!(parsed.spawns[0].backend.as_deref(), Some("codex"));
+        assert_eq!(parsed.spawns[0].model, None);
+    }
+
+    #[test]
+    fn team_spawn_sol_names_the_agent_after_its_model() {
+        let events = run(&FakeRunner::team(BackendKind::Claude), "spawn:sol please");
+        let parsed = crate::router::parse_agent_output(completed_text(&events));
+        assert_eq!(parsed.spawns[0].name, "sol");
+        assert_eq!(parsed.spawns[0].model.as_deref(), Some("gpt-6.1-sol"));
+    }
+
+    #[test]
+    fn team_sub_agent_messages_never_spawn_again() {
+        let task = format!("{SUB_AGENT_TASK_MARKER}Main (main)]\nhint\n\nplease spawn more");
+        let events = run(&FakeRunner::team(BackendKind::Claude), &task);
+        assert!(completed_text(&events).contains("Finished: please spawn more"));
+        assert!(!completed_text(&events).contains("@@spawn"));
+
+        let handback = format!("{HANDBACK_MARKER}reviewer (reviewer)]\nhint\n\nspawn done");
+        let events = run(&FakeRunner::team(BackendKind::Codex), &handback);
+        assert!(!completed_text(&events).contains("@@spawn"));
+    }
+
+    #[test]
+    fn echo_prompt_replies_with_the_whole_prompt_but_only_for_the_message() {
+        let runner = FakeRunner::team(BackendKind::Claude);
+        let events = run(&runner, "echo-prompt what did we talk about");
+        assert_eq!(
+            completed_text(&events),
+            "echo-prompt what did we talk about"
+        );
+
+        // With a recap in front, the reply keeps all of it.
+        let with_recap = format!(
+            "{RECAP_HEADER}\nUser: echo-prompt earlier\n\n{RECAP_FOOTER}\n\necho-prompt now"
+        );
+        let events = run(&runner, &with_recap);
+        assert_eq!(completed_text(&events), with_recap);
+
+        // A trigger word that only the recap quotes is not a trigger.
+        let quoted =
+            format!("{RECAP_HEADER}\nUser: echo-prompt earlier\n\n{RECAP_FOOTER}\n\nplain words");
+        let events = run(&runner, &quoted);
+        assert_eq!(completed_text(&events), "[claude fake] plain words");
     }
 
     #[test]

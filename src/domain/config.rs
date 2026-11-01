@@ -6,9 +6,11 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use std::{env, fs, io};
 
-use crate::adapter::models::run_with_timeout;
+use crate::adapter::models::{model_family_words, run_with_timeout};
+use crate::domain::event::SpawnRequest;
 use crate::domain::team::{
-    BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, TeamConfig, TeamMember,
+    BackendKind, DefaultTarget, Effort, MAX_SUB_AGENTS, MemberId, PermissionMode, SandboxPolicy,
+    TeamConfig, TeamMember, normalize_member_id,
 };
 use crate::fs_safety;
 
@@ -19,7 +21,7 @@ pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL
 /// Live roster and member status. Rewritten whenever the team or a status changes.
 pub const ASTERLINE_ROSTER_PATH: &str = ".asterline/roster.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 20;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 23;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
@@ -145,6 +147,18 @@ pub struct DetectedBackends {
 impl DetectedBackends {
     pub fn any(self) -> bool {
         self.codex || self.claude || self.grok || self.agy
+    }
+
+    /// The default main backend: Codex, then Claude, Grok, Agy.
+    pub fn first(self) -> Option<BackendKind> {
+        [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ]
+        .into_iter()
+        .find(|backend| self.contains(*backend))
     }
 
     pub fn contains(self, backend: BackendKind) -> bool {
@@ -425,60 +439,180 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Build a default in-memory roster from the detected backends:
-/// both -> mixed (codex builder + claude reviewer), one -> single-backend team,
-/// none -> `None` (the caller should show a setup/error state).
+/// Id of the single member a fresh workspace starts with.
+pub const MAIN_MEMBER_ID: &str = "main";
+
+/// Build the starting team when no config exists: one general-purpose `main`
+/// member on the first detected backend (Codex, Claude, Grok, then Agy) with
+/// that backend's safe permission defaults and no model override, so the CLI
+/// keeps using its own configured default. `None` when no backend is installed.
 pub fn default_team(
     workspace: impl Into<PathBuf>,
     detected: DetectedBackends,
 ) -> Option<TeamConfig> {
-    let workspace = workspace.into();
-    match (detected.codex, detected.claude) {
-        (true, true) => {
-            let mut builder =
-                TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
-            builder.apply_codex_permissions_preset(
-                crate::domain::team::CodexPermissionsPreset::AskForApproval,
-            );
-            let mut reviewer =
-                TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
-            reviewer.permission_mode = Some(PermissionMode::AcceptEdits);
-            let mut config = TeamConfig::new("default-mixed", workspace)
-                .with_member(builder)
-                .with_member(reviewer);
-            config.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
-            Some(config)
-        }
-        (true, false) => {
-            let mut codex = TeamMember::new("codex", "Codex", BackendKind::Codex, "general");
-            codex.apply_codex_permissions_preset(
-                crate::domain::team::CodexPermissionsPreset::AskForApproval,
-            );
-            Some(TeamConfig::new("default-codex", workspace).with_member(codex))
-        }
-        (false, true) => {
-            let mut claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "general");
-            claude.permission_mode = Some(PermissionMode::AcceptEdits);
-            Some(TeamConfig::new("default-claude", workspace).with_member(claude))
-        }
-        (false, false) if detected.grok => {
-            let mut grok = TeamMember::new("grok", "Grok", BackendKind::Grok, "general");
-            grok.sandbox = SandboxPolicy::WorkspaceWrite;
-            grok.permission_mode = Some(PermissionMode::Auto);
-            Some(TeamConfig::new("default-grok", workspace).with_member(grok))
-        }
-        (false, false) if detected.agy => {
-            let mut agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "general");
-            agy.sandbox = SandboxPolicy::WorkspaceWrite;
-            agy.permission_mode = Some(PermissionMode::AcceptEdits);
-            Some(TeamConfig::new("default-agy", workspace).with_member(agy))
-        }
-        (false, false) => None,
-    }
+    let backend = detected.first()?;
+    let mut config = TeamConfig::new("default", workspace).with_member(main_member(backend));
+    config.default_target = Some(DefaultTarget::Member(MemberId::new(MAIN_MEMBER_ID)));
+    Some(config)
 }
 
-/// The canonical default member for a backend, used by the interactive team
-/// builder. Custom rosters (roles, sandboxes, prompts) come via a config file.
+/// The `main` member on `backend`, with that backend's default permissions.
+pub fn main_member(backend: BackendKind) -> TeamMember {
+    let mut member = TeamMember::new(MAIN_MEMBER_ID, "Main", backend, "general");
+    apply_backend_defaults(&mut member);
+    member
+}
+
+/// Build the sub-agent an `@@spawn` asks for. Omitted backend, model, and effort
+/// follow `parent`. A different backend gets that backend's default permission
+/// preset; the same backend keeps the parent's. Errors are the reason shown to
+/// the parent when the request is refused.
+pub fn sub_agent_member(parent: &TeamMember, request: &SpawnRequest) -> Result<TeamMember, String> {
+    if request.name.chars().any(char::is_control) {
+        return Err("the name must not contain control characters".to_string());
+    }
+    let id = normalize_member_id(&request.name, "");
+    if id.is_empty() {
+        return Err(format!(
+            "the name {:?} has no letters or digits to build an id from",
+            request.name
+        ));
+    }
+    if id.eq_ignore_ascii_case("all") {
+        return Err("the name \"all\" is reserved for broadcast routing".to_string());
+    }
+    let backend = match request.backend.as_deref() {
+        Some(raw) => BackendKind::try_from(raw.to_ascii_lowercase().as_str())
+            .map_err(|_| format!("unknown backend {raw:?} (use claude, codex, grok, or agy)"))?,
+        None => parent.backend,
+    };
+    let same_backend = backend == parent.backend;
+    let effort = match request.effort.as_deref() {
+        Some(raw) => {
+            let effort = Effort::parse(raw).ok_or_else(|| {
+                format!("unknown effort {raw:?} (use low, medium, high, xhigh, max, or ultra)")
+            })?;
+            if !effort.supported_by(backend) {
+                return Err(format!(
+                    "{backend} does not support {} effort",
+                    effort.as_str()
+                ));
+            }
+            Some(effort)
+        }
+        None => parent.effort.filter(|effort| effort.supported_by(backend)),
+    };
+    let model = match &request.model {
+        Some(model) => Some(model.clone()),
+        // A model name belongs to one backend; do not carry it across.
+        None if same_backend => parent.model.clone(),
+        None => None,
+    };
+    let role = request
+        .role
+        .clone()
+        .unwrap_or_else(|| "sub-agent".to_string());
+    let mut member = TeamMember::new(id, upper_first(request.name.trim()), backend, role);
+    member.model = model;
+    member.effort = effort;
+    member.cwd = parent.cwd.clone();
+    if same_backend {
+        member.sandbox = parent.sandbox;
+        member.permission_mode = parent.permission_mode;
+        member.approvals_reviewer = parent.approvals_reviewer;
+        member.allowed_tools = parent.allowed_tools.clone();
+    } else {
+        apply_backend_defaults(&mut member);
+    }
+    member.parent = Some(parent.id.clone());
+    Ok(member)
+}
+
+/// Name given to a sub-agent whose requested name is only a model or backend.
+pub const DEFAULT_SUB_AGENT_NAME: &str = "helper";
+
+/// `text` with the first letter of each `-`/`_`-separated segment uppercased
+/// and the rest as given: `test-writer` becomes `Test-Writer`.
+pub(crate) fn upper_first(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut segment_start = true;
+    for ch in text.chars() {
+        if segment_start {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+        segment_start = matches!(ch, '-' | '_');
+    }
+    out
+}
+
+/// Lowercase alphanumeric words of `text`, split on `-`, `.`, `_`, `/`, `:`,
+/// spaces, and any other separator.
+fn name_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// A purely numeric word (`6`, `4`, `20251001`) or a short version tag (`v2`).
+fn is_version_word(word: &str) -> bool {
+    let digits = word.strip_prefix('v').unwrap_or(word);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// Whether the member id `id` says nothing but which model or CLI the
+/// sub-agent runs on: every non-version word is a backend name, a model family
+/// word, or a word of one of `models` (`sol` for `gpt-6.1-sol`). A name that
+/// adds a job (`opus-reviewer`) is not model-style.
+pub fn is_model_style_name(id: &str, models: &[&str]) -> bool {
+    let model_words: Vec<String> = models.iter().flat_map(|model| name_words(model)).collect();
+    let mut words = name_words(id)
+        .filter(|word| !is_version_word(word))
+        .peekable();
+    words.peek().is_some()
+        && words.all(|word| {
+            BackendKind::try_from(word.as_str()).is_ok()
+                || model_family_words().any(|family| family == word)
+                || model_words.contains(&word)
+        })
+}
+
+/// If `child`'s id is model-style (see [`is_model_style_name`]) given the
+/// model the request asked for and the one the child ended up with, rename it
+/// to the first free `helper`, `helper-2`, `helper-3`, ... (`taken` says
+/// whether a name already belongs to a member). Returns whether it renamed.
+pub fn replace_model_style_name(
+    child: &mut TeamMember,
+    requested_model: Option<&str>,
+    taken: impl Fn(&str) -> bool,
+) -> bool {
+    let models: Vec<&str> = requested_model
+        .into_iter()
+        .chain(child.model.as_deref())
+        .collect();
+    if !is_model_style_name(child.id.as_str(), &models) {
+        return false;
+    }
+    let name = std::iter::once(DEFAULT_SUB_AGENT_NAME.to_string())
+        .chain((2..).map(|n| format!("{DEFAULT_SUB_AGENT_NAME}-{n}")))
+        .find(|name| !taken(name))
+        .expect("an unbounded sequence has a free name");
+    child.display_name = upper_first(&name);
+    child.id = MemberId::new(name);
+    true
+}
+
+/// Reset a member's sandbox and permission settings to its backend's defaults.
+pub fn apply_backend_defaults(member: &mut TeamMember) {
+    let defaults = default_member(member.backend);
+    member.sandbox = defaults.sandbox;
+    member.permission_mode = defaults.permission_mode;
+    member.approvals_reviewer = defaults.approvals_reviewer;
+}
+
+/// The canonical permission preset for a backend. Custom rosters (roles,
+/// sandboxes, prompts) come via a config file.
 pub fn default_member(backend: BackendKind) -> TeamMember {
     match backend {
         BackendKind::Codex => {
@@ -508,36 +642,27 @@ pub fn default_member(backend: BackendKind) -> TeamMember {
     }
 }
 
-/// Build a team from an explicit list of backends chosen in the interactive
-/// builder. Returns `None` when no backend is selected.
-pub fn build_team(workspace: impl Into<PathBuf>, backends: &[BackendKind]) -> Option<TeamConfig> {
-    if backends.is_empty() {
-        return None;
-    }
-    let mut config = TeamConfig::new("custom", workspace);
-    for &backend in backends {
-        config = config.with_member(default_member(backend));
-    }
-    if let Some(first) = config.members.first().map(|m| m.id.clone()) {
-        config.default_target = Some(DefaultTarget::Member(first));
-    }
-    Some(config)
-}
-
 /// Prepend a compact Asterline team hint to each member's system prompt.
 /// Detailed protocol lives in the repo skill at `.agents/skills`.
 pub fn inject_team_protocol(team: &mut TeamConfig) {
     let protocols: Vec<String> = team
         .members
         .iter()
-        .map(|me| {
-            let teammates: Vec<String> = team
-                .members
-                .iter()
-                .filter(|other| other.id != me.id)
-                .map(|other| format!("{} [{}]", other.id, other.role))
-                .collect();
-            build_protocol(me.id.as_str(), &teammates)
+        .map(|me| match &me.parent {
+            Some(parent) => build_sub_agent_protocol(me.id.as_str(), parent.as_str()),
+            None => {
+                let teammates: Vec<String> = team
+                    .members
+                    .iter()
+                    .filter(|other| other.id != me.id && other.parent.is_none())
+                    .map(|other| format!("{} [{}]", other.id, other.role))
+                    .collect();
+                let sub_agents: Vec<String> = team
+                    .sub_agents_of(&me.id)
+                    .map(|child| format!("{} [{}]", child.id, child.role))
+                    .collect();
+                build_protocol(me.id.as_str(), &teammates, &sub_agents)
+            }
         })
         .collect();
 
@@ -588,7 +713,7 @@ pub fn strip_team_protocol(prompt: &str) -> String {
     out
 }
 
-fn build_protocol(me: &str, teammates: &[String]) -> String {
+fn build_protocol(me: &str, teammates: &[String], sub_agents: &[String]) -> String {
     let mut protocol = format!(
         "You are \"{me}\", a member of an Asterline multi-agent team.\n\
          {}\n",
@@ -599,8 +724,31 @@ fn build_protocol(me: &str, teammates: &[String]) -> String {
     } else {
         protocol.push_str(&format!("Teammates: {}.\n", teammates.join(", ")));
     }
+    if !sub_agents.is_empty() {
+        protocol.push_str(&format!("Your sub-agents: {}.\n", sub_agents.join(", ")));
+    }
+    protocol.push_str(&format!(
+        "Sub-agents: when work can run in parallel, or a second model's view or a review is worth it, \
+         open one with a control line (up to {MAX_SUB_AGENTS} per chat):\n\
+         @@spawn {{\"name\":\"reviewer\",\"task\":\"what to do\",\"backend\":\"claude\",\"model\":\"opus\",\"effort\":\"high\"}}\n\
+         backend, model, and effort are optional and default to yours. Name it after its job (reviewer, \
+         test-writer, researcher; helper if none), never a model or CLI, since the list shows the model. \
+         Its final reply comes back to you automatically as a message from it. To give a sub-agent more \
+         work, send @@spawn again with the same name.\n"
+    ));
     protocol.push_str("All other text you write is shown to the user.");
     protocol
+}
+
+fn build_sub_agent_protocol(me: &str, parent: &str) -> String {
+    format!(
+        "You are \"{me}\", a sub-agent opened by \"{parent}\" in an Asterline multi-agent team.\n\
+         {}\n\
+         When {parent} gives you a task, your final reply is handed back to {parent} automatically; \
+         you do not need to send it yourself. You cannot open sub-agents of your own.\n\
+         All other text you write is shown to the user.",
+        team_skill_hint()
+    )
 }
 
 #[cfg(test)]
@@ -608,104 +756,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mixed_default_team_pairs_codex_builder_with_claude_reviewer() {
-        let detected = DetectedBackends {
-            codex: true,
-            claude: true,
-            grok: false,
-            agy: false,
-        };
-        let config = default_team("/tmp/ws", detected).expect("mixed team");
+    fn upper_first_capitalises_each_hyphen_or_underscore_segment() {
+        assert_eq!(upper_first("test-writer"), "Test-Writer");
+        assert_eq!(upper_first("helper-2"), "Helper-2");
+        assert_eq!(upper_first("code_review-bot"), "Code_Review-Bot");
+        assert_eq!(upper_first("reviewer"), "Reviewer");
+        assert_eq!(upper_first("code review!"), "Code review!");
+        assert_eq!(upper_first("-x"), "-X");
+        assert_eq!(upper_first(""), "");
+    }
+
+    fn detected(codex: bool, claude: bool, grok: bool, agy: bool) -> DetectedBackends {
+        DetectedBackends {
+            codex,
+            claude,
+            grok,
+            agy,
+        }
+    }
+
+    #[test]
+    fn default_team_is_one_main_member_on_the_first_detected_backend() {
+        let config = default_team("/tmp/ws", detected(true, true, true, true)).expect("team");
 
         assert!(config.validate().is_ok());
-        assert_eq!(config.members.len(), 2);
-        assert_eq!(config.members[0].backend, BackendKind::Codex);
-        assert_eq!(config.members[1].backend, BackendKind::Claude);
-        assert_eq!(config.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(
-            config.members[1].permission_mode,
-            Some(PermissionMode::AcceptEdits)
-        );
-        assert_eq!(config.default_member_ids(), vec![MemberId::new("builder")]);
+        assert_eq!(config.members.len(), 1);
+        let main = &config.members[0];
+        assert_eq!(main.id, MemberId::new("main"));
+        assert_eq!(main.display_name, "Main");
+        assert_eq!(main.role, "general");
+        assert_eq!(main.backend, BackendKind::Codex);
+        assert_eq!(main.model, None);
+        assert_eq!(main.effort, None);
+        assert_eq!(config.default_member_ids(), vec![MemberId::new("main")]);
     }
 
     #[test]
-    fn codex_only_default_team_is_single_codex() {
-        let detected = DetectedBackends {
-            codex: true,
-            claude: false,
-            grok: false,
-            agy: false,
-        };
-        let config = default_team("/tmp/ws", detected).expect("codex team");
-
-        assert_eq!(config.members.len(), 1);
-        assert_eq!(config.members[0].backend, BackendKind::Codex);
+    fn default_backend_priority_is_codex_claude_grok_agy() {
+        for (flags, expected) in [
+            ((true, true, true, true), BackendKind::Codex),
+            ((false, true, true, true), BackendKind::Claude),
+            ((false, false, true, true), BackendKind::Grok),
+            ((false, false, false, true), BackendKind::Agy),
+        ] {
+            let config =
+                default_team("/tmp/ws", detected(flags.0, flags.1, flags.2, flags.3)).unwrap();
+            assert_eq!(config.members[0].backend, expected);
+        }
     }
 
     #[test]
-    fn claude_only_default_team_is_single_claude() {
-        let detected = DetectedBackends {
-            codex: false,
-            claude: true,
-            grok: false,
-            agy: false,
-        };
-        let config = default_team("/tmp/ws", detected).expect("claude team");
-
-        assert_eq!(config.members.len(), 1);
-        assert_eq!(config.members[0].backend, BackendKind::Claude);
+    fn default_main_member_uses_each_backends_permission_preset() {
+        let codex = main_member(BackendKind::Codex);
+        assert_eq!(codex.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(codex.permission_mode, Some(PermissionMode::Auto));
         assert_eq!(
-            config.members[0].permission_mode,
-            Some(PermissionMode::AcceptEdits)
+            codex.codex_permissions_preset(),
+            Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
         );
+
+        let claude = main_member(BackendKind::Claude);
+        assert_eq!(claude.permission_mode, Some(PermissionMode::AcceptEdits));
+
+        let grok = main_member(BackendKind::Grok);
+        assert_eq!(grok.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(grok.permission_mode, Some(PermissionMode::Auto));
+
+        let agy = main_member(BackendKind::Agy);
+        assert_eq!(agy.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(agy.permission_mode, Some(PermissionMode::AcceptEdits));
+    }
+
+    #[test]
+    fn apply_backend_defaults_resets_permissions_for_the_new_backend() {
+        let mut member = main_member(BackendKind::Claude);
+        member.backend = BackendKind::Grok;
+        apply_backend_defaults(&mut member);
+        assert_eq!(member.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(member.sandbox, SandboxPolicy::WorkspaceWrite);
     }
 
     #[test]
     fn no_backends_yields_no_default_team() {
-        let detected = DetectedBackends {
-            codex: false,
-            claude: false,
-            grok: false,
-            agy: false,
-        };
-        assert!(default_team("/tmp/ws", detected).is_none());
-    }
-
-    #[test]
-    fn agy_only_default_team_is_single_agy() {
-        let detected = DetectedBackends {
-            codex: false,
-            claude: false,
-            grok: false,
-            agy: true,
-        };
-        let config = default_team("/tmp/ws", detected).expect("agy team");
-        assert_eq!(config.members.len(), 1);
-        assert_eq!(config.members[0].backend, BackendKind::Agy);
-        assert_eq!(config.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(
-            config.members[0].permission_mode,
-            Some(PermissionMode::AcceptEdits)
-        );
-    }
-
-    #[test]
-    fn grok_only_default_team_is_single_grok() {
-        let detected = DetectedBackends {
-            codex: false,
-            claude: false,
-            grok: true,
-            agy: false,
-        };
-        let config = default_team("/tmp/ws", detected).expect("grok team");
-        assert_eq!(config.members.len(), 1);
-        assert_eq!(config.members[0].backend, BackendKind::Grok);
-        assert_eq!(config.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(
-            config.members[0].permission_mode,
-            Some(PermissionMode::Auto)
-        );
+        assert!(default_team("/tmp/ws", detected(false, false, false, false)).is_none());
     }
 
     #[test]
@@ -862,19 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn build_team_from_selected_backends() {
-        assert!(build_team("/tmp/ws", &[]).is_none());
-
-        let config = build_team("/tmp/ws", &[BackendKind::Codex, BackendKind::Agy]).unwrap();
-        assert!(config.validate().is_ok());
-        assert_eq!(config.members.len(), 2);
-        assert_eq!(config.members[0].backend, BackendKind::Codex);
-        assert_eq!(config.members[1].backend, BackendKind::Agy);
-        // The first selected member is the default target.
-        assert_eq!(config.default_member_ids(), vec![MemberId::new("builder")]);
-    }
-
-    #[test]
     fn default_member_maps_backend_to_role() {
         assert_eq!(default_member(BackendKind::Codex).role, "implementation");
         assert_eq!(default_member(BackendKind::Claude).role, "review");
@@ -993,7 +1113,7 @@ mod tests {
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 20"));
+        assert!(text.contains("version: 23"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -1066,12 +1186,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v20() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 20);
+    fn embedded_team_skill_is_protocol_v22() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 23);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 20")
+                .any(|line| line.trim() == "version: 23")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1096,7 +1216,10 @@ mod tests {
                 .contains("Writing the plan, review, or patch \"for the user\" is not delivery")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(ASTERLINE_ROSTER_PATH));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 20);
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 23);
+        assert!(ASTERLINE_TEAM_SKILL.contains("@@spawn"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("[hand-back from"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("at most 8 sub-agents"));
         assert!(ASTERLINE_TEAM_SKILL.contains("write defaults"));
         assert!(ASTERLINE_TEAM_SKILL.contains("Waiting For User Approval"));
     }
@@ -1106,16 +1229,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("asterline-cfg-load-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("team.json");
-        let config = default_team(
-            &dir,
-            DetectedBackends {
-                codex: true,
-                claude: true,
-                grok: false,
-                agy: false,
-            },
-        )
-        .unwrap();
+        let config = default_team(&dir, detected(true, true, false, false)).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
         let loaded = load_team_config(&path).expect("config loads");
@@ -1187,5 +1301,176 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn spawn(name: &str) -> SpawnRequest {
+        SpawnRequest {
+            name: name.to_string(),
+            task: "task".to_string(),
+            backend: None,
+            model: None,
+            effort: None,
+            role: None,
+        }
+    }
+
+    #[test]
+    fn sub_agent_copies_the_parent_when_nothing_is_overridden() {
+        let mut parent = main_member(BackendKind::Claude);
+        parent.model = Some("opus".to_string());
+        parent.effort = Some(Effort::High);
+        parent.permission_mode = Some(PermissionMode::BypassPermissions);
+
+        let child = sub_agent_member(&parent, &spawn("Reviewer")).unwrap();
+
+        assert_eq!(child.id, MemberId::new("reviewer"));
+        assert_eq!(child.display_name, "Reviewer");
+        assert_eq!(child.role, "sub-agent");
+        assert_eq!(child.parent, Some(parent.id.clone()));
+        assert_eq!(child.backend, BackendKind::Claude);
+        assert_eq!(child.model.as_deref(), Some("opus"));
+        assert_eq!(child.effort, Some(Effort::High));
+        assert_eq!(
+            child.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
+    }
+
+    #[test]
+    fn sub_agent_on_another_backend_takes_that_backends_defaults() {
+        let mut parent = main_member(BackendKind::Claude);
+        parent.model = Some("opus".to_string());
+        parent.effort = Some(Effort::Max);
+        let mut request = spawn("coder");
+        request.backend = Some("Codex".to_string());
+
+        let child = sub_agent_member(&parent, &request).unwrap();
+
+        assert_eq!(child.backend, BackendKind::Codex);
+        assert_eq!(child.model, None);
+        assert_eq!(child.effort, Some(Effort::Max));
+        assert_eq!(
+            child.codex_permissions_preset(),
+            Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+        );
+    }
+
+    #[test]
+    fn sub_agent_display_name_is_capitalised_and_the_id_is_not() {
+        let parent = main_member(BackendKind::Claude);
+        for (name, id, display) in [
+            ("reviewer", "reviewer", "Reviewer"),
+            ("test-writer", "test-writer", "Test-Writer"),
+            ("helper-2", "helper-2", "Helper-2"),
+            ("  code review ", "code-review", "Code review"),
+            ("QA", "qa", "QA"),
+            ("code_review-bot", "code_review-bot", "Code_Review-Bot"),
+        ] {
+            let child = sub_agent_member(&parent, &spawn(name)).unwrap();
+            assert_eq!(child.id, MemberId::new(id), "{name}");
+            assert_eq!(child.display_name, display, "{name}");
+        }
+    }
+
+    fn renamed(name: &str, model: Option<&str>, taken: &[&str]) -> Option<(String, String)> {
+        let mut parent = main_member(BackendKind::Claude);
+        parent.model = None;
+        let mut request = spawn(name);
+        request.model = model.map(str::to_string);
+        let mut child = sub_agent_member(&parent, &request).unwrap();
+        replace_model_style_name(&mut child, model, |candidate| taken.contains(&candidate))
+            .then(|| (child.id.to_string(), child.display_name))
+    }
+
+    #[test]
+    fn model_style_names_become_helper() {
+        let helper = Some(("helper".to_string(), "Helper".to_string()));
+        assert_eq!(renamed("sol", Some("gpt-6.1-sol"), &[]), helper);
+        assert_eq!(renamed("gpt-6-1-sol", Some("gpt-6.1-sol"), &[]), helper);
+        assert_eq!(renamed("Sol", Some("gpt/6.1_sol:high"), &[]), helper);
+        assert_eq!(renamed("opus", Some("opus"), &[]), helper);
+        assert_eq!(renamed("opus", None, &[]), helper);
+        assert_eq!(renamed("claude-opus", None, &[]), helper);
+        assert_eq!(renamed("claude-opus-4-5", None, &[]), helper);
+        assert_eq!(renamed("codex", None, &[]), helper);
+        assert_eq!(renamed("agy", None, &[]), helper);
+        assert_eq!(renamed("gemini", None, &[]), helper);
+        assert_eq!(renamed("gpt", None, &[]), helper);
+    }
+
+    #[test]
+    fn job_names_are_kept() {
+        for (name, model) in [
+            ("opus-reviewer", Some("opus")),
+            ("reviewer", Some("gpt-6.1-sol")),
+            ("researcher", Some("opus")),
+            ("test-writer", None),
+            ("helper", None),
+            // `sol` is only a model word when the model says so.
+            ("sol", None),
+            ("4", Some("gpt-4")),
+        ] {
+            assert_eq!(renamed(name, model, &[]), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn replacement_name_skips_taken_helpers() {
+        assert_eq!(
+            renamed("sol", Some("gpt-6.1-sol"), &["helper"]),
+            Some(("helper-2".to_string(), "Helper-2".to_string()))
+        );
+        assert_eq!(
+            renamed("codex", None, &["helper", "helper-2"]),
+            Some(("helper-3".to_string(), "Helper-3".to_string()))
+        );
+    }
+
+    #[test]
+    fn model_style_check_uses_the_childs_effective_model() {
+        let mut parent = main_member(BackendKind::Claude);
+        parent.model = Some("gpt-6.1-sol".to_string());
+        let mut child = sub_agent_member(&parent, &spawn("sol")).unwrap();
+        assert!(replace_model_style_name(&mut child, None, |_| false));
+        assert_eq!(child.id, MemberId::new("helper"));
+    }
+
+    #[test]
+    fn protocol_tells_agents_to_name_sub_agents_after_their_job() {
+        let protocol = build_protocol("main", &[], &[]);
+        assert!(protocol.contains("Name it after its job"));
+        assert!(protocol.contains("never a model or CLI"));
+        assert!(protocol.contains(r#"{"name":"reviewer""#));
+        assert!(ASTERLINE_TEAM_SKILL.contains("Name a sub-agent after its job"));
+    }
+
+    #[test]
+    fn sub_agent_requests_with_bad_values_are_refused_with_a_reason() {
+        let parent = main_member(BackendKind::Claude);
+        for (mutate, reason) in [
+            (
+                Box::new(|r: &mut SpawnRequest| r.name = "!!!".to_string())
+                    as Box<dyn Fn(&mut SpawnRequest)>,
+                "no letters or digits",
+            ),
+            (Box::new(|r| r.name = "all".to_string()), "reserved"),
+            (
+                Box::new(|r| r.backend = Some("gpt".to_string())),
+                "unknown backend",
+            ),
+            (
+                Box::new(|r| r.effort = Some("huge".to_string())),
+                "unknown effort",
+            ),
+            (
+                Box::new(|r| r.effort = Some("ultra".to_string())),
+                "does not support",
+            ),
+        ] {
+            let mut request = spawn("helper");
+            mutate(&mut request);
+            let error = sub_agent_member(&parent, &request).unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
     }
 }
