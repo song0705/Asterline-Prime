@@ -37,6 +37,8 @@ struct Palette {
     user_band: Color,
     /// Quieter than `muted`: placeholders, ages and hints that should recede.
     dim: Color,
+    /// Subtle background behind inline code.
+    code_bg: Color,
     /// Full-width band behind the selected row of a list view.
     selection_bg: Color,
     selection_text: Color,
@@ -61,6 +63,7 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             user: Color::Rgb(134, 239, 172),
             user_band: Color::Rgb(48, 48, 48),
             dim: Color::Rgb(113, 113, 122),
+            code_bg: Color::Rgb(39, 39, 42),
             selection_bg: Color::Rgb(58, 58, 66),
             selection_text: Color::Black,
             chat_selection_bg: Color::Rgb(63, 63, 70),
@@ -77,6 +80,7 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             user: Color::Rgb(22, 101, 52),
             user_band: Color::Rgb(232, 232, 232),
             dim: Color::Rgb(113, 113, 122),
+            code_bg: Color::Rgb(238, 238, 241),
             selection_bg: Color::Rgb(220, 220, 228),
             selection_text: Color::White,
             chat_selection_bg: Color::Rgb(212, 212, 216),
@@ -126,6 +130,11 @@ pub fn user_band_bg() -> Color {
 /// that stays distinct from `user_band_bg`.
 pub fn selection_bg() -> Color {
     palette().selection_bg
+}
+
+/// Background of inline code spans.
+pub fn code_bg() -> Color {
+    palette().code_bg
 }
 
 pub fn dim_color() -> Color {

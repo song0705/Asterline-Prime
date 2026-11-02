@@ -11,6 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use std::borrow::Cow;
+use std::ops::Range;
+
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,6 +22,8 @@ use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::tui::{hyperlink, theme};
 
 /// Default syntaxes and a dark theme, loaded once. `syntect` parsing is backed
 /// by `fancy-regex` (pure Rust), so there is no C toolchain dependency.
@@ -60,15 +65,236 @@ pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     })
 }
 
-fn render_uncached(text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut renderer = Renderer::new(width);
+fn parser_options() -> Options {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
-    for event in Parser::new_ext(text, options) {
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options
+}
+
+fn render_uncached(text: &str, width: usize) -> Vec<Line<'static>> {
+    let mut renderer = Renderer::new(width);
+    let prepared = fix_cjk_emphasis(text);
+    for event in Parser::new_ext(&prepared, parser_options()) {
         renderer.handle(event);
     }
     renderer.finish()
+}
+
+/// Find the first bare `http://` / `https://` URL in `text` as a byte range.
+/// A URL ends at whitespace or the first non-ASCII character (CJK text often
+/// follows a URL with no space) and drops trailing sentence punctuation.
+fn find_bare_url(text: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("://") {
+        let sep = from + offset;
+        from = sep + 3;
+        let scheme_start = text[..sep]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_ascii_alphabetic())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let scheme = &text[scheme_start..sep];
+        if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+            continue;
+        }
+        let mut end = text[sep + 3..]
+            .find(|c: char| c.is_whitespace() || !c.is_ascii() || c == '<' || c == '>')
+            .map_or(text.len(), |i| sep + 3 + i);
+        loop {
+            let url = &text[scheme_start..end];
+            let Some(last) = url.chars().last() else {
+                break;
+            };
+            let trim = match last {
+                '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+                ')' => url.matches('(').count() < url.matches(')').count(),
+                ']' => url.matches('[').count() < url.matches(']').count(),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            end -= 1;
+        }
+        if end > sep + 3 {
+            return Some((scheme_start, end));
+        }
+    }
+    None
+}
+
+/// Zero width space: neither whitespace nor punctuation for CommonMark's
+/// flanking rules. It is inserted next to `*` runs to make emphasis around CJK
+/// punctuation work, and stripped again from every text event.
+const ZWSP: char = '\u{200b}';
+
+fn strip_zwsp(text: &str) -> Cow<'_, str> {
+    if text.contains(ZWSP) {
+        Cow::Owned(text.replace(ZWSP, ""))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Non-ASCII punctuation that CommonMark treats as punctuation but that sits
+/// directly against CJK text with no space (so `。**它` never closes bold).
+fn is_cjk_punct(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00B7
+            | 0x2010..=0x2027
+            | 0x2030..=0x205E
+            | 0x3001..=0x3003
+            | 0x3008..=0x3011
+            | 0x3014..=0x301F
+            | 0x3030
+            | 0x303D
+            | 0x30FB
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6B
+            | 0xFF01..=0xFF0F
+            | 0xFF1A..=0xFF20
+            | 0xFF3B..=0xFF40
+            | 0xFF5B..=0xFF65
+    )
+}
+
+fn is_punct(c: char) -> bool {
+    c.is_ascii_punctuation() || is_cjk_punct(c)
+}
+
+/// CommonMark left/right-flanking test for a `*` run, with `None` meaning a
+/// line boundary (treated as whitespace).
+fn flanking(prev: Option<char>, next: Option<char>) -> (bool, bool) {
+    let ws = |c: Option<char>| c.is_none_or(char::is_whitespace);
+    let punct = |c: Option<char>| c.is_some_and(is_punct);
+    let can_open = !ws(next) && (!punct(next) || ws(prev) || punct(prev));
+    let can_close = !ws(prev) && (!punct(prev) || ws(next) || punct(next));
+    (can_open, can_close)
+}
+
+/// CommonMark refuses `**` that touches CJK punctuation on one side and a
+/// letter on the other (`找人。**它`, `是**“词”**`), so bold leaks as literal
+/// asterisks. Insert a zero width space on the punctuation side of such runs
+/// so they become valid openers/closers. Code spans, code blocks and raw HTML
+/// are left untouched, and only runs whose meaning is unambiguous are changed.
+fn fix_cjk_emphasis(text: &str) -> Cow<'_, str> {
+    if !text.contains('*') || !text.chars().any(is_cjk_punct) {
+        return Cow::Borrowed(text);
+    }
+    let mut protected: Vec<Range<usize>> = Vec::new();
+    for (event, range) in Parser::new_ext(text, parser_options()).into_offset_iter() {
+        match event {
+            Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::Start(Tag::CodeBlock(_)) => protected.push(range),
+            _ => {}
+        }
+    }
+    protected.sort_by_key(|r| r.start);
+
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut changed = false;
+    // Lengths of `*` runs that opened and have not closed yet.
+    let mut open: Vec<usize> = Vec::new();
+    let mut next_protected = 0usize;
+    let mut i = 0usize;
+    while i < text.len() {
+        while next_protected < protected.len() && protected[next_protected].end <= i {
+            next_protected += 1;
+        }
+        if let Some(range) = protected.get(next_protected).filter(|r| r.start <= i) {
+            out.push_str(&text[i..range.end]);
+            i = range.end;
+            continue;
+        }
+        let Some(c) = text[i..].chars().next() else {
+            break;
+        };
+        if c == '\n' {
+            let rest = &text[i + 1..];
+            let next_line = rest.split('\n').next().unwrap_or("");
+            let this_line = text[..i].rsplit('\n').next().unwrap_or("");
+            if next_line.trim().is_empty() || this_line.trim_start().starts_with('|') {
+                open.clear();
+            }
+        }
+        if c != '*' {
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        let mut j = i;
+        while text[j..].starts_with('*') {
+            j += 1;
+        }
+        let len = j - i;
+        let run = &text[i..j];
+        let escaped = text[..i].bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1;
+        if escaped {
+            out.push_str(run);
+            i = j;
+            continue;
+        }
+        let prev = text[..i].chars().next_back();
+        let next = text[j..].chars().next();
+        let (can_open, can_close) = flanking(prev, next);
+        let has_open = open.contains(&len);
+        let close = |open: &mut Vec<usize>| {
+            if let Some(pos) = open.iter().rposition(|l| *l == len) {
+                open.truncate(pos);
+            }
+        };
+        let mut before = false;
+        let mut after = false;
+        if !can_open
+            && can_close
+            && next.is_some_and(is_cjk_punct)
+            && prev.is_some_and(|p| !is_punct(p))
+        {
+            // `字**，`: a closer when something is open, else an opener that
+            // needs help because CJK punctuation follows it.
+            if has_open {
+                close(&mut open);
+            } else {
+                after = true;
+                open.push(len);
+            }
+        } else if can_open && !can_close && prev.is_some_and(is_cjk_punct) && has_open {
+            // `。**字` closing an earlier opener.
+            before = true;
+            close(&mut open);
+        } else if can_open && can_close {
+            if has_open {
+                close(&mut open);
+            } else {
+                open.push(len);
+            }
+        } else if can_open {
+            open.push(len);
+        } else if can_close && has_open {
+            close(&mut open);
+        }
+        if before {
+            out.push(ZWSP);
+            changed = true;
+        }
+        out.push_str(run);
+        if after {
+            out.push(ZWSP);
+            changed = true;
+        }
+        i = j;
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -99,6 +325,14 @@ struct Table {
     in_head: bool,
 }
 
+/// An open `[label](url)` link. Only the label is shown; the destination rides
+/// invisibly in the label's style (see [`crate::tui::hyperlink`]).
+struct LinkState {
+    /// Label style (link colour plus the click target), or the plain style
+    /// when the destination is not a safe URL.
+    style: Style,
+}
+
 struct Renderer {
     width: usize,
     out: Vec<Line<'static>>,
@@ -107,11 +341,20 @@ struct Renderer {
     bold: bool,
     italic: bool,
     strike: bool,
-    link: bool,
+    link: Option<LinkState>,
     heading: Option<HeadingLevel>,
     /// One entry per open list; `Some(n)` is the next ordered number.
     lists: Vec<Option<u64>>,
+    /// Per open list: the column where the current item's text starts, so
+    /// nested lists and continuation lines align under it.
+    item_cols: Vec<usize>,
+    /// Inside a footnote definition (rendered as a dim list entry).
+    in_footnote: bool,
+    /// The previous top-level block was a footnote definition.
+    after_footnote: bool,
     quote_depth: usize,
+    /// Whether the outermost open block quote already holds a block.
+    quote_has_content: bool,
     /// First-line prefix for the current list item (consumed on first flush).
     pending_prefix: Option<String>,
     /// Pulldown may split malformed emphasis markers into one-character text
@@ -129,10 +372,14 @@ impl Renderer {
             bold: false,
             italic: false,
             strike: false,
-            link: false,
+            link: None,
             heading: None,
             lists: Vec::new(),
+            item_cols: Vec::new(),
+            in_footnote: false,
+            after_footnote: false,
             quote_depth: 0,
+            quote_has_content: false,
             pending_prefix: None,
             normal_text: None,
         }
@@ -152,37 +399,53 @@ impl Renderer {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.text(&text),
+            Event::Text(text) => self.text(&strip_zwsp(&text)),
             Event::Code(code) => {
                 if let Mode::Table(table) = &mut self.mode {
                     table.cell.push_str(&code);
                 } else {
-                    let style = self.inline_style().fg(Color::Yellow);
+                    let style = self
+                        .inline_style()
+                        .fg(theme::warning_color())
+                        .bg(theme::code_bg());
                     self.push_units(&code, style);
                 }
             }
-            Event::SoftBreak => self.text(" "),
+            // In prose a soft break is a newline unit: the wrapper turns it
+            // into a space, or into nothing between two CJK characters.
+            Event::SoftBreak => {
+                let soft = if matches!(self.mode, Mode::Normal) {
+                    "\n"
+                } else {
+                    " "
+                };
+                self.text(soft);
+            }
             Event::HardBreak => self.flush_block(),
             Event::Rule => {
                 self.block_separator();
                 self.out.push(Line::from(Span::styled(
-                    "---",
-                    Style::default().fg(Color::DarkGray),
+                    "─".repeat(self.width.max(1)),
+                    theme::dim(),
                 )));
             }
-            // Raw HTML / footnotes / math: surface their text verbatim.
+            // Raw HTML / math: surface their text verbatim.
             Event::Html(s)
             | Event::InlineHtml(s)
             | Event::InlineMath(s)
             | Event::DisplayMath(s) => {
-                self.push_units(&s, self.inline_style());
+                self.push_units(&strip_zwsp(&s), self.inline_style());
             }
             Event::TaskListMarker(done) => {
-                let mark = if done { "[x] " } else { "[ ] " };
-                self.push_units(mark, self.inline_style());
+                let (mark, color) = if done {
+                    ("☑ ", theme::success_color())
+                } else {
+                    ("☐ ", theme::muted_color())
+                };
+                self.push_units(mark, Style::default().fg(color));
             }
             Event::FootnoteReference(name) => {
-                self.push_units(&format!("[^{name}]"), self.inline_style());
+                self.push_units(&format!("[{name}]"), theme::dim());
             }
         }
     }
@@ -190,12 +453,16 @@ impl Renderer {
     fn start(&mut self, tag: Tag<'_>) {
         self.flush_normal_text();
         match tag {
+            Tag::Paragraph => self.block_separator(),
             Tag::Heading { level, .. } => {
                 self.block_separator();
                 self.heading = Some(level);
             }
             Tag::BlockQuote(_) => {
                 self.block_separator();
+                if self.quote_depth == 0 {
+                    self.quote_has_content = false;
+                }
                 self.quote_depth += 1;
             }
             Tag::CodeBlock(kind) => {
@@ -222,10 +489,16 @@ impl Renderer {
                     self.block_separator();
                 }
                 self.lists.push(start);
+                self.item_cols.push(0);
             }
             Tag::Item => {
                 let depth = self.lists.len();
-                let base = "  ".repeat(depth.saturating_sub(1));
+                let parent_col = if depth >= 2 {
+                    self.item_cols[depth - 2]
+                } else {
+                    0
+                };
+                let base = " ".repeat(parent_col);
                 let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let m = format!("{base}{n}. ");
@@ -234,12 +507,26 @@ impl Renderer {
                     }
                     _ => format!("{base}• "),
                 };
+                if let Some(col) = self.item_cols.last_mut() {
+                    *col = display_width(&marker);
+                }
                 self.pending_prefix = Some(marker);
+            }
+            Tag::FootnoteDefinition(name) => {
+                if !self.after_footnote {
+                    self.block_separator();
+                }
+                self.in_footnote = true;
+                self.pending_prefix = Some(format!("[{name}] "));
             }
             Tag::Strong => self.bold = true,
             Tag::Emphasis => self.italic = true,
             Tag::Strikethrough => self.strike = true,
-            Tag::Link { .. } => self.link = true,
+            Tag::Link { dest_url, .. } => {
+                self.link = Some(LinkState {
+                    style: hyperlink::link_style(&strip_zwsp(&dest_url)),
+                });
+            }
             Tag::Table(alignments) => {
                 self.block_separator();
                 self.mode = Mode::Table(Table {
@@ -276,8 +563,17 @@ impl Renderer {
             }
             TagEnd::BlockQuote(_) => self.quote_depth = self.quote_depth.saturating_sub(1),
             TagEnd::CodeBlock => self.flush_code(),
+            TagEnd::FootnoteDefinition => {
+                if !self.cur.is_empty() {
+                    self.flush_block();
+                }
+                self.in_footnote = false;
+                self.after_footnote = true;
+                self.pending_prefix = None;
+            }
             TagEnd::List(_) => {
                 self.lists.pop();
+                self.item_cols.pop();
                 self.pending_prefix = None;
             }
             TagEnd::Item => {
@@ -289,7 +585,7 @@ impl Renderer {
             TagEnd::Strong => self.bold = false,
             TagEnd::Emphasis => self.italic = false,
             TagEnd::Strikethrough => self.strike = false,
-            TagEnd::Link => self.link = false,
+            TagEnd::Link => self.link = None,
             TagEnd::Table => self.flush_table(),
             TagEnd::TableCell => {
                 if let Mode::Table(t) = &mut self.mode {
@@ -346,29 +642,47 @@ impl Renderer {
     fn push_loose_strong(&mut self, text: &str, style: Style) {
         let mut rest = text;
         while let Some(open) = rest.find("**") {
-            self.push_units(&rest[..open], style);
+            self.push_prose(&rest[..open], style);
             let after_open = &rest[open + 2..];
             let Some(close) = after_open.find("**") else {
-                self.push_units(&rest[open..], style);
+                self.push_prose(&rest[open..], style);
                 return;
             };
             let inner = &after_open[..close];
             self.emit_loose_strong(inner, style);
             rest = &after_open[close + 2..];
         }
-        self.push_units(rest, style);
+        self.push_prose(rest, style);
     }
 
     fn emit_loose_strong(&mut self, inner: &str, style: Style) {
         let content = inner.trim_end();
         if content.is_empty() || content.len() == inner.len() {
-            self.push_units("**", style);
-            self.push_units(inner, style);
-            self.push_units("**", style);
+            self.push_prose("**", style);
+            self.push_prose(inner, style);
+            self.push_prose("**", style);
             return;
         }
-        self.push_units(content, style.add_modifier(Modifier::BOLD));
-        self.push_units(&inner[content.len()..], style);
+        self.push_prose(content, style.add_modifier(Modifier::BOLD));
+        self.push_prose(&inner[content.len()..], style);
+    }
+
+    /// Push prose text, styling bare `http(s)://` URLs like link labels.
+    fn push_prose(&mut self, text: &str, style: Style) {
+        if self.link.is_some() || !text.contains("://") {
+            self.push_units(text, style);
+            return;
+        }
+        let mut rest = text;
+        while let Some((start, end)) = find_bare_url(rest) {
+            self.push_units(&rest[..start], style);
+            self.push_units(
+                &rest[start..end],
+                style.patch(hyperlink::link_style(&rest[start..end])),
+            );
+            rest = &rest[end..];
+        }
+        self.push_units(rest, style);
     }
 
     fn push_units(&mut self, text: &str, style: Style) {
@@ -379,19 +693,21 @@ impl Renderer {
 
     /// The active inline style from the open emphasis/heading/link/quote state.
     fn inline_style(&self) -> Style {
-        if let Some(level) = self.heading {
-            let color = if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-                Color::Cyan
-            } else {
-                Color::Blue
-            };
-            return Style::default().fg(color).add_modifier(Modifier::BOLD);
-        }
         let mut style = Style::default();
-        if self.link {
-            style = style.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+        if let Some(level) = self.heading {
+            let color = match level {
+                HeadingLevel::H1 => theme::accent_color(),
+                HeadingLevel::H2 => theme::emphasis_color(),
+                _ => theme::muted_color(),
+            };
+            style = style.fg(color).add_modifier(Modifier::BOLD);
+        } else if self.in_footnote {
+            style = style.fg(theme::dim_color());
         } else if self.quote_depth > 0 {
-            style = style.fg(Color::Gray);
+            style = style.fg(theme::muted_color());
+        }
+        if let Some(link) = &self.link {
+            style = style.patch(link.style);
         }
         if self.bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -405,10 +721,39 @@ impl Renderer {
         style
     }
 
-    /// Insert a blank line between consecutive top-level blocks.
+    /// Separate the block that is about to start from the previous one: one
+    /// blank line between top-level blocks (never doubled, never at the very
+    /// start), a bare quote bar between blocks of the same quote, and nothing
+    /// inside lists so tight items stay adjacent.
     fn block_separator(&mut self) {
-        if self.lists.is_empty() && self.quote_depth == 0 && !self.out.is_empty() {
-            self.out.push(Line::raw(""));
+        if !self.lists.is_empty() || self.in_footnote {
+            return;
+        }
+        self.after_footnote = false;
+        if self.quote_depth == 0 {
+            if !self.cur.is_empty() {
+                self.flush_block();
+            }
+            let last_is_blank = self
+                .out
+                .last()
+                .is_none_or(|line| line.spans.iter().all(|s| s.content.trim().is_empty()));
+            if !last_is_blank {
+                self.out.push(Line::raw(""));
+            }
+        } else if self.quote_has_content {
+            let bar = "▎ ".repeat(self.quote_depth);
+            let last_is_bar = self.out.last().is_some_and(|line| {
+                line.spans
+                    .iter()
+                    .all(|s| s.content.chars().all(|c| c == '▎' || c == ' '))
+            });
+            if !last_is_bar {
+                self.out.push(Line::from(Span::styled(
+                    bar.trim_end().to_string(),
+                    theme::dim(),
+                )));
+            }
         }
     }
 
@@ -417,11 +762,14 @@ impl Renderer {
     fn flush_block(&mut self) {
         self.flush_normal_text();
         let (first, cont) = self.prefixes();
-        let prefix_style = if self.quote_depth > 0 {
-            Style::default().fg(Color::DarkGray)
+        let prefix_style = if self.quote_depth > 0 || self.in_footnote {
+            theme::dim()
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme::accent_color())
         };
+        if self.quote_depth > 0 {
+            self.quote_has_content = true;
+        }
         let prefix_width = display_width(&first).max(display_width(&cont));
         let avail = self.width.saturating_sub(prefix_width).max(1);
         let wrapped = wrap_units(&self.cur, avail);
@@ -453,7 +801,7 @@ impl Renderer {
                 (marker, indent)
             }
             None if !self.lists.is_empty() => {
-                let indent = "  ".repeat(self.lists.len());
+                let indent = " ".repeat(self.item_cols.last().copied().unwrap_or(0));
                 (indent.clone(), indent)
             }
             None => (String::new(), String::new()),
@@ -468,9 +816,14 @@ impl Renderer {
         let Mode::Code { lang, buf } = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return;
         };
-        for line in highlight_code(&buf, lang.as_deref()) {
-            self.out.push(line);
+        if let Some(lang) = &lang {
+            self.out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(lang.clone(), theme::dim()),
+            ]));
         }
+        let room = self.width.saturating_sub(2).max(1);
+        self.out.extend(highlight_code(&buf, lang.as_deref(), room));
     }
 
     fn flush_table(&mut self) {
@@ -483,8 +836,10 @@ impl Renderer {
     }
 }
 
-/// Highlight a fenced code block with syntect, returning indented styled lines.
-fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+/// Highlight a fenced code block with syntect. Lines wider than `room` are
+/// hard-broken (never cut); continuation rows start with a dim `↪` marker in
+/// the two-column gutter that otherwise holds plain indentation.
+fn highlight_code(code: &str, lang: Option<&str>, room: usize) -> Vec<Line<'static>> {
     let syntax = lang
         .and_then(|l| SYNTAXES.find_syntax_by_token(l))
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
@@ -492,25 +847,28 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
 
     let mut out = Vec::new();
     for line in LinesWithEndings::from(code) {
+        let expanded = line.replace('\t', "    ");
         let ranges = highlighter
-            .highlight_line(line, &SYNTAXES)
+            .highlight_line(&expanded, &SYNTAXES)
             .unwrap_or_default();
-        let mut spans = vec![Span::styled("  ", Style::default())];
+        let mut units: Vec<Unit> = Vec::new();
         for (syn, text) in ranges {
-            let text = text.trim_end_matches('\n');
-            if text.is_empty() {
-                continue;
+            let style = syntect_style(syn);
+            for ch in text.trim_end_matches(['\n', '\r']).chars() {
+                units.push((ch, style));
             }
-            let mut style = Style::default().fg(syntect_color(syn.foreground));
-            if syn.font_style.contains(FontStyle::BOLD) {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            if syn.font_style.contains(FontStyle::ITALIC) {
-                style = style.add_modifier(Modifier::ITALIC);
-            }
-            spans.push(Span::styled(text.to_string(), style));
         }
-        out.push(Line::from(spans));
+        let rows = hard_break(units, room);
+        for (index, row) in rows.into_iter().enumerate() {
+            let gutter = if index == 0 {
+                Span::raw("  ")
+            } else {
+                Span::styled("↪ ", theme::dim())
+            };
+            let mut spans = vec![gutter];
+            spans.extend(coalesce(row));
+            out.push(Line::from(spans));
+        }
     }
     out
 }
@@ -562,10 +920,10 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
     let col_w = table_column_widths(table, cols, width);
 
     let header_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(theme::accent_color())
         .add_modifier(Modifier::BOLD);
-    let body_style = Style::default().fg(Color::Gray);
-    let rule_style = Style::default().fg(Color::DarkGray);
+    let body_style = theme::muted();
+    let rule_style = theme::dim();
     let mut out = vec![Line::from(Span::styled(
         table_rule(&col_w, '┌', '┬', '┐'),
         rule_style,
@@ -670,70 +1028,18 @@ fn table_column_widths(table: &Table, cols: usize, width: usize) -> Vec<usize> {
     widths
 }
 
-/// Wrap one cell to `width` display cells. Breaks at spaces when possible,
-/// after wide (CJK) characters, and otherwise hard-breaks by display width.
+/// Wrap one table cell to `width` display cells with the same rules as prose
+/// (see [`wrap_units`]). Always returns at least one (possibly empty) line.
 fn wrap_cell(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    // Tokens: (text, preceded_by_space). A token ends at whitespace or right
-    // after a wide character, which may wrap anywhere.
-    let mut tokens: Vec<(String, bool)> = Vec::new();
-    let mut cur = String::new();
-    let mut space_before = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !cur.is_empty() {
-                tokens.push((std::mem::take(&mut cur), space_before));
-            }
-            space_before = true;
-            continue;
-        }
-        cur.push(ch);
-        if char_width(ch) > 1 {
-            tokens.push((std::mem::take(&mut cur), space_before));
-            space_before = false;
-        }
-    }
-    if !cur.is_empty() {
-        tokens.push((cur, space_before));
-    }
-
-    let mut lines: Vec<String> = Vec::new();
-    let mut line = String::new();
-    let mut line_w = 0usize;
-    for (token, spaced) in tokens {
-        let token_w = display_width(&token);
-        let gap = usize::from(spaced && !line.is_empty());
-        if !line.is_empty() && line_w + gap + token_w <= width {
-            if gap == 1 {
-                line.push(' ');
-            }
-            line.push_str(&token);
-            line_w += gap + token_w;
-            continue;
-        }
-        if !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
-            line_w = 0;
-        }
-        if token_w <= width {
-            line = token;
-            line_w = token_w;
-            continue;
-        }
-        for ch in token.chars() {
-            let cw = char_width(ch);
-            if line_w + cw > width && !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-                line_w = 0;
-            }
-            line.push(ch);
-            line_w += cw;
-        }
-    }
-    if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
+    let units: Vec<Unit> = text.chars().map(|c| (c, Style::default())).collect();
+    let lines = wrap_units(&units, width);
+    if lines.is_empty() {
+        return vec![String::new()];
     }
     lines
+        .into_iter()
+        .map(|line| line.into_iter().map(|(c, _)| c).collect())
+        .collect()
 }
 
 fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> String {
@@ -787,70 +1093,186 @@ fn coalesce(units: Vec<Unit>) -> Vec<Span<'static>> {
     spans
 }
 
-/// Greedy, display-width-aware word wrap over styled units. Words wider than
-/// `width` are hard-broken; styles are preserved across wraps.
+/// Characters that must not start a line (closing punctuation, sentence
+/// marks), CJK and ASCII.
+fn no_line_start(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '）'
+            | '」'
+            | '』'
+            | '”'
+            | '’'
+            | '》'
+            | '〉'
+            | '】'
+            | '〕'
+            | '〗'
+            | '］'
+            | '｝'
+            | '…'
+            | '‥'
+            | '·'
+            | '・'
+            | '％'
+            | ','
+            | '.'
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '%'
+    )
+}
+
+/// Characters that must not end a line (opening punctuation).
+fn no_line_end(c: char) -> bool {
+    matches!(
+        c,
+        '（' | '「'
+            | '『'
+            | '“'
+            | '‘'
+            | '《'
+            | '〈'
+            | '【'
+            | '〔'
+            | '〖'
+            | '［'
+            | '｛'
+            | '('
+            | '['
+            | '{'
+    )
+}
+
+/// Whether a line may break between two adjacent non-space characters: only
+/// next to a wide (CJK) character, never before a combining mark, and never
+/// where line-start / line-end punctuation rules forbid it.
+fn can_break_between(a: char, b: char) -> bool {
+    let (wa, wb) = (char_width(a), char_width(b));
+    wb > 0 && (wa >= 2 || wb >= 2) && !no_line_start(b) && !no_line_end(a)
+}
+
+/// An unbreakable run of characters plus the whitespace (if any) before it.
+struct Atom {
+    units: Vec<Unit>,
+    width: usize,
+    gap: Option<Style>,
+}
+
+/// Cut `units` into atoms: runs of non-space characters, split between CJK
+/// characters wherever [`can_break_between`] allows. A soft line break
+/// (newline) between two wide characters leaves no gap at all.
+fn split_atoms(units: &[Unit]) -> Vec<Atom> {
+    let mut atoms: Vec<Atom> = Vec::new();
+    let mut cur: Vec<Unit> = Vec::new();
+    let mut cur_gap: Option<Style> = None;
+    let mut gap: Option<Style> = None;
+    let mut gap_is_soft = false;
+    let mut last: Option<char> = None;
+    let flush = |cur: &mut Vec<Unit>, cur_gap: &mut Option<Style>, atoms: &mut Vec<Atom>| {
+        if !cur.is_empty() {
+            let units = std::mem::take(cur);
+            let width = units.iter().map(|(c, _)| char_width(*c)).sum();
+            atoms.push(Atom {
+                units,
+                width,
+                gap: cur_gap.take(),
+            });
+        }
+    };
+    for &(ch, style) in units {
+        if ch.is_whitespace() {
+            flush(&mut cur, &mut cur_gap, &mut atoms);
+            gap_is_soft = if gap.is_none() { ch == '\n' } else { false };
+            gap.get_or_insert(style);
+            continue;
+        }
+        if let Some(gap_style) = gap.take() {
+            let both_wide = last.is_some_and(|l| char_width(l) >= 2) && char_width(ch) >= 2;
+            cur_gap = (!(gap_is_soft && both_wide)).then_some(gap_style);
+        } else if let Some(prev) = last
+            && !cur.is_empty()
+            && can_break_between(prev, ch)
+        {
+            flush(&mut cur, &mut cur_gap, &mut atoms);
+        }
+        cur.push((ch, style));
+        last = Some(ch);
+    }
+    flush(&mut cur, &mut cur_gap, &mut atoms);
+    atoms
+}
+
+/// Greedy, display-width-aware wrap over styled units. Lines break at spaces
+/// and between CJK characters (with basic kinsoku rules); words, URLs and
+/// inline-code tokens stay whole unless wider than `width`, in which case they
+/// are hard-broken. Every unit keeps its own style across wraps.
 fn wrap_units(units: &[Unit], width: usize) -> Vec<Vec<Unit>> {
-    let words = split_words(units);
-    if words.is_empty() {
+    let width = width.max(1);
+    let atoms = split_atoms(units);
+    if atoms.is_empty() {
         return Vec::new();
     }
     let mut lines: Vec<Vec<Unit>> = Vec::new();
     let mut line: Vec<Unit> = Vec::new();
     let mut line_w = 0usize;
 
-    for word in words {
-        let word_w: usize = word.iter().map(|(c, _)| char_width(*c)).sum();
-        if word_w > width {
-            if !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
+    for atom in atoms {
+        let gap = usize::from(!line.is_empty() && atom.gap.is_some());
+        if !line.is_empty() && line_w + gap + atom.width <= width {
+            if let (1, Some(style)) = (gap, atom.gap) {
+                line.push((' ', style));
             }
-            let mut chunk: Vec<Unit> = Vec::new();
-            let mut chunk_w = 0usize;
-            for unit in word {
-                let cw = char_width(unit.0);
-                if chunk_w + cw > width && !chunk.is_empty() {
-                    lines.push(std::mem::take(&mut chunk));
-                    chunk_w = 0;
-                }
-                chunk.push(unit);
-                chunk_w += cw;
-            }
-            line = chunk;
-            line_w = chunk_w;
-        } else if line.is_empty() {
-            line = word;
-            line_w = word_w;
-        } else if line_w + 1 + word_w <= width {
-            line.push((' ', Style::default()));
-            line.extend(word);
-            line_w += 1 + word_w;
-        } else {
-            lines.push(std::mem::take(&mut line));
-            line = word;
-            line_w = word_w;
+            line.extend(atom.units);
+            line_w += gap + atom.width;
+            continue;
         }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if atom.width <= width {
+            line = atom.units;
+            line_w = atom.width;
+            continue;
+        }
+        let mut chunks = hard_break(atom.units, width);
+        line = chunks.pop().unwrap_or_default();
+        line_w = line.iter().map(|(c, _)| char_width(*c)).sum();
+        lines.extend(chunks);
     }
     lines.push(line);
     lines
 }
 
-/// Split units into whitespace-delimited words (dropping the whitespace).
-fn split_words(units: &[Unit]) -> Vec<Vec<Unit>> {
-    let mut words = Vec::new();
-    let mut word: Vec<Unit> = Vec::new();
-    for &(ch, style) in units {
-        if ch.is_whitespace() {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
-        } else {
-            word.push((ch, style));
+/// Cut `units` into rows of at most `width` display cells, breaking anywhere.
+/// Always returns at least one (possibly empty) row.
+fn hard_break(units: Vec<Unit>, width: usize) -> Vec<Vec<Unit>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Unit>> = Vec::new();
+    let mut row: Vec<Unit> = Vec::new();
+    let mut row_w = 0usize;
+    for unit in units {
+        let cw = char_width(unit.0);
+        if row_w + cw > width && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            row_w = 0;
         }
+        row.push(unit);
+        row_w += cw;
     }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    words
+    rows.push(row);
+    rows
 }
 
 fn char_width(ch: char) -> usize {
@@ -989,10 +1411,10 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_paragraphs_do_not_add_a_blank_chat_row() {
+    fn consecutive_paragraphs_are_separated_by_one_blank_line() {
         let lines = render("first paragraph\n\nsecond paragraph", 80);
         let text: Vec<_> = lines.iter().map(Line::to_string).collect();
-        assert_eq!(text, ["first paragraph", "second paragraph"]);
+        assert_eq!(text, ["first paragraph", "", "second paragraph"]);
     }
 
     #[test]
@@ -1099,12 +1521,12 @@ mod tests {
         assert!(lines.iter().all(|line| {
             line.spans
                 .iter()
-                .all(|span| span.style.fg != Some(Color::Yellow))
+                .all(|span| span.style.fg != Some(theme::warning_color()))
         }));
     }
 
     #[test]
-    fn horizontal_rule_emits_literal_dashes() {
+    fn horizontal_rule_spans_the_width_in_the_dim_style() {
         let lines = render("before\n\n---\n\nafter", 80);
         let t = texts(&lines);
         assert_eq!(
@@ -1112,9 +1534,410 @@ mod tests {
             vec![
                 "before".to_string(),
                 "".to_string(),
-                "---".to_string(),
+                "─".repeat(80),
+                "".to_string(),
                 "after".to_string()
             ]
+        );
+    }
+
+    fn plain(lines: &[Line<'static>]) -> String {
+        texts(lines).join("\n")
+    }
+
+    #[test]
+    fn blocks_are_separated_by_exactly_one_blank_line() {
+        let md = "# Title\n\npara one\n\n- a\n- b\n\n```\ncode\n```\n\n> quote\n\n---\n\n| x | y |\n|---|---|\n| 1 | 2 |\n\nend";
+        let t = texts(&render(md, 40));
+        assert_eq!(t.first().map(String::as_str), Some("Title"));
+        assert_eq!(t.last().map(String::as_str), Some("end"));
+        assert!(
+            t.windows(2).all(|w| !(w[0].is_empty() && w[1].is_empty())),
+            "{t:#?}"
+        );
+        let expect = [
+            "Title",
+            "",
+            "para one",
+            "",
+            "• a",
+            "• b",
+            "",
+            "  code",
+            "",
+            "▎ quote",
+            "",
+            "────────────────────────────────────────",
+            "",
+            "┌───┬───┐",
+        ];
+        assert_eq!(t[..expect.len()], expect, "{t:#?}");
+        assert_eq!(t[t.len() - 2], "", "{t:#?}");
+    }
+
+    #[test]
+    fn tight_list_items_stay_adjacent_and_nested_lists_do_not_get_gaps() {
+        let t = texts(&render("intro\n\n- a\n  - b\n- c\n\ntail", 40));
+        assert_eq!(t, ["intro", "", "• a", "  • b", "• c", "", "tail"]);
+    }
+
+    #[test]
+    fn quote_paragraphs_keep_a_bare_bar_between_them() {
+        let t = texts(&render("> one\n>\n> two", 40));
+        assert_eq!(t, ["▎ one", "▎", "▎ two"]);
+    }
+
+    #[test]
+    fn cjk_bold_next_to_fullwidth_punctuation_is_recognised() {
+        let md = "我的判断是：**最值得关注的，是找人。**它瞄准注意力。资源。**一个任务可以跨越。**官方模型";
+        let lines = render(md, 200);
+        let joined = plain(&lines);
+        assert!(!joined.contains('*'), "{joined}");
+        assert!(!joined.contains('\u{200b}'), "{joined}");
+        let bold: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, ["最值得关注的，是找人。", "一个任务可以跨越。"]);
+        // Bold that opens against an opening quote after a CJK letter.
+        let lines = render("这是**“重点”**，别忘了", 80);
+        let joined = plain(&lines);
+        assert_eq!(joined, "这是“重点”，别忘了");
+        assert!(lines[0].spans.iter().any(
+            |s| s.content.as_ref() == "“重点”" && s.style.add_modifier.contains(Modifier::BOLD)
+        ));
+    }
+
+    #[test]
+    fn cjk_emphasis_fix_leaves_english_code_and_plain_asterisks_alone() {
+        let lines = render("a **bold** b and *it* and 2*3*4 and snake_case_name", 80);
+        // `2*3*4` is ordinary CommonMark emphasis, exactly as before.
+        assert_eq!(plain(&lines), "a bold b and it and 234 and snake_case_name");
+        assert!(matches!(
+            fix_cjk_emphasis("2*3*4，**x** 和 **y**。后"),
+            Cow::Borrowed(_)
+        ));
+        // Inside inline code and fenced code nothing is inserted.
+        let md = "`找人。**它` and\n\n```\n找人。**它\n```";
+        assert!(matches!(fix_cjk_emphasis(md), Cow::Borrowed(_)));
+        let t = plain(&render(md, 80));
+        assert!(t.contains("找人。**它"), "{t}");
+        assert!(!t.contains('\u{200b}'));
+        // Escaped asterisks stay literal.
+        let t = plain(&render("好\\*\\*。**它", 80));
+        assert!(!t.contains('\u{200b}'));
+    }
+
+    #[test]
+    fn prose_wraps_between_cjk_characters_and_at_spaces() {
+        let t = texts(&render("甲乙丙丁戊己庚辛 abc def", 8));
+        assert_eq!(t, ["甲乙丙丁", "戊己庚辛", "abc def"]);
+        // A mixed line fills to the edge instead of stopping at the last space.
+        let t = texts(&render("word 中文中文中文中文", 11));
+        assert_eq!(t, ["word 中文中", "文中文中文"]);
+    }
+
+    #[test]
+    fn wrap_applies_kinsoku_and_keeps_tokens_whole() {
+        // Closing punctuation never starts a line; opening never ends one.
+        let t = texts(&render("甲乙丙丁，戊（己庚）", 8));
+        assert_eq!(t, ["甲乙丙", "丁，戊", "（己庚）"]);
+        for line in &t {
+            let first = line.chars().next().unwrap();
+            let last = line.chars().last().unwrap();
+            assert!(!no_line_start(first), "{t:?}");
+            assert!(!no_line_end(last), "{t:?}");
+        }
+        // English words and inline code are not split while they fit.
+        let t = texts(&render("中文 `cargo-build` internationalization 结束", 22));
+        assert!(t.iter().any(|l| l.contains("cargo-build")), "{t:?}");
+        assert!(
+            t.iter().any(|l| l.contains("internationalization")),
+            "{t:?}"
+        );
+        // Overlong tokens hard-break.
+        let t = texts(&render("abcdefghij", 4));
+        assert_eq!(t, ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn soft_breaks_between_cjk_lines_add_no_space() {
+        let t = texts(&render("你好\n世界\nab\ncd", 40));
+        assert_eq!(t, ["你好世界 ab cd"]);
+    }
+
+    #[test]
+    fn wrapped_lines_keep_styles_on_the_right_characters() {
+        let lines = render("前缀中文**加粗的一段文字**后缀 `code span` 尾", 10);
+        let mut styled = String::new();
+        for line in &lines {
+            for span in &line.spans {
+                if span.style.add_modifier.contains(Modifier::BOLD) {
+                    styled.push_str(&span.content);
+                }
+            }
+        }
+        assert_eq!(styled, "加粗的一段文字");
+        let code: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.fg == Some(theme::warning_color()))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(code, "code span");
+        let all = plain(&lines).replace('\n', "");
+        assert!(all.starts_with("前缀中文加粗的一段文字后缀"), "{all}");
+        assert!(lines.iter().all(|l| display_width(&l.to_string()) <= 10));
+    }
+
+    /// The link destination carried by a span's invisible marker.
+    fn span_url(span: &Span<'static>) -> Option<String> {
+        hyperlink::url_of_style(span.style)
+    }
+
+    #[test]
+    fn link_shows_only_the_label_in_accent_with_a_hidden_target() {
+        let lines = render("see [官方仓库](https://example.com/a) now", 80);
+        assert_eq!(plain(&lines), "see 官方仓库 now");
+        let label = find_span(&lines, "官方仓库");
+        assert_eq!(label.style.fg, Some(theme::accent_color()));
+        assert_eq!(span_url(label).as_deref(), Some("https://example.com/a"));
+        for span in &lines[0].spans {
+            assert!(
+                !span.style.add_modifier.contains(Modifier::UNDERLINED),
+                "{span:?}"
+            );
+            assert!(!span.content.contains("example.com"));
+        }
+        // Surrounding text is not part of the link.
+        assert_eq!(span_url(find_span(&lines, "see")), None);
+    }
+
+    #[test]
+    fn unsafe_link_destinations_render_as_plain_labels() {
+        let lines = render(
+            "[click](javascript:alert(1)) and [x](https://a.io/\u{1b}[31m)",
+            80,
+        );
+        assert_eq!(plain(&lines).split(" and ").next(), Some("click"));
+        let label = find_span(&lines, "click");
+        assert_eq!(label.style.fg, None);
+        assert_eq!(span_url(label), None);
+    }
+
+    #[test]
+    fn autolink_and_equal_label_show_the_url_once() {
+        let lines = render(
+            "<https://example.com/x> and [https://a.io](https://a.io)",
+            80,
+        );
+        assert_eq!(plain(&lines), "https://example.com/x and https://a.io");
+        assert_eq!(
+            span_url(find_span(&lines, "https://example.com/x")).as_deref(),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[test]
+    fn long_link_labels_wrap_with_each_segment_keeping_the_target() {
+        let url = "https://example.com/target";
+        let lines = render(&format!("[{}]({url})", "label".repeat(8)), 12);
+        let t = texts(&lines);
+        assert!(t.len() >= 4, "{t:?}");
+        assert!(t.iter().all(|l| display_width(l) <= 12), "{t:?}");
+        assert_eq!(t.concat(), "label".repeat(8));
+        for line in &lines {
+            assert_eq!(span_url(&line.spans[0]).as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn long_bare_urls_wrap_without_truncation() {
+        let url = format!("https://example.com/{}", "segment/".repeat(10));
+        let t = texts(&render(&url, 30));
+        assert!(t.len() >= 3, "{t:?}");
+        assert!(t.iter().all(|l| display_width(l) <= 30), "{t:?}");
+        assert_eq!(t.concat(), url);
+    }
+
+    #[test]
+    fn markdown_colours_come_from_the_theme_palette() {
+        let md = "# H1\n\n### H3\n\n> quote\n\n---\n\n| a |\n|---|\n| b |\n\n[l](http://u) `c`";
+        for line in render(md, 40) {
+            for span in &line.spans {
+                for color in [span.style.fg, span.style.bg].into_iter().flatten() {
+                    assert!(
+                        matches!(color, Color::Rgb(..)),
+                        "non-theme colour {color:?} in {span:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn link_in_table_cell_shows_only_the_label() {
+        let t = texts(&render("| a |\n|---|\n| [x](http://u.io) |", 60));
+        assert!(t.iter().any(|l| l.contains("│ x ")), "{t:?}");
+        assert!(t.iter().all(|l| !l.contains("u.io")), "{t:?}");
+    }
+
+    fn find_span<'a>(lines: &'a [Line<'static>], text: &str) -> &'a Span<'static> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains(text))
+            .unwrap_or_else(|| panic!("no span containing {text:?}"))
+    }
+
+    #[test]
+    fn rule_is_dim() {
+        let lines = render("a\n\n---\n\nb", 12);
+        assert_eq!(lines[2].spans[0].content.as_ref(), "─".repeat(12));
+        assert_eq!(lines[2].spans[0].style.fg, Some(theme::dim_color()));
+    }
+
+    #[test]
+    fn heading_levels_are_visually_distinct_and_use_theme_colours() {
+        let lines = render("# One\n\n## Two\n\n### Three\n\n#### Four", 40);
+        let fg = |text: &str| find_span(&lines, text).style.fg;
+        assert_eq!(fg("One"), Some(theme::accent_color()));
+        assert_eq!(fg("Two"), Some(theme::emphasis_color()));
+        assert_eq!(fg("Three"), Some(theme::muted_color()));
+        assert_eq!(fg("Four"), Some(theme::muted_color()));
+        assert_ne!(fg("One"), fg("Two"));
+        assert_ne!(fg("Two"), fg("Three"));
+        for text in ["One", "Two", "Three"] {
+            let m = find_span(&lines, text).style.add_modifier;
+            assert!(m.contains(Modifier::BOLD) && !m.contains(Modifier::UNDERLINED));
+        }
+    }
+
+    #[test]
+    fn long_code_lines_wrap_instead_of_being_cut() {
+        let long = "x".repeat(25);
+        let md = format!("```rust\nlet a = \"{long}\";\nshort\n```");
+        let lines = render(&md, 12);
+        let t = texts(&lines);
+        assert_eq!(t[0], "  rust");
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme::dim_color()));
+        assert!(t.iter().all(|l| display_width(l) <= 12), "{t:?}");
+        let body: String = t[1..t.len() - 1]
+            .iter()
+            .map(|l| l.chars().skip(2).collect::<String>())
+            .collect();
+        assert_eq!(body, format!("let a = \"{long}\";"));
+        assert!(t[2].starts_with("↪ "), "{t:?}");
+        assert_eq!(t.last().unwrap(), "  short");
+        // Highlighting survives: more than one distinct colour on the code.
+        let colours: std::collections::HashSet<_> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| s.style.fg)
+            .collect();
+        assert!(colours.len() > 1);
+    }
+
+    #[test]
+    fn task_list_markers_render_as_checkboxes() {
+        let t = texts(&render("- [ ] todo\n- [x] done", 40));
+        assert_eq!(t, ["• ☐ todo", "• ☑ done"]);
+    }
+
+    #[test]
+    fn footnotes_render_dim_reference_and_definition() {
+        let lines = render("Claim[^1] here.\n\n[^1]: The source.\n[^2]: Another.", 40);
+        let t = texts(&lines);
+        assert_eq!(t[0], "Claim[1] here.");
+        assert_eq!(find_span(&lines, "[1]").style.fg, Some(theme::dim_color()));
+        assert_eq!(t[1], "");
+        assert!(t[2].starts_with("[1] The source."), "{t:?}");
+        assert!(t[3].starts_with("[2] Another."), "{t:?}");
+        assert_eq!(
+            find_span(&lines, "The source").style.fg,
+            Some(theme::dim_color())
+        );
+    }
+
+    #[test]
+    fn soft_break_joins_cjk_without_space_but_english_with_space() {
+        assert_eq!(texts(&render("**中文**\n接着", 40)), ["中文接着"]);
+        assert_eq!(texts(&render("one\ntwo", 40)), ["one two"]);
+        assert_eq!(texts(&render("中文\nabc", 40)), ["中文 abc"]);
+    }
+
+    #[test]
+    fn nested_lists_align_under_the_parent_text() {
+        let t = texts(&render(
+            "1. one\n2. two\n   - child\n     - grand\n3. three",
+            40,
+        ));
+        assert_eq!(
+            t,
+            ["1. one", "2. two", "   • child", "     • grand", "3. three"]
+        );
+        // Wrapped continuation lines align under the item text at every depth.
+        let t = texts(&render(
+            "- a\n  1. bb cc dd ee ff\n     - gg hh ii jj kk",
+            12,
+        ));
+        assert_eq!(
+            t,
+            [
+                "• a",
+                "  1. bb cc",
+                "     dd ee",
+                "     ff",
+                "     • gg hh",
+                "       ii jj",
+                "       kk"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_code_uses_theme_foreground_and_background() {
+        let lines = render("run `cargo test` now", 40);
+        let span = find_span(&lines, "cargo test");
+        assert_eq!(span.style.fg, Some(theme::warning_color()));
+        assert_eq!(span.style.bg, Some(theme::code_bg()));
+    }
+
+    #[test]
+    fn user_style_text_never_starts_a_line_with_closing_punctuation() {
+        let text = "这是一段比较长的中文提示词用来检查换行规则，它不应该让逗号出现在行首。结尾";
+        for width in 10..40 {
+            for line in texts(&render(text, width)) {
+                let first = line.chars().next().unwrap();
+                assert!(!no_line_start(first), "width {width}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn bare_urls_and_autolinks_use_the_link_colour_once() {
+        let lines = render(
+            "see https://example.com/a?b=1, or <https://other.io/x>。",
+            80,
+        );
+        assert_eq!(
+            plain(&lines),
+            "see https://example.com/a?b=1, or https://other.io/x。"
+        );
+        let bare = find_span(&lines, "https://example.com/a?b=1");
+        assert_eq!(bare.content.as_ref(), "https://example.com/a?b=1");
+        assert_eq!(bare.style.fg, Some(theme::accent_color()));
+        assert_eq!(span_url(bare).as_deref(), Some("https://example.com/a?b=1"));
+        let auto = find_span(&lines, "https://other.io/x");
+        assert_eq!(auto.style.fg, Some(theme::accent_color()));
+        assert!(!auto.style.add_modifier.contains(Modifier::UNDERLINED));
+        // A URL followed directly by CJK text ends at the CJK character.
+        let lines = render("见https://a.io/p中文", 80);
+        assert_eq!(
+            find_span(&lines, "https://a.io/p").content.as_ref(),
+            "https://a.io/p"
         );
     }
 }

@@ -163,6 +163,13 @@ impl ChatLayout {
 /// Paint the full chat UI. Returns a layout snapshot of the conversation
 /// column for content-anchored selection (ignored when a drawer is open).
 pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
+    let layout = render_screen(frame, state);
+    // Remember where the links landed so a click can open them.
+    crate::tui::hyperlink::record_frame(frame.buffer_mut());
+    layout
+}
+
+fn render_screen(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
     // The Agents list replaces the whole chat screen: no transcript,
     // composer or footer.
     if state.drawer() == Some(Drawer::Agents) {

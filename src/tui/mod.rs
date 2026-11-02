@@ -19,6 +19,7 @@ mod file_diff;
 pub mod goal_surface;
 pub mod grok_import;
 pub mod header;
+pub mod hyperlink;
 mod import_io;
 pub mod keymap;
 pub mod markdown;
@@ -54,8 +55,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
+use hyperlink::LinkBackend;
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 
 use crate::domain::event::{ApprovalDecision, RuntimeEvent, UiCommand};
 use crate::domain::mode::TerminalMode;
@@ -190,7 +191,7 @@ pub fn run(
     let keyboard_enhancement =
         enable_keyboard_enhancement(&mut stdout, keyboard_enhancement_allowed)?;
     restore.keyboard_enhancement = keyboard_enhancement;
-    let backend = CrosstermBackend::new(stdout);
+    let backend = LinkBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_loop(
@@ -262,7 +263,7 @@ fn disable_keyboard_enhancement(out: &mut impl Write, enabled: bool) -> io::Resu
 }
 
 fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<LinkBackend<io::Stdout>>,
     state: &mut AppState,
     handle: &RuntimeHandle,
     events: &Receiver<RuntimeEvent>,
@@ -473,6 +474,13 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
                 // A press and release on the same cell is a click, not a
                 // drag. On a tool group title it folds or unfolds the group.
                 if selection.is_empty()
+                    && let Some(url) = hyperlink::url_at(mouse.column, mouse.row)
+                {
+                    state.clear_chat_selection();
+                    hyperlink::open_url(&url);
+                    return;
+                }
+                if selection.is_empty()
                     && let Some(first) = layout.tool_group_at_line(selection.start.0)
                 {
                     state.clear_chat_selection();
@@ -643,7 +651,7 @@ fn handle_mode_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
 /// Hand the whole terminal to the member's real interactive CLI (resuming its
 /// session), then restore Asterline when that CLI exits.
 fn attach_to_member(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<LinkBackend<io::Stdout>>,
     state: &mut AppState,
     req: &attach::AttachRequest,
     keyboard_enhancement: bool,
@@ -1808,6 +1816,109 @@ mod tests {
                 Some(layout),
             );
         }
+    }
+
+    fn link_state() -> AppState {
+        AppState::new(vec![ChatItem::Agent {
+            member: MemberId::new("builder"),
+            display_name: "Builder".to_string(),
+            backend: BackendKind::Codex,
+            text: "前文 [官方仓库](https://example.com/repo) 后文，以及 [bad](javascript:alert(1))"
+                .to_string(),
+        }])
+    }
+
+    /// Screen cell of the first character of `needle` on a painted terminal.
+    fn find_text(terminal: &Terminal<ratatui::backend::TestBackend>, needle: &str) -> (u16, u16) {
+        let buffer = terminal.backend().buffer();
+        let first = needle.chars().next().unwrap().to_string();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer.cell((x, y)).is_some_and(|c| c.symbol() == first) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
+    fn mouse_at(
+        state: &mut AppState,
+        layout: &chat_view::ChatLayout,
+        kind: MouseEventKind,
+        at: (u16, u16),
+    ) {
+        handle_mouse(
+            MouseEvent {
+                kind,
+                column: at.0,
+                row: at.1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            state,
+            Some(layout),
+        );
+    }
+
+    #[test]
+    fn clicking_a_link_opens_it_but_dragging_over_it_does_not() {
+        let mut state = link_state();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let view = format!("{}", terminal.backend());
+        assert!(view.contains("官方仓库"), "{view}");
+        assert!(!view.contains("example.com"), "{view}");
+        let cell = find_text(&terminal, "官方仓库");
+
+        let _ = hyperlink::take_opened();
+        // Press and release on the same cell opens the link (right half too).
+        click(&mut state, &layout, cell);
+        assert_eq!(hyperlink::take_opened(), ["https://example.com/repo"]);
+        click(&mut state, &layout, (cell.0 + 1, cell.1));
+        assert_eq!(hyperlink::take_opened(), ["https://example.com/repo"]);
+
+        // A drag that starts on the link selects text instead.
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+        );
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Drag(MouseButton::Left),
+            (cell.0 + 6, cell.1),
+        );
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Up(MouseButton::Left),
+            (cell.0 + 6, cell.1),
+        );
+        assert!(hyperlink::take_opened().is_empty());
+
+        // Plain text and links with unsafe destinations are not clickable.
+        click(&mut state, &layout, (cell.0 - 3, cell.1));
+        let bad = find_text(&terminal, "bad");
+        click(&mut state, &layout, bad);
+        assert!(hyperlink::take_opened().is_empty());
+    }
+
+    #[test]
+    fn copying_a_link_copies_the_label_without_escape_bytes() {
+        let mut state = link_state();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let cell = find_text(&terminal, "官方仓库");
+        state.begin_chat_selection(layout.screen_to_content(cell.0, cell.1).unwrap());
+        state.update_chat_selection(layout.screen_to_content(cell.0 + 7, cell.1).unwrap());
+        let text = layout.selected_text(state.chat_selection().unwrap());
+        assert!(text.contains("官方仓库"), "{text:?}");
+        assert!(
+            !text.contains('\x1b') && !text.contains("example.com"),
+            "{text:?}"
+        );
     }
 
     #[test]
