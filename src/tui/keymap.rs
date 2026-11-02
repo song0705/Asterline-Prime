@@ -29,8 +29,8 @@ pub enum Action {
     ToggleThinking,
     ToggleDiffs,
     ToggleTools,
-    NextMember,
-    PrevMember,
+    /// Ctrl+N: start a new chat (only the Agents list uses it).
+    NewChat,
     /// Ctrl+X: delete the highlighted item (only the Agents list uses it).
     DeleteItem,
     /// Pull the last queued (not-yet-started) prompt back into the composer.
@@ -88,8 +88,7 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('w') if ctrl => Some(Action::DeleteWord),
         KeyCode::Char('a') if ctrl => Some(Action::Home),
         KeyCode::Char('e') if ctrl => Some(Action::End),
-        KeyCode::Char('n') if ctrl => Some(Action::NextMember),
-        KeyCode::Char('b') if ctrl => Some(Action::PrevMember),
+        KeyCode::Char('n') if ctrl => Some(Action::NewChat),
         KeyCode::Char('x') if ctrl => Some(Action::DeleteItem),
         KeyCode::Char(c) if !ctrl && !alt => Some(Action::InsertChar(c)),
         _ => None,

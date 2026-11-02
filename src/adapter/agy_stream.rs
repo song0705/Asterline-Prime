@@ -30,6 +30,10 @@ pub struct AgyStreamAdapter {
     cwd: PathBuf,
     member_id: String,
     log_dir: PathBuf,
+    /// The team workspace whose state directory holds `log_dir`.
+    workspace: PathBuf,
+    /// Asterline's shared skills and this project's state, outside `cwd`.
+    extra_dirs: Vec<PathBuf>,
     model: Option<String>,
     system_prompt: Option<String>,
     sandbox: SandboxPolicy,
@@ -43,7 +47,9 @@ impl AgyStreamAdapter {
         Self {
             binary: "agy".to_string(),
             cwd: member.resolved_cwd(&workspace),
-            log_dir: workspace.join(".asterline").join("agy"),
+            log_dir: crate::state_paths::agy_log_dir(&workspace),
+            workspace: workspace.clone(),
+            extra_dirs: crate::state_paths::agent_access_dirs(&workspace),
             member_id: member.id.as_str().to_string(),
             model: member.model.clone(),
             system_prompt: member.system_prompt.clone(),
@@ -115,6 +121,7 @@ impl StreamAdapter for AgyStreamAdapter {
         session: Option<&AgentSessionId>,
         effort: Option<Effort>,
     ) -> AdapterCommand {
+        let _ = crate::state_paths::ensure_project_dir(&self.workspace);
         let _ = std::fs::create_dir_all(&self.log_dir);
         let mut args = vec![
             "--print-timeout".to_string(),
@@ -126,6 +133,10 @@ impl StreamAdapter for AgyStreamAdapter {
             "--add-dir".to_string(),
             self.cwd.display().to_string(),
         ];
+        for dir in &self.extra_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.display().to_string());
+        }
         if let Some(session) = session {
             args.push("--conversation".to_string());
             args.push(session.as_str().to_string());
@@ -556,6 +567,26 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|w| w == ["--add-dir", "/tmp/ws"])
+        );
+        for dir in crate::state_paths::agent_access_dirs(Path::new("/tmp/ws")) {
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|w| w[0] == "--add-dir" && w[1] == dir.display().to_string()),
+                "missing --add-dir {}",
+                dir.display()
+            );
+        }
+        let log = command
+            .args
+            .windows(2)
+            .find(|w| w[0] == "--log-file")
+            .map(|w| w[1].clone())
+            .unwrap();
+        assert!(
+            Path::new(&log).starts_with(crate::state_paths::agy_log_dir(Path::new("/tmp/ws"))),
+            "{log}"
         );
         assert!(command.args.windows(2).any(|w| w == ["--model", "model-x"]));
         assert!(

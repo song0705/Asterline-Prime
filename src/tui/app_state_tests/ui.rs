@@ -278,14 +278,21 @@ fn queued_member_remains_busy_and_cannot_attach() {
 
     assert_eq!(state.running_count(), 1);
     assert!(state.member_elapsed_secs(&builder).is_some());
-    assert!(state.request_attach(0).is_none());
+    assert!(
+        state
+            .request_attach_member_by_name(&MemberId::new("builder"))
+            .is_none()
+    );
     assert!(state.take_attach_request().is_none());
 
     state.apply(RuntimeEvent::MemberStatus {
         member: builder,
         status: MemberStatus::Idle,
     });
-    assert_eq!(state.request_attach(0), Some(MemberId::new("builder")));
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("builder")),
+        Some(MemberId::new("builder"))
+    );
     state.apply(RuntimeEvent::AttachGranted {
         member: MemberId::new("builder"),
     });
@@ -302,7 +309,10 @@ fn fresh_claude_attach_is_given_a_deterministic_session_id() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready_event);
 
-    assert_eq!(state.request_attach(0), Some(MemberId::new("builder")));
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("builder")),
+        Some(MemberId::new("builder"))
+    );
     state.apply(RuntimeEvent::AttachGranted {
         member: MemberId::new("builder"),
     });
@@ -334,7 +344,11 @@ fn attach_is_blocked_by_work_elsewhere_and_pending_approval() {
         status: MemberStatus::Running,
     });
 
-    assert!(state.request_attach(1).is_none());
+    assert!(
+        state
+            .request_attach_member_by_name(&MemberId::new("reviewer"))
+            .is_none()
+    );
     assert!(state.take_attach_request().is_none());
     assert!(state.chat().iter().any(|item| matches!(
         item,
@@ -351,14 +365,21 @@ fn attach_is_blocked_by_work_elsewhere_and_pending_approval() {
         action: "shell".to_string(),
         body: "publish".to_string(),
     });
-    assert!(state.request_attach(1).is_none());
+    assert!(
+        state
+            .request_attach_member_by_name(&MemberId::new("reviewer"))
+            .is_none()
+    );
     assert!(state.take_attach_request().is_none());
 
     state.apply(RuntimeEvent::ApprovalResolved {
         id: ApprovalId(77),
         decision: ApprovalDecision::Reject,
     });
-    assert_eq!(state.request_attach(1), Some(MemberId::new("reviewer")));
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("reviewer")),
+        Some(MemberId::new("reviewer"))
+    );
     state.apply(RuntimeEvent::AttachGranted {
         member: MemberId::new("reviewer"),
     });
@@ -379,11 +400,18 @@ fn authoritative_route_queue_update_unblocks_attach() {
         reason: "relay paused".to_string(),
         queued: 1,
     });
-    assert!(state.request_attach(0).is_none());
+    assert!(
+        state
+            .request_attach_member_by_name(&MemberId::new("builder"))
+            .is_none()
+    );
     assert!(state.take_attach_request().is_none());
 
     state.apply(RuntimeEvent::RouteQueueUpdated { queued: 0 });
-    assert_eq!(state.request_attach(0), Some(MemberId::new("builder")));
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("builder")),
+        Some(MemberId::new("builder"))
+    );
     state.apply(RuntimeEvent::AttachGranted {
         member: MemberId::new("builder"),
     });
@@ -395,8 +423,15 @@ fn duplicate_attach_request_is_suppressed_until_runtime_resolves_it() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
 
-    assert_eq!(state.request_attach(0), Some(MemberId::new("builder")));
-    assert!(state.request_attach(0).is_none());
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("builder")),
+        Some(MemberId::new("builder"))
+    );
+    assert!(
+        state
+            .request_attach_member_by_name(&MemberId::new("builder"))
+            .is_none()
+    );
 
     state.apply(RuntimeEvent::AttachGranted {
         member: MemberId::new("builder"),
@@ -427,7 +462,9 @@ fn named_attach_resolves_a_display_name_to_the_member_id() {
 fn pending_attach_is_cancelable_and_late_grants_are_released() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    let member = state.request_attach(0).unwrap();
+    let member = state
+        .request_attach_member_by_name(&MemberId::new("builder"))
+        .unwrap();
 
     assert!(state.has_cancelable_work());
     assert_eq!(state.cancel_pending_attach(), Some(member.clone()));
@@ -446,7 +483,9 @@ fn pending_attach_is_cancelable_and_late_grants_are_released() {
 fn granted_attach_is_cancelable_before_terminal_handoff() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
-    let member = state.request_attach(0).unwrap();
+    let member = state
+        .request_attach_member_by_name(&MemberId::new("builder"))
+        .unwrap();
     state.apply(RuntimeEvent::AttachGranted {
         member: member.clone(),
     });
@@ -463,13 +502,19 @@ fn attach_denial_clears_pending_request() {
     state.apply(ready());
     let member = MemberId::new("builder");
 
-    assert_eq!(state.request_attach(0), Some(member.clone()));
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("builder")),
+        Some(member.clone())
+    );
     state.apply(RuntimeEvent::AttachDenied {
         member: member.clone(),
         reason: "work became active".to_string(),
     });
 
-    assert_eq!(state.request_attach(0), Some(member));
+    assert_eq!(
+        state.request_attach_member_by_name(&MemberId::new("builder")),
+        Some(member)
+    );
 }
 
 #[test]
@@ -816,58 +861,6 @@ fn dismiss_hides_popup_until_text_changes() {
     assert!(state.completion().is_none());
     state.insert_char('a');
     assert!(state.completion().is_some());
-}
-
-#[test]
-fn header_roster_selection() {
-    let mut state = AppState::new(Vec::new());
-    state.members = vec![
-        MemberView {
-            id: MemberId::new("builder"),
-            display_name: "Builder".to_string(),
-            backend: BackendKind::Codex,
-            role: "impl".to_string(),
-            status: MemberStatus::Idle,
-            session: None,
-            cwd: String::new(),
-            model: None,
-            effort: None,
-            sandbox: SandboxPolicy::ReadOnly,
-            permission_mode: Some(PermissionMode::Default),
-            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
-            session_policy: SessionPolicy::Resume,
-            parent: None,
-        },
-        MemberView {
-            id: MemberId::new("reviewer"),
-            display_name: "Reviewer".to_string(),
-            backend: BackendKind::Claude,
-            role: "review".to_string(),
-            status: MemberStatus::Idle,
-            session: None,
-            cwd: String::new(),
-            model: None,
-            effort: None,
-            sandbox: SandboxPolicy::ReadOnly,
-            permission_mode: Some(PermissionMode::Default),
-            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
-            session_policy: SessionPolicy::Resume,
-            parent: None,
-        },
-    ];
-    assert_eq!(state.header_selected(), None);
-
-    state.select_next_member();
-    assert_eq!(state.header_selected(), Some(0)); // builder
-
-    state.select_next_member();
-    assert_eq!(state.header_selected(), Some(1)); // reviewer
-
-    state.select_prev_member();
-    assert_eq!(state.header_selected(), Some(0)); // builder
-
-    state.insert_char('x');
-    assert_eq!(state.header_selected(), None); // cleared on typing
 }
 
 #[test]

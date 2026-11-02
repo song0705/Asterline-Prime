@@ -19,15 +19,15 @@ use crate::adapter::parser::{
     format_permission_denial, is_permission_denied_tool,
 };
 use crate::domain::config::{
-    ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_ROSTER_PATH, MAIN_MEMBER_ID, brainstorm_skill_text,
-    inject_team_protocol, replace_model_style_name, strip_team_protocol, strip_team_protocols,
+    ASTERLINE_BRAINSTORM_SKILL_NAME, MAIN_MEMBER_ID, brainstorm_skill_text,
+    inject_team_protocol_with, replace_model_style_name, strip_team_protocol, strip_team_protocols,
     sub_agent_member, team_skill_hint,
 };
 use crate::domain::event::{
-    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ImportedMessage, LogEntry,
-    MemberStatus, MemberSummary, MessageId, MessageTarget, RouteTo, RunId, RunStatus,
-    RunStepRequest, RunStepStatus, RunStepSummary, RunSummary, RuntimeEvent, SpawnRequest,
-    TeamMessage, TurnId, UiCommand,
+    AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, CloseRequest,
+    DepartedMember, ImportedMessage, LogEntry, MemberStatus, MemberSummary, MessageId,
+    MessageTarget, RouteTo, RunId, RunStatus, RunStepRequest, RunStepStatus, RunStepSummary,
+    RunSummary, RuntimeEvent, SpawnRequest, TeamMessage, TurnId, UiCommand,
 };
 use crate::domain::goal::{
     CONTINUATION_NO_PROGRESS_CAP, GoalAction, GoalState, GoalStatus, REASON_INTERRUPT,
@@ -42,9 +42,10 @@ use crate::domain::mode::{
     resolve_plan_builder, resolve_plan_reviewer, resolve_team_allow_add_members,
     resolve_team_coordinator, resolve_team_limits, validate_mode_overrides, validate_terminal_mode,
 };
+use crate::domain::model_directory::{ModelDirectory, ResolvedModel, effort_refusal};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MAX_SUB_AGENTS, MemberId, SessionPolicy, TeamConfig,
-    TeamMember,
+    TeamMember, normalize_member_id,
 };
 use crate::fs_safety;
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
@@ -58,6 +59,7 @@ use crate::runtime::mode_prompts::{
     verdict_nudge_prompt, verify_failure_prompt,
 };
 use crate::runtime::session_registry::SessionRegistry;
+use crate::state_paths;
 use crate::store::sqlite::SqliteStore;
 
 pub(super) const MAX_IMPORTED_ITEMS: usize = 1_000;
@@ -244,6 +246,15 @@ pub struct TeamRuntime {
     goal: Option<GoalState>,
     /// Turns the goal's member took part in, for the continuation loop.
     goal_turns: HashMap<TurnId, GoalTurn>,
+    /// The models the installed backends offer, as the UI last reported them.
+    models: ModelDirectory,
+    /// Members whose runner still carries an older protocol text because they
+    /// were busy when the model list changed; refreshed when their next run
+    /// starts.
+    protocol_stale: HashSet<MemberId>,
+    /// Sub-agents being removed that still have a run winding down; each is
+    /// taken off the roster when that run exits.
+    closing: HashMap<MemberId, CloseOrigin>,
 }
 
 impl TeamRuntime {
@@ -356,6 +367,9 @@ impl TeamRuntime {
             startup_reconciled,
             goal: None,
             goal_turns: HashMap::new(),
+            models: ModelDirectory::default(),
+            protocol_stale: HashSet::new(),
+            closing: HashMap::new(),
         };
         let mut runtime = runtime;
         if let Err(err) = runtime.restore_goal() {
@@ -371,7 +385,7 @@ impl TeamRuntime {
         if let Err(err) = runtime.write_roster_snapshot() {
             runtime
                 .startup_notices
-                .push(format!("could not write {ASTERLINE_ROSTER_PATH}: {err}"));
+                .push(format!("could not write the team roster: {err}"));
         }
         runtime.sync_resume_sessions();
         runtime
@@ -604,6 +618,7 @@ impl TeamRuntime {
                 self.handle_cancel(member, &mut step)
             }
             UiCommand::Goal { action } => self.handle_goal_command(action, &mut step),
+            UiCommand::SetModelDirectory(models) => self.handle_model_directory(models, &mut step),
             UiCommand::EditQueuedPrompt { member } => {
                 self.handle_edit_queued_prompt(member, &mut step);
             }
@@ -645,6 +660,9 @@ impl TeamRuntime {
                 }
             }
             UiCommand::RequestSavedChats => self.handle_request_saved_chats(&mut step),
+            UiCommand::RemoveSubAgent { member } => {
+                self.handle_remove_sub_agent(&member, &mut step);
+            }
             UiCommand::DeleteConversation { conversation } => {
                 self.handle_delete_conversation(conversation, &mut step)
             }
@@ -1115,7 +1133,7 @@ impl TeamRuntime {
         }
         if !removed_sub_agents.is_empty() {
             // Parents' protocol text lists their sub-agents; refresh it.
-            inject_team_protocol(&mut self.config);
+            inject_team_protocol_with(&mut self.config, &self.models);
             if let Err(err) = self.store.upsert_team(&self.config) {
                 self.report_store_error("update the saved roster", err, step);
             }
@@ -1283,7 +1301,7 @@ impl TeamRuntime {
             SessionRegistry::from_stored_for(&snapshot.sessions, &raw_config.members);
         let restored_sessions = restored_registry.to_stored(&raw_config.members);
         let mut operational_config = raw_config.clone();
-        inject_team_protocol(&mut operational_config);
+        inject_team_protocol_with(&mut operational_config, &self.models);
         let rejected = match self.store.activate_runtime_team_state(
             conversation,
             &operational_config,
@@ -1344,8 +1362,15 @@ impl TeamRuntime {
             });
         }
         step.persist_team = Some(raw_config.without_sub_agents());
-        step.events
-            .push(RuntimeEvent::ConversationResumed { conversation, chat });
+        let departed = self
+            .store
+            .departed_members_for(conversation)
+            .unwrap_or_default();
+        step.events.push(RuntimeEvent::ConversationResumed {
+            conversation,
+            chat,
+            departed,
+        });
         step.events.extend(self.chat_name_event());
         step.events.push(self.ready_event());
         step.events.push(RuntimeEvent::ModeChanged { mode });
@@ -1489,6 +1514,57 @@ impl TeamRuntime {
             return;
         }
         step.events.push(RuntimeEvent::AttachGranted { member });
+    }
+
+    /// Take the model list the UI discovered, and give every member that may
+    /// open sub-agents the new list in its protocol text. Idle members get a
+    /// fresh runner now; busy ones when their next run starts.
+    fn handle_model_directory(&mut self, models: ModelDirectory, step: &mut RuntimeStep) {
+        if self.models == models {
+            return;
+        }
+        self.models = models;
+        let mut next = self.config.clone();
+        inject_team_protocol_with(&mut next, &self.models);
+        let changed: Vec<MemberId> = next
+            .members
+            .iter()
+            .filter(|member| {
+                self.config
+                    .member(&member.id)
+                    .is_none_or(|old| old.system_prompt != member.system_prompt)
+            })
+            .map(|member| member.id.clone())
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        self.config = next;
+        if let Err(err) = self.store.upsert_team(&self.config) {
+            self.report_store_error("save the refreshed team protocol", err, step);
+        }
+        for id in changed {
+            let busy = self
+                .members
+                .get(&id)
+                .is_some_and(|state| state.running.is_some() || !state.queue.is_empty());
+            if busy {
+                self.protocol_stale.insert(id);
+            } else {
+                self.push_runner_upsert(&id, step);
+            }
+        }
+    }
+
+    /// Rebuild `member`'s runner from the current roster entry.
+    fn push_runner_upsert(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        self.protocol_stale.remove(member);
+        if let Some(entry) = self.config.member(member).cloned() {
+            step.runner_changes.push(RunnerChange::Upsert {
+                member: Box::new(entry),
+                workspace: self.config.workspace.clone(),
+            });
+        }
     }
 
     fn handle_replace_team(
@@ -1671,7 +1747,7 @@ impl TeamRuntime {
             });
         let next_sessions = next_registry.to_stored(&raw_config.members);
         let mut operational_config = raw_config.clone();
-        inject_team_protocol(&mut operational_config);
+        inject_team_protocol_with(&mut operational_config, &self.models);
         if let Err(err) = self.store.replace_runtime_team_state(
             &operational_config,
             &raw_config,
@@ -2490,7 +2566,10 @@ impl TeamRuntime {
                     });
                 }
             }
-            AgentEvent::Exited { code, ok } => self.finalize_run(member, code, ok, &mut step),
+            AgentEvent::Exited { code, ok } => {
+                self.finalize_run(member, code, ok, &mut step);
+                self.finish_pending_close(member, &mut step);
+            }
         }
         step
     }
@@ -2628,6 +2707,7 @@ impl TeamRuntime {
         let has_controls = !parsed.messages.is_empty()
             || !parsed.members.is_empty()
             || !parsed.spawns.is_empty()
+            || !parsed.closes.is_empty()
             || !parsed.run_steps.is_empty()
             || !parsed.reviews.is_empty()
             || !parsed.brainstorm_votes.is_empty()
@@ -2705,6 +2785,7 @@ impl TeamRuntime {
             || !parsed.messages.is_empty()
             || !parsed.members.is_empty()
             || !parsed.spawns.is_empty()
+            || !parsed.closes.is_empty()
             || !parsed.run_steps.is_empty()
         {
             self.goal_note_output(member, turn);
@@ -2716,6 +2797,9 @@ impl TeamRuntime {
         }
         for spawn in parsed.spawns {
             self.handle_spawn(member, turn, spawn, step);
+        }
+        for close in parsed.closes {
+            self.handle_close(member, turn, close, step);
         }
         let mut checklist_run = None;
         for request in parsed.run_steps {
@@ -3365,6 +3449,11 @@ impl TeamRuntime {
         origin: Option<MemberId>,
         step: &mut RuntimeStep,
     ) {
+        if self.closing.contains_key(member) {
+            // On its way off the roster: nothing new is queued for it.
+            self.check_turn_complete(turn, step);
+            return;
+        }
         let stripped_prompt = strip_routing_prefix(&prompt);
         let busy = self
             .members
@@ -3446,6 +3535,9 @@ impl TeamRuntime {
             status: MemberStatus::Running,
         });
         self.note_roster_write(step);
+        if self.protocol_stale.contains(member) {
+            self.push_runner_upsert(member, step);
+        }
         let prompt = normalize_backend_command(self.member_backend(member), prompt);
         let prompt = self.prompt_with_recap(member, turn, prompt, step);
         step.actions.push(RunAction {
@@ -3497,10 +3589,9 @@ impl TeamRuntime {
     }
 
     fn write_roster_snapshot(&self) -> std::io::Result<()> {
-        let directory =
-            fs_safety::ensure_workspace_directory(&self.config.workspace, &[".asterline"], true)?;
+        let directory = state_paths::ensure_project_dir(&self.config.workspace)?;
         fs_safety::write_regular_file(
-            &directory.join("roster.md"),
+            &directory.join(state_paths::ROSTER_FILE),
             "team roster",
             &self.roster_snapshot(),
         )
@@ -3509,7 +3600,7 @@ impl TeamRuntime {
     fn note_roster_write(&self, step: &mut RuntimeStep) {
         if let Err(err) = self.write_roster_snapshot() {
             step.events.push(RuntimeEvent::Notice(format!(
-                "could not update {ASTERLINE_ROSTER_PATH}: {err}"
+                "could not update the team roster: {err}"
             )));
         }
     }

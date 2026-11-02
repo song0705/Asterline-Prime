@@ -1051,6 +1051,7 @@ fn a_new_or_resumed_chat_forgets_the_saved_list() {
     state.apply(RuntimeEvent::ConversationResumed {
         conversation: 9,
         chat: Vec::new(),
+        departed: Vec::new(),
     });
     assert!(state.saved_chats().is_empty());
 }
@@ -1378,6 +1379,7 @@ fn a_new_or_resumed_chat_drops_the_current_name() {
         RuntimeEvent::ConversationResumed {
             conversation: 4,
             chat: Vec::new(),
+            departed: Vec::new(),
         },
     ] {
         let mut state = main_state(Vec::new());
@@ -1453,4 +1455,156 @@ fn a_member_waiting_for_approval_gets_a_yellow_bang_instead_of_the_pulse() {
     assert_eq!(lit.fg, theme::emphasis().fg);
     let (glyph, _) = icon_of(&terminal, "Planner", "");
     assert_eq!(glyph, "•");
+}
+
+fn select_scout(state: &mut AppState) {
+    open(state);
+    state.select_first_agent();
+    while state.selected_agent() != Some(AgentChoice::Member(id("scout"))) {
+        state.select_next_agent();
+    }
+}
+
+#[test]
+fn a_sub_agent_row_offers_remove_and_ctrl_x_arms_then_sends_the_removal() {
+    let mut state = roster_state(Vec::new(), Some("builder"));
+    select_scout(&mut state);
+    assert!(state.agents_can_remove() && !state.agents_can_delete());
+    assert_eq!(
+        last_row(&state),
+        "  ↑/↓ navigate   Home/End first/last   Enter/→ open   Ctrl+X remove   Ctrl+N new   Esc close"
+    );
+
+    state.press_agents_delete();
+    assert!(state.agents_delete_armed());
+    assert_eq!(state.take_pending_command(), None);
+    // Idle sub-agent: nothing to stop.
+    assert_eq!(last_row(&state), "  Press Ctrl+X again to remove");
+
+    state.press_agents_delete();
+    assert_eq!(
+        state.take_pending_command(),
+        Some(UiCommand::RemoveSubAgent {
+            member: id("scout")
+        })
+    );
+    assert!(!state.agents_delete_armed());
+    assert_eq!(state.drawer(), Some(Drawer::Agents));
+}
+
+#[test]
+fn a_busy_sub_agent_says_stop_and_remove_in_every_active_status() {
+    for status in [
+        MemberStatus::Running,
+        MemberStatus::Queued,
+        MemberStatus::Waiting,
+        MemberStatus::NeedsApproval,
+    ] {
+        let mut state = roster_state(Vec::new(), Some("builder"));
+        state.apply(RuntimeEvent::MemberStatus {
+            member: id("scout"),
+            status,
+        });
+        select_scout(&mut state);
+        state.press_agents_delete();
+        assert!(state.agents_delete_armed(), "{status:?}");
+        assert_eq!(
+            last_row(&state),
+            "  Press Ctrl+X again to stop and remove",
+            "{status:?}"
+        );
+    }
+}
+
+#[test]
+fn another_key_or_moving_the_selection_disarms_a_sub_agent_removal() {
+    let mut state = roster_state(Vec::new(), Some("builder"));
+    select_scout(&mut state);
+    state.press_agents_delete();
+    state.disarm_agents_delete();
+    assert!(!state.agents_delete_armed());
+    // Disarmed: the next press only arms again.
+    state.press_agents_delete();
+    assert_eq!(state.take_pending_command(), None);
+
+    state.select_next_agent();
+    assert!(!state.agents_delete_armed());
+    state.select_previous_agent();
+    assert_eq!(
+        state.selected_agent(),
+        Some(AgentChoice::Member(id("scout")))
+    );
+    // Arming was cleared by the move, so one press does not remove.
+    state.press_agents_delete();
+    assert_eq!(state.take_pending_command(), None);
+    assert!(state.agents_delete_armed());
+}
+
+#[test]
+fn ctrl_x_does_nothing_on_top_level_members_the_all_row_or_with_a_search() {
+    let mut state = roster_state(Vec::new(), Some("builder"));
+    open(&mut state);
+    state.select_first_agent();
+    assert_eq!(state.selected_agent(), Some(AgentChoice::All));
+    state.press_agents_delete();
+    assert!(!state.agents_delete_armed());
+    assert_eq!(state.take_pending_command(), None);
+    state.select_next_agent();
+    assert_eq!(
+        state.selected_agent(),
+        Some(AgentChoice::Member(id("builder")))
+    );
+    // Builder (top level): no hint, no arming, no command.
+    state.press_agents_delete();
+    state.press_agents_delete();
+    assert!(!state.agents_delete_armed());
+    assert_eq!(state.take_pending_command(), None);
+    assert!(!last_row(&state).contains("Ctrl+X"), "{}", last_row(&state));
+
+    // A search turns the key off even on a sub-agent row.
+    type_query(&mut state, "scout");
+    assert_eq!(
+        state.selected_agent(),
+        Some(AgentChoice::Member(id("scout")))
+    );
+    state.press_agents_delete();
+    state.press_agents_delete();
+    assert_eq!(state.take_pending_command(), None);
+    assert!(!last_row(&state).contains("Ctrl+X"), "{}", last_row(&state));
+}
+
+#[test]
+fn removing_the_viewed_sub_agent_returns_the_focus_to_its_parent() {
+    let mut state = roster_state(Vec::new(), Some("scout"));
+    assert_eq!(state.focus(), Some(&id("scout")));
+
+    // The roster arrives without Scout.
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: String::new(),
+        default_target: Some(DefaultTarget::Member(id("planner"))),
+        runs: Vec::new(),
+        members: vec![
+            member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "impl",
+                MemberStatus::Idle,
+            ),
+            member_summary(
+                "planner",
+                "Planner",
+                BackendKind::Grok,
+                "plan",
+                MemberStatus::Idle,
+            ),
+        ],
+    });
+
+    // Back on the parent, not the default target.
+    assert_eq!(state.focus(), Some(&id("builder")));
 }

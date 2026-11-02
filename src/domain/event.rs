@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::goal::{GoalAction, GoalState};
 use crate::domain::mode::{CollabMode, ModeStatusSummary, ModesConfig, TerminalMode};
+use crate::domain::model_directory::ModelDirectory;
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember,
@@ -222,6 +223,14 @@ pub struct SpawnRequest {
     pub role: Option<String>,
 }
 
+/// A request to close one of the sender's sub-agents, parsed from an
+/// `@@close` envelope. The agent names it by `name` or `id`; either is
+/// matched against member ids and display names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloseRequest {
+    pub name: String,
+}
+
 /// One edited path, optionally with the before/after text used to paint a
 /// Codex-style `+/-` hunk when the file-changes block is expanded. Native
 /// backends may instead provide a unified patch, which keeps its source line
@@ -332,6 +341,10 @@ pub enum UiCommand {
     /// Delete a saved chat and everything stored for it. The current chat is
     /// refused. The runtime answers with a fresh `SavedChats` list.
     DeleteConversation { conversation: i64 },
+    /// Remove one sub-agent from the roster (Agents list, Ctrl+X twice). A
+    /// busy one is interrupted first. Refused for top-level members and for
+    /// a sub-agent that fills a seat of the running mode run.
+    RemoveSubAgent { member: MemberId },
     /// Name a chat (`None` conversation = the current one). An empty or
     /// whitespace-only `name` clears it.
     RenameConversation {
@@ -411,6 +424,10 @@ pub enum UiCommand {
     RunMode { mode: CollabMode, task: String },
     /// `/goal`: show, set, pause, resume or clear the main agent's goal.
     Goal { action: GoalAction },
+    /// The models the installed backends offer, as discovery has found them.
+    /// Sent whenever the picture changes; the runtime uses it to tell agents
+    /// which ids `@@spawn` accepts and to check what they ask for.
+    SetModelDirectory(ModelDirectory),
     /// Begin a graceful shutdown.
     Shutdown,
 }
@@ -796,6 +813,15 @@ pub enum RuntimeEvent {
         child: MemberId,
         summary: String,
     },
+    /// A sub-agent was removed from the roster, by the user (`by_user`) or by
+    /// its parent's `@@close`. `departed` keeps what the chat needs to go on
+    /// labelling the member's earlier messages.
+    SubAgentClosed {
+        parent: MemberId,
+        child: MemberId,
+        by_user: bool,
+        departed: DepartedMember,
+    },
     /// A route referenced an unknown target.
     RouteError {
         turn: TurnId,
@@ -883,6 +909,8 @@ pub enum RuntimeEvent {
     ConversationResumed {
         conversation: i64,
         chat: Vec<ChatItem>,
+        /// Sub-agents removed from this chat earlier (see [`DepartedMember`]).
+        departed: Vec<DepartedMember>,
     },
     /// The chat's goal changed (`None`: it has none). Sent at startup, after a
     /// chat is resumed and on every goal change.
@@ -895,6 +923,18 @@ pub enum RuntimeEvent {
         member: MemberId,
         turn: u32,
     },
+}
+
+/// A sub-agent that was removed from the roster. The chat keeps showing its
+/// earlier messages, so the display name and model settings are remembered
+/// (and saved with the chat) to label them the way a live member is labelled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepartedMember {
+    pub id: MemberId,
+    pub display_name: String,
+    pub backend: BackendKind,
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
 }
 
 /// One saved chat, listed as an "Inactive" row of the Agents list.
@@ -970,6 +1010,14 @@ pub enum ChatItem {
         parent: MemberId,
         child: MemberId,
         summary: String,
+    },
+    /// A sub-agent was removed. Live only, like `Spawn`. `by_user` tells a
+    /// removal from the Agents list from the parent's own `@@close`.
+    Close {
+        parent: MemberId,
+        child: MemberId,
+        name: String,
+        by_user: bool,
     },
     Notice {
         text: String,

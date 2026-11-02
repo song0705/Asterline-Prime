@@ -341,8 +341,8 @@ fn header_chips_show_the_model_name_and_effort_once_a_catalog_names_it() {
         rows[0]
     );
     assert!(!rows[0].contains("Builder · codex"), "{}", rows[0]);
-    // The other member has no catalog and keeps its backend name.
-    assert!(rows[0].contains("Reviewer · claude"), "{}", rows[0]);
+    // Only the open agent is named in the header.
+    assert!(!rows[0].contains("Reviewer"), "{}", rows[0]);
 }
 
 #[test]
@@ -417,21 +417,18 @@ fn the_path_sits_dim_at_the_right_end_of_the_footer() {
 }
 
 #[test]
-fn the_mode_chip_shows_in_the_member_bar_outside_normal_mode() {
+fn the_mode_leads_the_footer_hints_outside_normal_mode() {
     let mut state = state_over(Vec::new(), Some(builder()));
-    assert!(!draw_rows(&state, 80, 10)[0].contains("mode"));
+    let rows = draw_rows(&state, 80, 10);
+    assert!(!rows[0].contains("mode") && !rows.last().unwrap().contains("mode"));
 
     state.apply(RuntimeEvent::ModeChanged {
         mode: TerminalMode::Review,
     });
     let rows = draw_rows(&state, 80, 10);
-    assert!(rows[0].contains(" review mode "), "{}", rows[0]);
-    // Right after the agents, before anything else.
-    assert!(
-        rows[0].find("Reviewer · claude").unwrap() < rows[0].find("review mode").unwrap(),
-        "{}",
-        rows[0]
-    );
+    assert!(!rows[0].contains("mode"), "not in the header: {}", rows[0]);
+    let footer = rows.last().unwrap();
+    assert!(footer.starts_with("review mode · Enter send"), "{footer}");
     // And no label is left on the composer.
     assert!(!rows.iter().skip(1).any(|row| row.contains("mode:")));
 }

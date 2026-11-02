@@ -6,6 +6,15 @@
 /// `TeamMessage::kind` of a sub-agent's automatic result.
 const HANDBACK_KIND: &str = "handback";
 
+/// Who asked for a sub-agent to be removed, which decides who is told and how.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseOrigin {
+    /// The user, from the Agents list.
+    User,
+    /// The sub-agent's parent, with `@@close` in its reply to this turn.
+    Parent(TurnId),
+}
+
 /// What a finished run needs to decide whether its result goes back to the
 /// member that assigned it.
 #[derive(Default)]
@@ -13,6 +22,8 @@ struct SubAgentOutcome {
     origin: Option<MemberId>,
     messaged_origin: bool,
     last_reply: String,
+    /// The backend's own message when the run failed.
+    error: Option<String>,
 }
 
 impl SubAgentOutcome {
@@ -21,6 +32,7 @@ impl SubAgentOutcome {
             origin: running.origin.clone(),
             messaged_origin: running.messaged_origin,
             last_reply: running.last_reply.clone(),
+            error: running.error.clone(),
         }
     }
 }
@@ -59,6 +71,13 @@ impl TeamRuntime {
             );
             return;
         }
+        let (request, resolution) = match self.resolve_spawn_request(&parent, request.clone()) {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                self.refuse_spawn(from, turn, &request.name, &reason, step);
+                return;
+            }
+        };
         let mut candidate = match sub_agent_member(&parent, &request) {
             Ok(candidate) => candidate,
             Err(reason) => {
@@ -66,6 +85,7 @@ impl TeamRuntime {
                 return;
             }
         };
+        self.fit_inherited_effort(&mut candidate, &request);
 
         let existing = self
             .config
@@ -73,9 +93,10 @@ impl TeamRuntime {
             .or_else(|| self.config.find(&candidate.display_name));
         if let Some(existing) = existing {
             if existing.id == candidate.id && existing.parent.as_ref() == Some(from) {
-                // Reuse: the sub-agent keeps its model and session; only the
-                // new task goes to it.
-                self.deliver_task(from, turn, &existing.id.clone(), request.task, step);
+                // Reuse: the sub-agent keeps its context. Only what the
+                // request names explicitly (and differently) is changed.
+                let existing = existing.clone();
+                self.respawn(from, turn, existing, &candidate, &request, &resolution, step);
             } else {
                 self.refuse_spawn(
                     from,
@@ -127,15 +148,440 @@ impl TeamRuntime {
             );
             return;
         }
+        let mut notes = Vec::new();
         if renamed {
             // The parent addresses the child by name later, so it must learn
             // the real one.
-            let note = format!(
+            notes.push(format!(
                 "Sub-agent opened as \"{id}\" (name sub-agents after their job, not their model)."
-            );
-            self.send_system_note(from, turn, note, step);
+            ));
+        }
+        if resolution.changed {
+            let summary = self
+                .config
+                .member(&id)
+                .map(|child| named_summary(child, &resolution))
+                .unwrap_or_default();
+            notes.push(format!("Sub-agent \"{id}\" opened on {summary}."));
+        }
+        notes.extend(resolution.remark.clone());
+        if !notes.is_empty() {
+            self.send_system_note(from, turn, notes.join(" "), step);
         }
         self.deliver_task(from, turn, &id, request.task, step);
+    }
+
+    /// `@@close` from `from`: remove one of its sub-agents.
+    fn handle_close(
+        &mut self,
+        from: &MemberId,
+        turn: TurnId,
+        request: CloseRequest,
+        step: &mut RuntimeStep,
+    ) {
+        match self.closable_sub_agent(&request.name, Some(from)) {
+            Ok(child) => self.begin_close(&child.id, CloseOrigin::Parent(turn), step),
+            Err(reason) => self.refuse_close(from, turn, &request.name, &reason, step),
+        }
+    }
+
+    /// The user asked to remove `member` (Agents list). A refusal is a notice.
+    fn handle_remove_sub_agent(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        match self.closable_sub_agent(member.as_str(), None) {
+            Ok(child) => self.begin_close(&child.id, CloseOrigin::User, step),
+            Err(reason) => step.events.push(RuntimeEvent::Notice(reason)),
+        }
+    }
+
+    /// The sub-agent `name` stands for, if `requester` (a parent, or `None`
+    /// for the user) may remove it now; else the reason it may not.
+    fn closable_sub_agent(
+        &self,
+        name: &str,
+        requester: Option<&MemberId>,
+    ) -> Result<TeamMember, String> {
+        let Some(member) = self.config.find(name).cloned() else {
+            return Err(match requester {
+                Some(_) => format!("there is no sub-agent named \"{name}\""),
+                None => format!("there is no member named \"{name}\""),
+            });
+        };
+        let display = member.display_name.clone();
+        match (&member.parent, requester) {
+            (None, Some(_)) => return Err(format!("{display} is not your sub-agent")),
+            (None, None) => {
+                return Err(format!(
+                    "{display} is not a sub-agent, so it cannot be removed"
+                ));
+            }
+            (Some(parent), Some(from)) if parent != from => {
+                return Err(format!("{display} is not your sub-agent"));
+            }
+            _ => {}
+        }
+        if let Some(mode) = self.active_seat_mode(&member.id) {
+            return Err(match requester {
+                Some(_) => format!(
+                    "{display} is in use by the running {mode}; close it after the run ends"
+                ),
+                None => format!(
+                    "{display} is in use by the running {mode}; press Esc to cancel the run first"
+                ),
+            });
+        }
+        if self.closing.contains_key(&member.id) {
+            return Err(format!("{display} is already being removed"));
+        }
+        Ok(member)
+    }
+
+    /// The mode whose running run has `member` in one of its seats.
+    fn active_seat_mode(&self, member: &MemberId) -> Option<CollabMode> {
+        self.mode_sessions
+            .values()
+            .find(|session| {
+                [&session.builder, &session.reviewer, &session.leader]
+                    .into_iter()
+                    .chain(session.plan_builder.as_ref())
+                    .chain(session.plan_reviewer.as_ref())
+                    .chain(session.participants.iter())
+                    .any(|seat| seat == member)
+            })
+            .map(|session| session.mode)
+    }
+
+    /// Stop whatever `child` is doing, then take it off the roster. A run
+    /// that is still winding down finishes the removal when it exits.
+    fn begin_close(&mut self, child: &MemberId, origin: CloseOrigin, step: &mut RuntimeStep) {
+        // Same as Esc on this one member, plus: nothing queued for it survives
+        // and nothing waits on an approval for it.
+        self.goal_pause_for_interrupt(Some(child), step);
+        let dropped: Vec<TurnId> = self
+            .members
+            .get_mut(child)
+            .map(|state| state.queue.drain(..).map(|queued| queued.turn).collect())
+            .unwrap_or_default();
+        if !dropped.is_empty() {
+            self.emit_queue_updated(child, step);
+        }
+        let held: Vec<ApprovalId> = self
+            .held_approvals
+            .iter()
+            .filter(|(_, held)| held.targets.contains(child))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in held {
+            self.handle_approval(id, ApprovalDecision::Reject, step);
+        }
+        self.handle_cancel(Some(child.clone()), step);
+        for turn in dropped {
+            self.check_turn_complete(turn, step);
+        }
+        let running = self
+            .members
+            .get(child)
+            .is_some_and(|state| state.running.is_some());
+        if running {
+            self.closing.insert(child.clone(), origin);
+            return;
+        }
+        self.finish_close(child, origin, false, step);
+    }
+
+    /// A member's run just ended: if it was being removed, remove it now.
+    fn finish_pending_close(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        let Some(origin) = self.closing.get(member).copied() else {
+            return;
+        };
+        let still_running = self
+            .members
+            .get(member)
+            .is_some_and(|state| state.running.is_some());
+        if still_running {
+            return;
+        }
+        self.closing.remove(member);
+        if self.config.member(member).is_some() {
+            self.finish_close(member, origin, true, step);
+        }
+    }
+
+    /// Take `child` off the roster, tell the parent, and say so in the chat.
+    /// `deferred` is set when the child had a run to stop first, so the
+    /// parent's turn that asked may be over. False when the roster refused.
+    fn finish_close(
+        &mut self,
+        child: &MemberId,
+        origin: CloseOrigin,
+        deferred: bool,
+        step: &mut RuntimeStep,
+    ) -> bool {
+        let Some(member) = self.config.member(child).cloned() else {
+            return false;
+        };
+        let Some(parent) = member.parent.clone() else {
+            return false;
+        };
+        let members: Vec<TeamMember> = self
+            .config
+            .members
+            .iter()
+            .filter(|other| other.id != *child)
+            .cloned()
+            .collect();
+        let default_target = match &self.config.default_target {
+            Some(DefaultTarget::Member(id)) if id == child => None,
+            other => other.clone(),
+        };
+        if !self.replace_team(members, default_target, false, step) {
+            if let CloseOrigin::Parent(turn) = origin
+                && !deferred
+            {
+                self.refuse_close(&parent, turn, child.as_str(), "the roster rejected the change", step);
+            }
+            return false;
+        }
+        self.protocol_stale.remove(child);
+        let departed = DepartedMember {
+            id: child.clone(),
+            display_name: member.display_name.clone(),
+            backend: member.backend,
+            model: member.model.clone(),
+            effort: member.effort,
+        };
+        // Saved with the chat, so its earlier messages keep their labels after
+        // a restart or a /resume.
+        if let Err(err) = self.store.record_departed_member(&departed) {
+            self.report_store_error("remember the removed sub-agent", err, step);
+        }
+        step.events.push(RuntimeEvent::SubAgentClosed {
+            parent: parent.clone(),
+            child: child.clone(),
+            by_user: matches!(origin, CloseOrigin::User),
+            departed,
+        });
+        if self.config.member(&parent).is_none() {
+            return true;
+        }
+        let turn = match origin {
+            CloseOrigin::Parent(turn) if !deferred => Some(turn),
+            _ => self.start_note_turn(step),
+        };
+        if let Some(turn) = turn {
+            let note = match origin {
+                CloseOrigin::User => format!("Sub-agent \"{child}\" was removed by the user."),
+                CloseOrigin::Parent(_) => format!("Sub-agent \"{child}\" closed."),
+            };
+            self.send_system_note(&parent, turn, note, step);
+        }
+        true
+    }
+
+    /// A new turn of its own, for a note nobody's current turn owns.
+    fn start_note_turn(&mut self, step: &mut RuntimeStep) -> Option<TurnId> {
+        match self.store.create_turn() {
+            Ok(turn) => {
+                step.events.push(RuntimeEvent::TurnStarted { turn });
+                Some(turn)
+            }
+            Err(err) => {
+                step.events
+                    .push(RuntimeEvent::Notice(format!("store error: {err}")));
+                None
+            }
+        }
+    }
+
+    /// Tell `from` why a `@@close` failed, once, like a refused spawn.
+    fn refuse_close(
+        &mut self,
+        from: &MemberId,
+        turn: TurnId,
+        name: &str,
+        reason: &str,
+        step: &mut RuntimeStep,
+    ) {
+        let note = format!("Your @@close for \"{name}\" was refused: {reason}. Nothing was changed.");
+        self.send_system_note(from, turn, note, step);
+    }
+
+    /// Check the backend, model, and effort an `@@spawn` names against the
+    /// installed backends and their model lists. The returned request names the
+    /// exact model id; the error is the reason to refuse. A backend whose list
+    /// is not known passes through unchanged.
+    fn resolve_spawn_request(
+        &self,
+        parent: &TeamMember,
+        mut request: SpawnRequest,
+    ) -> Result<(SpawnRequest, SpawnResolution), String> {
+        let mut resolution = SpawnResolution::default();
+        // A request for a sub-agent that already exists is about that
+        // sub-agent: what it does not name follows the child, not the parent.
+        let child = self
+            .config
+            .find(&normalize_member_id(&request.name, ""))
+            .filter(|child| child.parent.as_ref() == Some(&parent.id));
+        let default_backend = child.map_or(parent.backend, |child| child.backend);
+        if request.backend.is_none() && child.is_some() {
+            request.backend = Some(default_backend.as_str().to_string());
+        }
+        // A bad backend or effort word is reported by `sub_agent_member`.
+        let backend = match request.backend.as_deref() {
+            Some(raw) => match BackendKind::try_from(raw.to_ascii_lowercase().as_str()) {
+                Ok(backend) => backend,
+                Err(_) => return Ok((request, resolution)),
+            },
+            None => parent.backend,
+        };
+        if request.backend.is_some() && backend != default_backend && self.models.lacks(backend) {
+            return Err(format!(
+                "{backend} is not installed, so it cannot run a sub-agent"
+            ));
+        }
+        request.model = request
+            .model
+            .take()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        let mut chosen = None;
+        if let Some(asked) = request.model.clone() {
+            if let Some(result) = self.models.resolve(backend, &asked) {
+                let resolved = result?;
+                resolution.changed = resolved.id != asked;
+                resolution.remark = resolved.remark.clone();
+                request.model = Some(resolved.id.clone());
+                chosen = Some(resolved);
+            }
+        } else {
+            // No model named: the one the sub-agent will run.
+            let inherited = match child {
+                Some(child) => child.model.as_deref(),
+                None => (backend == parent.backend)
+                    .then_some(parent.model.as_deref())
+                    .flatten(),
+            };
+            chosen = self.models.effective(backend, inherited);
+        }
+        if let (Some(raw), Some(model)) = (request.effort.as_deref(), chosen.as_ref())
+            && let Some(effort) = Effort::parse(raw)
+            && let Some(reason) = effort_refusal(model, effort)
+        {
+            return Err(reason);
+        }
+        resolution.model = chosen;
+        Ok((request, resolution))
+    }
+
+    /// A sub-agent keeps an effort inherited from its parent only when the
+    /// model it runs offers it.
+    fn fit_inherited_effort(&self, child: &mut TeamMember, request: &SpawnRequest) {
+        if request.effort.is_some() {
+            return;
+        }
+        self.fit_effort(child);
+    }
+
+    fn fit_effort(&self, child: &mut TeamMember) {
+        let Some(effort) = child.effort else {
+            return;
+        };
+        if let Some(model) = self
+            .models
+            .effective(child.backend, child.model.as_deref())
+            && effort_refusal(&model, effort).is_some()
+        {
+            child.effort = None;
+        }
+    }
+
+    /// `@@spawn` for a sub-agent that already exists: switch it to the backend,
+    /// model, or effort the request names (when they differ), then hand it the
+    /// task. Fields the request leaves out keep the sub-agent's values.
+    #[allow(clippy::too_many_arguments)]
+    fn respawn(
+        &mut self,
+        from: &MemberId,
+        turn: TurnId,
+        existing: TeamMember,
+        candidate: &TeamMember,
+        request: &SpawnRequest,
+        resolution: &SpawnResolution,
+        step: &mut RuntimeStep,
+    ) {
+        let child = existing.id.clone();
+        let mut updated = existing.clone();
+        let backend_changes = request.backend.is_some() && candidate.backend != existing.backend;
+        if backend_changes {
+            // Same as `/model` onto another CLI: that CLI's permission preset,
+            // and a fresh native session.
+            updated.backend = candidate.backend;
+            crate::domain::config::apply_backend_defaults(&mut updated);
+            updated.session_id = None;
+            updated.model = request.model.as_ref().and(candidate.model.clone());
+            updated.effort = existing
+                .effort
+                .filter(|effort| effort.supported_by(updated.backend));
+        } else if request.model.is_some() {
+            updated.model = candidate.model.clone();
+        }
+        if request.effort.is_some() {
+            updated.effort = candidate.effort;
+            // The check in `resolve_spawn_request` looked at the model a new
+            // sub-agent would get; this one keeps its own.
+            if let (Some(effort), Some(model)) = (
+                updated.effort,
+                self.models
+                    .effective(updated.backend, updated.model.as_deref()),
+            ) && let Some(reason) = effort_refusal(&model, effort)
+            {
+                self.refuse_spawn(from, turn, &request.name, &reason, step);
+                return;
+            }
+        } else {
+            self.fit_effort(&mut updated);
+        }
+        if updated == existing {
+            self.deliver_task(from, turn, &child, request.task.clone(), step);
+            return;
+        }
+        let busy = self
+            .members
+            .get(&child)
+            .is_some_and(|state| state.running.is_some() || !state.queue.is_empty());
+        if busy {
+            self.refuse_spawn(
+                from,
+                turn,
+                &request.name,
+                &format!(
+                    "{child} is still working, so its model cannot change now. Wait for its hand-back, \
+                     or send @@spawn without backend, model, and effort to queue more work for it as it is"
+                ),
+                step,
+            );
+            return;
+        }
+        let mut members = self.config.members.clone();
+        if let Some(slot) = members.iter_mut().find(|member| member.id == child) {
+            *slot = updated.clone();
+        }
+        let default_target = self.config.default_target.clone();
+        if !self.replace_team(members, default_target, false, step) {
+            self.refuse_spawn(from, turn, &request.name, "the roster rejected the change", step);
+            return;
+        }
+        let summary = named_summary(&updated, resolution);
+        step.events.push(RuntimeEvent::MemberNotice {
+            member: child.clone(),
+            text: format!("Model: {} → {summary}", self.member_display(&child)),
+        });
+        let mut note = format!("Sub-agent \"{child}\" switched to {summary}.");
+        if let Some(remark) = &resolution.remark {
+            note.push(' ');
+            note.push_str(remark);
+        }
+        self.send_system_note(from, turn, note, step);
+        self.deliver_task(from, turn, &child, request.task.clone(), step);
     }
 
     /// Add `candidate` to the roster as a sub-agent of `parent` and announce
@@ -237,8 +683,9 @@ impl TeamRuntime {
         );
     }
 
-    /// Tell the user why a spawn failed, and tell `from` once, as a system
-    /// message that the relay guard counts like any other automatic relay.
+    /// Tell `from` why a spawn failed, once, as a system message that the relay
+    /// guard counts like any other automatic relay. The message also shows in
+    /// the chat as a row from Asterline, so no separate notice repeats it.
     fn refuse_spawn(
         &mut self,
         from: &MemberId,
@@ -247,13 +694,6 @@ impl TeamRuntime {
         reason: &str,
         step: &mut RuntimeStep,
     ) {
-        step.events.push(RuntimeEvent::MemberNotice {
-            member: from.clone(),
-            text: format!(
-                "{} could not spawn {name}: {reason}",
-                self.member_display(from)
-            ),
-        });
         let note = format!(
             "Your @@spawn for \"{name}\" was refused: {reason}. No sub-agent was created."
         );
@@ -347,7 +787,12 @@ impl TeamRuntime {
         let display = self.member_display(child);
         let reply = outcome.last_reply.trim();
         let body = if failed {
-            format!("{display} could not finish the task: its run failed before it gave a final reply.")
+            match outcome.error.as_deref().map(failure_reason).filter(|r| !r.is_empty()) {
+                Some(reason) => format!("{display} could not finish the task: {reason}"),
+                None => format!(
+                    "{display} could not finish the task: its run failed before it gave a final reply."
+                ),
+            }
         } else if reply.is_empty() {
             format!("{display} finished the task but gave no text reply.")
         } else {
@@ -364,6 +809,45 @@ impl TeamRuntime {
             step,
         );
     }
+}
+
+/// What checking an `@@spawn` against the model lists found.
+#[derive(Default)]
+struct SpawnResolution {
+    /// The model the sub-agent runs, as the list describes it.
+    model: Option<ResolvedModel>,
+    /// The model id differs from what the agent wrote.
+    changed: bool,
+    /// Extra wording for the parent (several models matched).
+    remark: Option<String>,
+}
+
+/// `backend · model (Display Name) · effort`; the name only when the list gave one.
+fn named_summary(member: &TeamMember, resolution: &SpawnResolution) -> String {
+    let mut parts = vec![member.backend.as_str().to_string()];
+    if let Some(model) = &member.model {
+        match resolution.model.as_ref().filter(|r| &r.id == model) {
+            Some(resolved) if !resolved.name.is_empty() && resolved.name != resolved.id => {
+                parts.push(format!("{model} ({})", resolved.name))
+            }
+            _ => parts.push(model.clone()),
+        }
+    }
+    if let Some(effort) = member.effort {
+        parts.push(effort.as_str().to_string());
+    }
+    parts.join(" · ")
+}
+
+/// The backend's error text, cut to something a hand-back can carry.
+fn failure_reason(error: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    let flat = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(MAX_CHARS).collect();
+    format!("{cut}…")
 }
 
 /// `backend[ · model][ · effort]` for the "spawned" notice.

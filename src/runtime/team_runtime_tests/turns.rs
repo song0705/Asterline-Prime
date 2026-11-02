@@ -933,7 +933,7 @@ fn saved_chat_resume_restores_chat_roster_and_native_member_sessions() {
     });
     assert!(resumed.events.iter().any(|event| matches!(
         event,
-        RuntimeEvent::ConversationResumed { conversation, chat }
+        RuntimeEvent::ConversationResumed { conversation, chat, .. }
             if *conversation == original
                 && chat.iter().any(|item| matches!(
                     item,
@@ -2252,7 +2252,7 @@ fn live_roster_is_written_to_workspace_not_every_codex_prompt() {
     config.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
     let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
 
-    let idle = std::fs::read_to_string(dir.join(".asterline/roster.md")).unwrap();
+    let idle = std::fs::read_to_string(crate::state_paths::roster_path(&dir)).unwrap();
     assert!(idle.contains("Default target: builder"));
     assert!(idle.contains(
         "id=builder display_name=\"Builder\" backend=codex role=\"impl\" status=idle model=gpt-5-codex effort=high"
@@ -2261,6 +2261,9 @@ fn live_roster_is_written_to_workspace_not_every_codex_prompt() {
         "id=reviewer display_name=\"Reviewer\" backend=claude role=\"review\" status=idle model=sonnet effort=medium cwd=\"/tmp/review\""
     ));
 
+    // The project folder itself stays untouched.
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
     let step = rt.on_ui_command(user("who is on the team?"));
     let prompt = &step.actions[0].prompt;
     assert!(!prompt.contains("$asterline-team"));
@@ -2268,7 +2271,7 @@ fn live_roster_is_written_to_workspace_not_every_codex_prompt() {
     assert!(!prompt.contains("id=builder display_name="));
     assert!(!prompt.contains("status=running"));
 
-    let running = std::fs::read_to_string(dir.join(".asterline/roster.md")).unwrap();
+    let running = std::fs::read_to_string(crate::state_paths::roster_path(&dir)).unwrap();
     assert!(running.contains(
         "id=builder display_name=\"Builder\" backend=codex role=\"impl\" status=running model=gpt-5-codex effort=high"
     ));

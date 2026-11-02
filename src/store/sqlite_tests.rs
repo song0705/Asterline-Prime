@@ -1923,3 +1923,38 @@ fn an_existing_database_gains_the_goal_table_on_open() {
 
     assert_eq!(store.goal_for(id).unwrap().unwrap().objective, "late");
 }
+
+#[test]
+fn departed_members_are_saved_per_conversation_and_deleted_with_it() {
+    use crate::domain::event::DepartedMember;
+    use crate::domain::team::Effort;
+    let store = store();
+    let first = store.create_conversation().unwrap();
+    store.set_conversation(first).unwrap();
+    let gone = DepartedMember {
+        id: MemberId::new("reviewer"),
+        display_name: "Reviewer".to_string(),
+        backend: BackendKind::Claude,
+        model: Some("opus".to_string()),
+        effort: Some(Effort::High),
+    };
+    store.record_departed_member(&gone).unwrap();
+    // Removing the same id again replaces the entry rather than duplicating it.
+    let renamed = DepartedMember {
+        model: None,
+        effort: None,
+        ..gone.clone()
+    };
+    store.record_departed_member(&renamed).unwrap();
+    assert_eq!(store.departed_members().unwrap(), vec![renamed]);
+
+    let second = store.create_conversation().unwrap();
+    store.set_conversation(second).unwrap();
+    assert!(store.departed_members().unwrap().is_empty());
+    store.record_departed_member(&gone).unwrap();
+    assert_eq!(store.departed_members_for(second).unwrap(), vec![gone]);
+
+    store.delete_conversation(first).unwrap();
+    assert!(store.departed_members_for(first).unwrap().is_empty());
+    assert_eq!(store.departed_members_for(second).unwrap().len(), 1);
+}

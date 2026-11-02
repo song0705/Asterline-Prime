@@ -48,7 +48,7 @@ Both `--option value` and `--option=value` are accepted for `--team`,
 Load a JSON team configuration from `PATH` instead of the saved one.
 
 ```bash
-asterline --team .asterline/team.json
+asterline --team ./team.json
 ```
 
 ### `--workspace <PATH>`
@@ -63,7 +63,8 @@ asterline --workspace /path/to/project
 ### `--db <PATH>`
 
 Set the SQLite database path. By default it is
-`<workspace>/.asterline/asterline.sqlite3`.
+`~/.asterline/projects/<workspace key>/asterline.sqlite3` (the home is
+`$ASTERLINE_HOME` when set; see [Runtime data](configuration.md#runtime-data)).
 
 ```bash
 asterline --db /path/to/asterline.sqlite3
@@ -243,7 +244,7 @@ is untouched.
 as a bare `/new` rather than merely hiding history (`/clear text` answers
 `Usage: /clear`). A normal restart reopens the currently selected conversation
 instead of clearing it. `/new` also removes the chat's sub-agents (see
-[Sub-agents](configuration.md#sub-agents)). The old chat stays in the Agents
+[Sub-agents](configuration.md#sub-agents); one at a time, `Ctrl+X` in the Agents list removes a single sub-agent). The old chat stays in the Agents
 list's **Inactive** section (see [Agents list](#agents-list-)). `Ctrl+N` in
 that list is the same as `/new`.
 
@@ -496,7 +497,7 @@ model keeps the effort it already had, and any other model leaves effort to the
 CLI. For AGY's merged rows the variant id carries the level, so no `effort` is
 written. Choosing a model from another CLI also switches the agent to that
 CLI's default permission preset and starts a fresh native session. The change is
-saved to `.asterline/team.json`, and a `Model: …` row records it in the chat. It
+saved to the project's `team.json`, and a `Model: …` row records it in the chat. It
 is refused (with a notice) while the agent is working; press `Esc` to stop it
 first.
 
@@ -591,6 +592,18 @@ with the agent you are viewing selected.
   Any other key, or moving the selection, cancels. The current chat and live
   agents cannot be deleted. The hint line lists `Ctrl+R rename` and `Ctrl+X
   delete` only on rows where they apply.
+- `Ctrl+X` (empty search) on a **sub-agent** row removes that one sub-agent from
+  the chat; the same two-press confirmation applies, and the hint reads `Press
+  Ctrl+X again to remove`, or `Press Ctrl+X again to stop and remove` when it is
+  working, queued, waiting, or needs approval (its work is interrupted first and
+  its queued messages and pending approvals are dropped). The hint line lists
+  `Ctrl+X remove` on sub-agent rows. The parent is told in a system message, and
+  the sub-agent's past messages stay in the chat. The key does nothing on top-level
+  members and the **All** row, and a sub-agent that fills a seat of the running
+  review, plan, or brainstorm run is refused until you cancel the run with `Esc`.
+  A removed review or brainstorm seat (`reviewer`, `ideator-N`) is opened again by
+  the next run. If you were viewing the removed sub-agent, the view returns to its
+  parent.
 - `Enter` or `→` switches the main chat to the selected row and closes the list;
   a mouse click on a row does the same.
 - `Esc` clears a typed search first and closes the list when the search is
@@ -678,8 +691,8 @@ without `s` or `w` discards pending edits.
 `/mode <name>` stays the keyboard fast path: it switches immediately and
 does not open the panel. A `Mode: …` line in the transcript describes the new
 mode, or says plainly why this roster cannot run it yet (only an explicit
-binding that cannot work, such as a reviewer bound to the builder); outside `normal` a ` review mode ` chip sits in the
-member bar. After selecting `review`, `plan`, `brainstorm`, or
+binding that cannot work, such as a reviewer bound to the builder); outside `normal` the footer hint line starts with
+`review mode ·`. After selecting `review`, `plan`, `brainstorm`, or
 `team`, enter the task as the next plain message — do **not** add an
 `@member` prefix. That message starts the selected mode with its configured
 participants. `@member <message>` deliberately remains a one-to-one
@@ -906,7 +919,7 @@ conversation can be scrolled all the way to its first message.
 | `↑` / `↓`                      | Move in composer, history, or active selection                |
 | `Tab`                          | Accept completion                                             |
 | `Ctrl+R`                       | Reverse-search prompt history (in the Agents list: rename)    |
-| `Ctrl+X` (Agents list)         | Press twice to delete the selected saved chat                 |
+| `Ctrl+X` (Agents list)         | Press twice to delete a saved chat or remove a sub-agent      |
 | `n` / `p`                      | Next/previous `/find` match when composer is empty            |
 | `PageUp` / `PageDown`          | Scroll chat or the open drawer by a page                      |
 | `←` (empty composer)           | Open the Agents list (members, sub-agents, saved chats)       |
@@ -920,7 +933,7 @@ conversation can be scrolled all the way to its first message.
 | `Ctrl+O`                       | Show full tool output and open every tool group (toggle)      |
 | `Ctrl+L`                       | Open logs                                                     |
 | `Ctrl+P`                       | Open command palette                                          |
-| `Ctrl+N` / `Ctrl+B`            | Focus next/previous member                                    |
+| `Ctrl+N`                       | New chat (inside the Agents list)                             |
 | `Ctrl+A` / `Ctrl+E`            | Move to line start/end                                        |
 | `Ctrl+U` / `Cmd+Backspace`     | Clear the current composer line (other lines stay)            |
 | `Ctrl+W`                       | Delete previous word                                          |
@@ -1023,8 +1036,7 @@ mouse drag and copied using the terminal's normal copy shortcut.
 
 ## Native session attach
 
-Press `Ctrl+N` or `Ctrl+B` to focus the roster, move with `←` or `→`, and press
-`Enter`; alternatively use `/attach <member>` or `@member /attach`. Asterline
+Use `/attach <member>` or `@member /attach`. Asterline
 suspends its TUI and opens that member's native interactive CLI. Use that CLI's
 supported exit method—normally `/exit`; EOF works only when the backend accepts
 it—to return to Asterline.

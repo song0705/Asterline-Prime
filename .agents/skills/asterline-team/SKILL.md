@@ -2,7 +2,7 @@
 name: asterline-team
 description: Use when acting as an Asterline team member who actually needs to message teammates, open a sub-agent for a side task, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 24
+  version: 27
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -12,7 +12,7 @@ Asterline reads special control lines from your final output. Put each control l
 
 ## Roster And Messaging Policy
 
-Read `.asterline/roster.md` for the current default target and every member's id, name, backend, and status. Asterline rewrites that file when the team or a status changes.
+Read the roster file (`roster.md`; your protocol text gives its full path) for the current default target and every member's id, name, backend, and status. Asterline rewrites that file when the team or a status changes.
 
 Do not send `@@team_message` merely because teammates are listed, another member's name suggests a relevant specialty, or the task involves search, research, review, or planning. Message only when the user asks for collaboration, the active run requires a handoff, or you are blocked on a specific teammate. If you can finish the request yourself, do not emit `@@team_message`.
 
@@ -50,7 +50,7 @@ When the messaging policy above permits it, send necessary work or questions to 
 
 ## Open A Sub-Agent
 
-A top-level member can open sub-agents for side work. They belong to the current chat only: they are not saved in `team.json`, `/resume` brings them back, and `/new` removes them.
+A top-level member can open sub-agents for side work. They belong to the current chat only: they are not saved in `team.json`, `/resume` brings them back, `/new` removes them all, and you or the user can close one at a time.
 
 ```text
 @@spawn {"name":"reviewer","task":"Review the diff in src/router and list real bugs only.","backend":"claude","model":"opus","effort":"high","role":"review"}
@@ -60,6 +60,8 @@ Name a sub-agent after its job, short: `reviewer`, `test-writer`, `researcher`. 
 
 Required fields: `name` and `task`. Optional fields: `backend` (`codex`, `claude`, `grok`, or `agy`), `model`, `effort`, `role` (a short job description, never required). Omitted `backend`, `model`, and `effort` follow you; a different backend gets that backend's default permissions, and the same backend keeps yours.
 
+Your protocol text lists, per installed backend, the exact `model` ids with their display names and supported efforts (`gpt-6-astra (GPT-6-Astra; low…ultra)`). Use those exact ids, and map the user's shorthand ("astra", "gpt-astra") to the listed id yourself instead of guessing; do not read files or run commands to find model names. Asterline refuses an unknown model, an effort the model does not offer, or a backend that is not installed, and the refusal message lists the valid choices. A close but inexact name (for example the display name) is resolved for you and you are told which id was used.
+
 When it is worth it:
 - Independent pieces of work can run in parallel.
 - A second model's perspective, or an independent review, would catch more than you alone.
@@ -68,10 +70,11 @@ When it is worth it:
 How it works:
 - The sub-agent's id is the `name` lowercased with spaces turned into `-`; its display name is the `name` with the first letter of each `-`/`_`-separated part capitalised (`test-writer` shows as `Test-Writer`). The `task` reaches it as a message from you.
 - When it finishes, its final reply comes back to you automatically as a `[hand-back from ...]` message. It does not need to message you itself, and you should not poll or wait for it.
-- To give an existing sub-agent more work, send `@@spawn` again with the same `name` (the other fields are ignored), or an `@@team_message`. It keeps its context.
+- To give an existing sub-agent more work, send `@@spawn` again with the same `name`, or an `@@team_message`. It keeps its context. If that `@@spawn` also names a different `backend`, `model`, or `effort`, the sub-agent is switched to it first (refused while it is busy); fields you leave out keep its current values.
 - A chat holds at most 8 sub-agents. A sub-agent cannot open sub-agents. If Asterline refuses a request, you receive one short `[system message from Asterline]` saying why; do not retry the same request.
 - In `/mode team`, `@@spawn` follows the same roster lock as `@@team_member`. Review, plan, and brainstorm runs do not accept it.
 - Review and brainstorm runs on a roster too small for their seats open `reviewer` and `ideator-N` sub-agents by themselves (Asterline does this, not you); do not spawn those names yourself during such a run.
+- To close a sub-agent you no longer need, send `@@close {"name":"reviewer"}` (`"id"` also works). Only its parent can close it. A busy sub-agent is stopped first, and its past messages stay in the chat. You get a short `[system message from Asterline]` confirming it, or saying why it was refused (an unknown name, not your sub-agent, or a seat in a running review, plan, or brainstorm). The user can also remove a sub-agent from the Agents list (`Ctrl+X` twice); you are then told it was removed. `@@spawn` with the same name opens a fresh one.
 - The user can open any sub-agent from the Agents list (`←` on an empty composer) and keep chatting with it. Its replies to the user are not forwarded to you.
 
 If you are a sub-agent (your prompt says who opened you), just do the task and give your final reply as plain text.

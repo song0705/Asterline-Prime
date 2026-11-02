@@ -264,3 +264,56 @@ fn a_full_chat_starts_nothing_and_says_why() {
     assert_eq!(spawned(&step).len(), 1);
     assert_eq!(rt.config.sub_agent_count(), 8);
 }
+
+#[test]
+fn a_seat_of_the_running_review_cannot_be_removed_but_can_be_afterwards() {
+    let mut rt = lone_main_runtime();
+    rt.on_ui_command(run_mode("add tests"));
+    assert!(rt.config.member(&id("reviewer")).is_some());
+
+    // The user is refused while the run holds the seat.
+    let step = rt.on_ui_command(UiCommand::RemoveSubAgent {
+        member: id("reviewer"),
+    });
+    assert!(notice_texts(&step).contains(
+        &"Reviewer is in use by the running review; press Esc to cancel the run first".to_string()
+    ));
+    assert!(rt.config.member(&id("reviewer")).is_some());
+
+    // So is the parent's @@close, through the note back to it.
+    let step = complete_ok(
+        &mut rt,
+        &main_id(),
+        "built\n@@close {\"name\":\"reviewer\"}",
+    );
+    assert!(rt.config.member(&id("reviewer")).is_some());
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Route { from, body, .. }
+            if from.as_str() == "asterline" && body.contains("was refused") && body.contains("in use by the running review")
+    )));
+
+    // The review starts once the parent has dealt with the refusal note; finish
+    // the run, after which the seat is free to remove.
+    complete_ok(&mut rt, &main_id(), "understood");
+    complete_ok(
+        &mut rt,
+        &id("reviewer"),
+        "Fine.\n@@review {\"verdict\":\"approve\",\"summary\":\"good\"}",
+    );
+    assert!(rt.mode_sessions.is_empty());
+    let step = rt.on_ui_command(UiCommand::RemoveSubAgent {
+        member: id("reviewer"),
+    });
+    assert!(rt.config.member(&id("reviewer")).is_none());
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::SubAgentClosed { child, .. } if child == &id("reviewer")
+    )));
+    // Drain the parent's run for the removal note before starting again.
+    complete_ok(&mut rt, &main_id(), "noted");
+
+    let step = rt.on_ui_command(run_mode("second"));
+    assert_eq!(spawned(&step), vec![(main_id(), id("reviewer"))]);
+    assert!(rt.config.member(&id("reviewer")).is_some());
+}

@@ -138,16 +138,18 @@ A team can mix providers or use the same backend more than once. Each member has
 
 Asterline does not replace provider authentication, billing, model access, or usage limits.
 
-Reopening Asterline resumes the last conversation by default. `/new` (optionally with a first prompt) and `/clear` both start a clean conversation and keep the mode settings. `/resume` picks a saved conversation in the Agents list and restores its transcript, roster, backend sessions, mode, and Runs. Project state lives in:
+Reopening Asterline resumes the last conversation by default. `/new` (optionally with a first prompt) and `/clear` both start a clean conversation and keep the mode settings. `/resume` picks a saved conversation in the Agents list and restores its transcript, roster, backend sessions, mode, and Runs. Project state lives under `~/.asterline` (override with `ASTERLINE_HOME`), never in your project folder:
 
 ```text
-<workspace>/.asterline/
-├── team.json
-├── roster.md
-└── asterline.sqlite3
+~/.asterline/
+├── skills/                      shared Asterline skills
+└── projects/<workspace key>/
+    ├── team.json
+    ├── roster.md
+    └── asterline.sqlite3
 ```
 
-The database may contain prompts, responses, tool output, routes, approvals, logs, and session identifiers. Treat it as sensitive development data and add `.asterline/` to `.gitignore` unless you intend to version it.
+The workspace key is the absolute workspace path with every character other than letters, digits, `-`, and `_` turned into `-` (`/home/me/app` becomes `-home-me-app`; a path with non-ASCII characters also gets a short hash). The database may contain prompts, responses, tool output, routes, approvals, logs, and session identifiers. Treat it as sensitive development data. State that an older version left in `<workspace>/.asterline/` is moved here on first launch.
 
 ## Safety model
 

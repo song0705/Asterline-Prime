@@ -10,7 +10,7 @@
 启动时，Asterline 按下列顺序选择 roster：
 
 1. `--team <PATH>` 加载指定 JSON 文件。
-2. 若 `<workspace>/.asterline/team.json` 存在则复用。
+2. 若该项目已保存的 `team.json`（见[运行时数据](#运行时数据)）存在则复用。
 3. 否则在 `PATH` 检测受支持后端可执行文件，并直接进入聊天：只有一个通用的 `main` Agent，
    使用找到的第一个 CLI（Codex、Claude、Grok、Agy 的顺序），模型用该 CLI 自己的默认值，
    权限用其默认预设，并把 roster 保存到 `team.json`。
@@ -229,7 +229,7 @@ Server 的 `thread.id`，通过 `thread/resume` 恢复；Claude、Grok、Agy 分
 可清除显式 ID。
 
 Asterline 会把自己的 Codex thread 和 Claude session 命名为 `Asterline · <成员名>`，以便在
-会显示标题的原生历史中辨认。`<workspace>/.asterline/team.json` 保存的 roster 也绑定到其
+会显示标题的原生历史中辨认。项目状态目录里 `team.json` 保存的 roster 也绑定到其
 所在 workspace：项目移动后，Asterline 会在启动成员前修正过期的已序列化 workspace，使新的
 原生 transcript 仍归属你实际打开的项目。原生 session picker 会按工作目录过滤。Claude
 Code 会有意不在交互式 picker 中列出由 `claude -p` 或 Agent SDK 创建的 session。
@@ -340,28 +340,46 @@ Asterline 在进程、adapter、runtime、import 和 UI 边界应用明确上限
 
 ## 运行时数据
 
-默认 workspace 状态为：
+Asterline 不会往项目目录里写任何东西。它的文件都放在 Asterline home 下：`~/.asterline`
+（Windows 为 `%USERPROFILE%\.asterline`），或环境变量 `ASTERLINE_HOME` 指定的目录：
 
 ```text
-<workspace>/.asterline/
-├── team.json
-├── roster.md
-└── asterline.sqlite3
+~/.asterline/
+├── skills/
+│   ├── asterline-team/SKILL.md
+│   └── asterline-brainstorm/SKILL.md
+└── projects/<工作区 key>/
+    ├── team.json
+    ├── roster.md
+    ├── agy/                 Agy 日志
+    └── asterline.sqlite3
 ```
+
+工作区 key 是工作区规范化后的绝对路径，其中所有不是 ASCII 字母、数字、`-`、`_` 的字符都换成
+`-`（与 Claude Code 对 `~/.claude/projects` 的做法相同）：`/home/me/app` 变成
+`-home-me-app`。路径含任何非 ASCII 字符（例如中文目录名）时，还会再附上 `-` 与完整路径
+SHA-256 的前 8 位十六进制，因此不同目录不会共用同一个 key。目录以 `0700` 权限创建。
+
+Claude、Grok 和 Agy 启动时会带上 `--add-dir`，指向 `~/.asterline/skills` 和该项目的状态
+目录，以便读取 team skill 和 roster。
+
+**迁移旧状态。** 旧版本把这些数据放在 `<workspace>/.asterline/`，并在项目里生成
+`.agents/skills/asterline-team/` 与 `.agents/skills/asterline-brainstorm/`。在某个 workspace
+首次启动时，Asterline 会把 `<workspace>/.asterline/`（数据库及其 `-wal`/`-shm`、
+`team.json`、`roster.md`）移到项目状态目录，删除它当初生成的 skill 文件，再删除因此变空的
+`.agents/skills/…`、`.agents/skills` 和 `.agents`。内容不同的文件绝不会删；Asterline 自己的
+源码仓库（`Cargo.toml` 的包名为 `asterline`）会保留 `.agents/skills`。若新的状态目录里已有数据库，
+则以新的为准：旧目录原样保留，并只提示一次。迁移无法完成时（例如另一个 Asterline 仍在使用旧目录）
+会给出提示，下次启动再试。
 
 SQLite 保存会话、工具事件、队友路由、原始后端事件、日志、审批、session 标识符、Runs、
 checklist、timeline 和验证结果。
 
-像保护其他开发 transcript 一样保护此目录。大多数仓库应忽略它：
-
-```gitignore
-.asterline/
-```
+像保护其他开发 transcript 一样保护此目录。它在你的仓库之外，无需改 `.gitignore`。
 
 重新打开 Asterline 默认恢复当前选中的对话。`/new` 与 `/clear` 都会在普通模式创建干净会话和
 新的后端 session，同时保留旧数据库记录。成员、Runs 或验证处于活动状态时它们会被拒绝；先按
-`Esc` 并等待取消。`--no-restore` 跳过启动 replay，不删除数据。`--db <PATH>` 将数据库移出
-workspace。
+`Esc` 并等待取消。`--no-restore` 跳过启动 replay，不删除数据。`--db <PATH>` 将数据库放到别处。
 
 `/resume` 打开 Agents 列表并停在已保存的聊天（**Inactive** 分组）上；`/new <prompt>` 开新对话并发送该提示。恢复聊天也会恢复该聊天所属的 roster、完整成员配置和
 每位成员的原生后端 session ID。
@@ -394,13 +412,13 @@ Asterline 本地启动后端 CLI，并继承其凭据、环境变量、文件系
 
 ## Agent 间协作
 
-Asterline 缺失时会创建 `.agents/skills/asterline-team/SKILL.md`，并告诉每位成员这个 team
-skill 位于该路径。完整协议留在 workspace，普通聊天不再每轮重复；该提示刻意不调用
-`$asterline-team`，因此不会强制 Codex 展开整份 skill。自身和队员的实时身份与状态写在
-`.asterline/roster.md`，团队或成员状态变化时更新。team skill 会说明该文件的用途，不会再写进
-每一轮 prompt。
+Asterline 缺失时会创建 `~/.asterline/skills/asterline-team/SKILL.md`（并在它管理的 skill 有新版本时
+升级），并告诉每位成员这个 team skill 位于该绝对路径。完整协议留在文件里，普通聊天不再每轮重复；该提示刻意不调用
+`$asterline-team`，因此不会强制 Codex 展开整份 skill。自身和队员的实时身份与状态写在该项目的
+`roster.md`（绝对路径写在每位成员的协议文本里），团队或成员状态变化时更新。team skill 会说明该文件的用途，不会把
+内容写进每一轮 prompt。
 
-它也会在缺失时创建 `.agents/skills/asterline-brainstorm/SKILL.md`。Brainstorm mode 会为每次
+它也会在缺失时创建 `~/.asterline/skills/asterline-brainstorm/SKILL.md`。Brainstorm mode 会为每次
 生成、投票和综合派发加载该文件。已有副本永不升级或覆盖，因此部署可以自定义方法，同时
 保留 `@@brainstorm_card` 和 `@@brainstorm_vote` schema。
 
@@ -457,9 +475,11 @@ name 转小写（空格变 `-`），显示名是 name 中每个以 `-`/`_` 分�
 的请求会显示通知，并给父成员发一条简短说明；交接和拒绝说明都和其他自动转交一样
 计入 `max_auto_relays`。
 
-子 Agent 只属于当前对话：不会写入 `.asterline/team.json`（`/model` 或 `/team` 修改
+子 Agent 只属于当前对话：不会写入已保存的 `team.json`（`/model` 或 `/team` 修改
 之后也一样），随对话一起保存，所以 `/resume` 和正常重启都会连同会话一起恢复，
-`/new` 会移除它们。对正在查看的子 Agent 用 `/model` 只会改它自己。`/team` 编辑器
+`/new` 会全部移除。也可以逐个移除：在 Agents 列表的子 Agent 行上连按两次 `Ctrl+X`，或由父成员发
+`@@close {"name":"reviewer"}`（也接受 `"id"`）；正在工作的会先被中断，它以往的消息仍留在聊天里，父成员会收到
+一行说明。占着进行中 review、plan 或 brainstorm 席位的子 Agent 两种方式都会被拒绝。对正在查看的子 Agent 用 `/model` 只会改它自己。`/team` 编辑器
 只列顶层成员；删掉某个父成员时，它的子 Agent 一并删除。成员字段 `parent` 标记子
 Agent，只写入对话快照。
 
@@ -513,7 +533,7 @@ asterline --fake --no-restore
 
 ### 打开了错误 roster
 
-编辑 `.asterline/team.json`，用 `/model` 修改模型，或使用 `/team` 后按 `s` 应用 roster 更改。删除 `team.json` 后下次启动会重新从默认的 `main` Agent 开始。
+编辑该项目的 `team.json`（在 `~/.asterline/projects/` 下），用 `/model` 修改模型，或使用 `/team` 后按 `s` 应用 roster 更改。删除 `team.json` 后下次启动会重新从默认的 `main` Agent 开始。
 
 ### 不加载之前的 transcript 启动
 

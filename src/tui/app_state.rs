@@ -18,11 +18,13 @@ use crate::adapter::prompt_images::{
 };
 use crate::domain::config::{DetectedBackends, MAIN_MEMBER_ID, detect_backends};
 use crate::domain::event::{
-    AgentSessionId, ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId,
-    MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
+    AgentSessionId, ApprovalId, ChatItem, ConversationSummary, DepartedMember, LogEntry,
+    MemberStatus, MessageId, MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary,
+    RuntimeEvent, UiCommand,
 };
 use crate::domain::goal::GoalState;
 use crate::domain::mode::{ModesConfig, TerminalMode};
+use crate::domain::model_directory::ModelDirectory;
 use crate::domain::team::{
     BackendKind, CodexApprovalsReviewer, DefaultTarget, Effort, MemberId, PermissionMode,
     SandboxPolicy, SessionPolicy, TeamMember,
@@ -235,7 +237,7 @@ pub(crate) fn focus_row(state: &AppState, item: &ChatItem) -> FocusRow {
         }
         // The parent sees that it opened a sub-agent; the sub-agent's own
         // window starts at the task it received.
-        ChatItem::Spawn { parent, .. } => own(parent),
+        ChatItem::Spawn { parent, .. } | ChatItem::Close { parent, .. } => own(parent),
         // The goal loop's turn marker belongs to the goal's member.
         ChatItem::GoalMarker { member, .. } => own(member),
     }
@@ -308,6 +310,9 @@ pub struct AppState {
     mode_overrides: ModesConfig,
     suggested_verify: Option<String>,
     members: Vec<MemberView>,
+    /// Sub-agents removed from this chat: their earlier messages keep the
+    /// display name and model label (see [`DepartedMember`]).
+    departed: Vec<DepartedMember>,
     chat: Vec<ChatItem>,
     message_index: HashMap<MessageId, ActiveMessageCell>,
     tool_index: HashMap<(MemberId, String), ActiveToolCell>,
@@ -362,9 +367,10 @@ pub struct AppState {
     /// Search text typed into the Agents list; empty shows every agent in
     /// status sections.
     agents_query: String,
-    /// The saved chat whose deletion Ctrl+X armed (a second Ctrl+X on the same
-    /// row deletes it; any other key disarms).
-    agents_delete_armed: Option<i64>,
+    /// The row whose removal Ctrl+X armed: a saved chat to delete or a
+    /// sub-agent to remove (a second Ctrl+X on the same row does it; any other
+    /// key disarms).
+    agents_delete_armed: Option<AgentChoice>,
     /// The rename editor that replaces the search line (Ctrl+R).
     agents_rename: Option<AgentsRename>,
     /// The name of the chat being viewed, if it has one.
@@ -376,7 +382,6 @@ pub struct AppState {
     agents_click_rows: RefCell<Vec<(u16, AgentChoice)>>,
     /// When each member last finished a reply, for the Agents list's age.
     last_reply_at: HashMap<MemberId, Instant>,
-    header_selected: Option<usize>,
     attach_pending: Option<MemberId>,
     attach_request: Option<AttachRequest>,
     attach_release_pending: Option<MemberId>,
@@ -425,6 +430,8 @@ pub struct AppState {
     /// Keeping that fixed avoids model-list subprocess churn while the Team
     /// changes.
     model_catalog_warmed: bool,
+    /// The model list the runtime was last given.
+    model_directory_sent: Option<ModelDirectory>,
     skills: Vec<SkillInfo>,
     /// Saved (not live) chats, newest first: the Agents list's Inactive rows.
     /// Refreshed by the runtime each time the list opens.
@@ -474,6 +481,7 @@ impl AppState {
             mode_overrides: ModesConfig::default(),
             suggested_verify: None,
             members: Vec::new(),
+            departed: Vec::new(),
             chat,
             message_index: HashMap::new(),
             tool_index: HashMap::new(),
@@ -518,7 +526,6 @@ impl AppState {
             goal: None,
             agents_click_rows: RefCell::new(Vec::new()),
             last_reply_at: HashMap::new(),
-            header_selected: None,
             attach_pending: None,
             attach_request: None,
             attach_release_pending: None,
@@ -540,6 +547,7 @@ impl AppState {
             model_switch_pending: false,
             model_catalog_detection: None,
             model_catalog_warmed: false,
+            model_directory_sent: None,
             skills: Vec::new(),
             saved_chats: Vec::new(),
             agents_select_inactive: false,
@@ -565,6 +573,20 @@ impl AppState {
         }
     }
 
+    /// Seed the sub-agents removed earlier from the restored chat, so their
+    /// messages keep their labels after a restart.
+    pub fn seed_departed(&mut self, departed: Vec<DepartedMember>) {
+        self.departed = departed;
+        self.roster_revision = self.roster_revision.wrapping_add(1);
+    }
+
+    /// Remember a removed sub-agent (a re-removed id replaces its old entry).
+    fn remember_departed(&mut self, member: DepartedMember) {
+        self.departed.retain(|known| known.id != member.id);
+        self.departed.push(member);
+        self.roster_revision = self.roster_revision.wrapping_add(1);
+    }
+
     pub fn apply(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Ready {
@@ -580,6 +602,14 @@ impl AppState {
                 // A refreshed roster invalidates any unsaved Team draft, but
                 // its completed/in-flight model lookups remain reusable.
                 self.stash_team_editor_catalog();
+                // A focused sub-agent that left the roster hands the focus
+                // back to its parent.
+                let focus_parent = self.focus.as_ref().and_then(|focus| {
+                    self.members
+                        .iter()
+                        .find(|member| &member.id == focus)
+                        .and_then(|member| member.parent.clone())
+                });
                 self.team = team;
                 self.skills = crate::tui::skills::discover(Path::new(&workspace));
                 self.workspace = workspace;
@@ -624,10 +654,11 @@ impl AppState {
                         self.running_since.remove(&member.id);
                     }
                 }
-                if let Some(idx) = self.header_selected
-                    && idx >= self.members.len()
+                if let (Some(focus), Some(parent)) = (&self.focus, focus_parent)
+                    && !self.members.iter().any(|member| &member.id == focus)
+                    && self.members.iter().any(|member| member.id == parent)
                 {
-                    self.header_selected = self.members.len().checked_sub(1);
+                    self.assign_focus(Some(parent));
                 }
                 self.sync_focus_with_roster();
                 if self.drawer == Some(Drawer::Team) {
@@ -934,6 +965,21 @@ impl AppState {
                     summary,
                 });
             }
+            RuntimeEvent::SubAgentClosed {
+                parent,
+                child,
+                by_user,
+                departed,
+            } => {
+                let name = departed.display_name.clone();
+                self.remember_departed(departed);
+                self.push(ChatItem::Close {
+                    parent,
+                    child,
+                    name,
+                    by_user,
+                });
+            }
             RuntimeEvent::FileChange { member, files, ok } => {
                 self.push(ChatItem::Diff { member, files, ok });
             }
@@ -1114,6 +1160,7 @@ impl AppState {
                 self.active_mode = TerminalMode::Normal;
                 self.mode_editor = None;
                 self.goal = None;
+                self.departed.clear();
                 self.saved_chats.clear();
                 self.chat_name = None;
                 self.agents_delete_armed = None;
@@ -1165,9 +1212,10 @@ impl AppState {
                     self.select_first_inactive();
                 }
             }
-            RuntimeEvent::ConversationResumed { chat, .. } => {
+            RuntimeEvent::ConversationResumed { chat, departed, .. } => {
                 // The chat being viewed changed, so the saved list is stale.
                 self.saved_chats.clear();
+                self.departed = departed;
                 self.chat_name = None;
                 self.agents_delete_armed = None;
                 self.agents_rename = None;
@@ -1472,6 +1520,9 @@ impl AppState {
         {
             return (member.display_name.clone(), member.backend);
         }
+        if let Some(gone) = self.departed_member(member) {
+            return (gone.display_name.clone(), gone.backend);
+        }
         self.chat
             .iter()
             .rev()
@@ -1526,7 +1577,22 @@ impl AppState {
             .iter()
             .find(|m| &m.id == member)
             .map(|m| m.display_name.clone())
+            .or_else(|| {
+                self.departed_member(member)
+                    .map(|gone| gone.display_name.clone())
+            })
             .unwrap_or_else(|| member.to_string())
+    }
+
+    /// A sub-agent removed from this chat, if `id` was one.
+    pub fn departed_member(&self, id: &MemberId) -> Option<&DepartedMember> {
+        self.departed.iter().find(|gone| &gone.id == id)
+    }
+
+    /// The members this chat's messages may come from that are no longer on
+    /// the team.
+    pub fn departed_members(&self) -> &[DepartedMember] {
+        &self.departed
     }
 
     pub fn has_active_message(&self, member_id: &MemberId) -> bool {
@@ -1741,9 +1807,6 @@ impl AppState {
     pub fn drawer(&self) -> Option<Drawer> {
         self.drawer.clone()
     }
-    pub fn header_selected(&self) -> Option<usize> {
-        self.header_selected
-    }
     pub fn scroll(&self) -> usize {
         self.scroll
     }
@@ -1937,17 +2000,6 @@ impl AppState {
         }
     }
 
-    /// Request attaching to the member at `idx`'s live backend session. The
-    /// synchronous attach pauses event consumption, so it is disabled while
-    /// any runtime work could still produce events.
-    pub fn request_attach(&mut self, idx: usize) -> Option<MemberId> {
-        let Some(member) = self.members.get(idx).map(|member| member.id.clone()) else {
-            self.header_selected = None;
-            return None;
-        };
-        self.request_attach_member(member)
-    }
-
     /// Request a named member's existing native interactive session.
     pub(crate) fn request_attach_member_by_name(
         &mut self,
@@ -1964,7 +2016,6 @@ impl AppState {
                 member: None,
                 text: "Cannot attach because the runtime has stopped.".to_string(),
             });
-            self.header_selected = None;
             return None;
         }
         if self.attach_pending.is_some() || self.attach_request.is_some() {
@@ -1972,7 +2023,6 @@ impl AppState {
                 member: None,
                 text: "An attach request is already pending.".to_string(),
             });
-            self.header_selected = None;
             return None;
         }
         if self.has_cancelable_work() {
@@ -1980,11 +2030,9 @@ impl AppState {
                 text: "Cannot attach while member work, verification, routing, or approval is active — press Esc to cancel it or resolve it first."
                     .to_string(),
             });
-            self.header_selected = None;
             return None;
         }
         self.attach_pending = Some(member.clone());
-        self.header_selected = None;
         Some(member)
     }
 
@@ -2072,7 +2120,6 @@ impl AppState {
 
     pub fn insert_char(&mut self, ch: char) {
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.insert(ch);
         self.reconcile_pending_images();
         self.history_cursor = None;
@@ -2167,7 +2214,6 @@ impl AppState {
             return Err(COMPOSER_INPUT_TRUNCATED.to_string());
         }
         self.disarm_quit();
-        self.header_selected = None;
         if self.composer.delete_selection() {
             self.reconcile_pending_images();
         }
@@ -2201,7 +2247,6 @@ impl AppState {
 
     pub fn insert_text(&mut self, text: &str) {
         self.disarm_quit();
-        self.header_selected = None;
         // Bound before newline normalization so a giant paste does not create
         // another full-size temporary allocation on the UI thread.
         let mut end = text.len().min(MAX_COMPOSER_BYTES);
@@ -2228,7 +2273,6 @@ impl AppState {
     }
     pub fn insert_newline(&mut self) {
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.insert_newline();
         self.reconcile_pending_images();
         self.history_cursor = None;
@@ -2252,7 +2296,6 @@ impl AppState {
     }
     pub fn backspace(&mut self) {
         self.disarm_quit();
-        self.header_selected = None;
         let cursor = self.composer.cursor();
         let text = self.composer.text();
         let image_range = (self.composer.selection_range().is_none())
@@ -2274,7 +2317,6 @@ impl AppState {
     }
     pub fn delete_word(&mut self) {
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.delete_word();
         self.reconcile_pending_images();
         self.history_cursor = None;
@@ -2282,7 +2324,6 @@ impl AppState {
     }
     pub fn clear_line(&mut self) {
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.delete_line();
         self.reconcile_pending_images();
         self.history_cursor = None;
@@ -2290,7 +2331,6 @@ impl AppState {
     }
     pub fn clear_composer(&mut self) {
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.clear();
         self.discard_pending_images();
         self.history_cursor = None;
@@ -2425,7 +2465,6 @@ impl AppState {
         // Suppress the completion popup while browsing recalled commands.
         self.popup_dismissed = true;
         self.popup_selected = 0;
-        self.header_selected = None;
     }
 
     /// Recall a newer entry (↓); stepping past the newest restores the draft.
@@ -2445,7 +2484,6 @@ impl AppState {
             self.composer.set_text(&draft);
         }
         self.popup_selected = 0;
-        self.header_selected = None;
     }
 
     /// Whether the composer is currently showing a recalled history entry.
@@ -2476,7 +2514,6 @@ impl AppState {
             query: String::new(),
             match_idx,
         });
-        self.header_selected = None;
         self.popup_dismissed = true;
     }
 
@@ -3062,14 +3099,39 @@ impl AppState {
             && matches!(self.selected_agent(), Some(AgentChoice::Saved(_)))
     }
 
-    /// Whether Ctrl+X has armed the deletion of the selected row.
-    pub fn agents_delete_armed(&self) -> bool {
-        match (self.agents_delete_armed, self.selected_agent()) {
-            (Some(armed), Some(AgentChoice::Saved(selected))) => {
-                armed == selected && self.agents_can_delete()
-            }
-            _ => false,
+    /// The sub-agent on the selected Agents row, if Ctrl+X can remove it:
+    /// only without a search, never a top-level member or the All row.
+    fn agents_removable_sub_agent(&self) -> Option<&MemberView> {
+        if !self.agents_query.trim().is_empty() {
+            return None;
         }
+        let AgentChoice::Member(id) = self.selected_agent()? else {
+            return None;
+        };
+        self.members
+            .iter()
+            .find(|member| member.id == id && member.parent.is_some())
+    }
+
+    /// Whether Ctrl+X on the selected Agents row removes a sub-agent.
+    pub fn agents_can_remove(&self) -> bool {
+        self.agents_removable_sub_agent().is_some()
+    }
+
+    /// Whether the sub-agent Ctrl+X would remove is busy (running, queued,
+    /// waiting, or needing approval), so removing it stops its work first.
+    pub fn agents_remove_busy(&self) -> bool {
+        self.agents_removable_sub_agent()
+            .is_some_and(|member| member_status_is_active(member.status))
+    }
+
+    /// Whether Ctrl+X has armed the deletion or removal of the selected row.
+    pub fn agents_delete_armed(&self) -> bool {
+        let Some(armed) = &self.agents_delete_armed else {
+            return false;
+        };
+        self.selected_agent().as_ref() == Some(armed)
+            && (self.agents_can_delete() || self.agents_can_remove())
     }
 
     /// Any key other than Ctrl+X puts the armed deletion away.
@@ -3077,20 +3139,33 @@ impl AppState {
         self.agents_delete_armed = None;
     }
 
-    /// Ctrl+X in the Agents list: the first press on an Inactive row arms its
-    /// deletion, a second one on the same row queues it.
+    /// Ctrl+X in the Agents list: the first press on an Inactive row or a
+    /// sub-agent arms its deletion or removal, a second one on the same row
+    /// queues it. Other rows ignore it.
     pub fn press_agents_delete(&mut self) {
-        let Some(AgentChoice::Saved(conversation)) = self.selected_agent() else {
+        let Some(choice) = self.selected_agent() else {
             self.agents_delete_armed = None;
             return;
         };
-        if !self.agents_can_delete() {
+        let command = match &choice {
+            AgentChoice::Saved(conversation) if self.agents_can_delete() => {
+                UiCommand::DeleteConversation {
+                    conversation: *conversation,
+                }
+            }
+            AgentChoice::Member(member) if self.agents_can_remove() => UiCommand::RemoveSubAgent {
+                member: member.clone(),
+            },
+            _ => {
+                self.agents_delete_armed = None;
+                return;
+            }
+        };
+        if self.agents_delete_armed.as_ref() == Some(&choice) {
             self.agents_delete_armed = None;
-        } else if self.agents_delete_armed == Some(conversation) {
-            self.agents_delete_armed = None;
-            self.pending_command = Some(UiCommand::DeleteConversation { conversation });
+            self.pending_command = Some(command);
         } else {
-            self.agents_delete_armed = Some(conversation);
+            self.agents_delete_armed = Some(choice);
         }
     }
 
@@ -3426,7 +3501,6 @@ impl AppState {
             return false;
         };
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.set_text(&command);
         self.history_cursor = None;
         self.reset_popup();
@@ -3442,7 +3516,6 @@ impl AppState {
             return false;
         };
         self.disarm_quit();
-        self.header_selected = None;
         self.composer.set_text(&command);
         self.history_cursor = None;
         self.reset_popup();
@@ -3752,6 +3825,39 @@ impl AppState {
         self.model_picker.is_some() || self.chat.is_empty()
     }
 
+    /// The installed backends and model lists found so far, when they differ
+    /// from what the runtime was last given. A list that is being reloaded
+    /// keeps its previous contents. Call [`Self::mark_model_directory_sent`] once
+    /// the runtime has accepted it.
+    pub(crate) fn pending_model_directory(&self) -> Option<ModelDirectory> {
+        let workspace = Path::new(&self.workspace);
+        let mut next = self.model_directory_sent.clone().unwrap_or_default();
+        next.installed = self.detected_backends.or(next.installed);
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            let CatalogView::Ready(catalog) = self.display_model_catalog().view(backend, workspace)
+            else {
+                continue;
+            };
+            match next.catalogs.iter_mut().find(|(kind, _)| *kind == backend) {
+                Some((_, models)) => *models = catalog.models.clone(),
+                None => next.catalogs.push((backend, catalog.models.clone())),
+            }
+        }
+        (self.model_directory_sent.as_ref() != Some(&next)
+            && (next.installed.is_some() || !next.catalogs.is_empty()))
+        .then_some(next)
+    }
+
+    /// Record that the runtime has the model list `sent`.
+    pub(crate) fn mark_model_directory_sent(&mut self, sent: ModelDirectory) {
+        self.model_directory_sent = Some(sent);
+    }
+
     fn open_team_editor(&mut self) {
         // The editor owns the top-level roster; sub-agents belong to the chat.
         let members = self
@@ -3821,29 +3927,39 @@ impl AppState {
     /// on the header chip and the welcome page. Until a catalog names the model
     /// it is the backend name; the effort part appears only when one is known.
     pub fn member_model_label(&self, member: &MemberView) -> String {
+        self.model_label_for(member.backend, member.model.as_deref(), member.effort)
+    }
+
+    fn model_label_for(
+        &self,
+        backend: BackendKind,
+        model: Option<&str>,
+        effort: Option<Effort>,
+    ) -> String {
         let effective = self.display_model_catalog().effective_model(
-            member.backend,
-            member.model.as_deref(),
-            member.effort,
+            backend,
+            model,
+            effort,
             Path::new(&self.workspace),
         );
         let name = effective
             .name
             .or(effective.id)
-            .unwrap_or_else(|| member.backend.as_str().to_string());
+            .unwrap_or_else(|| backend.as_str().to_string());
         match effective.effort {
             Some(effort) => format!("{name} · {}", effort.as_str()),
             None => name,
         }
     }
 
-    /// `member_model_label` for the member with this id, `None` when no such
-    /// member is on the team any more.
+    /// `member_model_label` for the member with this id: a live member's, else
+    /// that of a sub-agent removed from this chat, else `None`.
     pub fn member_model_label_by_id(&self, id: &MemberId) -> Option<String> {
-        self.members
-            .iter()
-            .find(|member| &member.id == id)
-            .map(|member| self.member_model_label(member))
+        if let Some(member) = self.members.iter().find(|member| &member.id == id) {
+            return Some(self.member_model_label(member));
+        }
+        self.departed_member(id)
+            .map(|gone| self.model_label_for(gone.backend, gone.model.as_deref(), gone.effort))
     }
 
     /// The model line of the welcome page: the viewed agent (else the first)
@@ -3918,7 +4034,6 @@ impl AppState {
             return;
         };
         self.close_drawer();
-        self.header_selected = None;
         self.disarm_quit();
         let target = &self.members[index];
         let (target_id, target_backend) = (target.id.clone(), target.backend);
@@ -4341,39 +4456,6 @@ impl AppState {
         member
     }
 
-    pub fn select_next_member(&mut self) {
-        self.disarm_quit();
-        let len = self.members.len();
-        if len == 0 {
-            return;
-        }
-        let next_idx = match self.header_selected {
-            None => 0,
-            Some(idx) => (idx + 1) % len,
-        };
-        self.header_selected = Some(next_idx);
-        self.reset_popup();
-    }
-
-    pub fn select_prev_member(&mut self) {
-        self.disarm_quit();
-        let len = self.members.len();
-        if len == 0 {
-            return;
-        }
-        let prev_idx = match self.header_selected {
-            None => len - 1,
-            Some(idx) => (idx + len - 1) % len,
-        };
-        self.header_selected = Some(prev_idx);
-        self.reset_popup();
-    }
-
-    pub fn clear_header_selection(&mut self) {
-        self.disarm_quit();
-        self.header_selected = None;
-    }
-
     pub fn scroll_up(&mut self) {
         self.scroll_by(self.chat_page_rows as i32);
     }
@@ -4638,6 +4720,15 @@ fn chat_item_search_text(item: &ChatItem) -> String {
             child,
             summary,
         } => format!("spawn {parent} {child} {summary}"),
+        ChatItem::Close {
+            parent,
+            child,
+            name,
+            by_user,
+        } => format!(
+            "{} {parent} {child} {name}",
+            if *by_user { "remove" } else { "close" }
+        ),
         ChatItem::Notice { text, .. } => text.clone(),
         ChatItem::Error { message, .. } => message.clone(),
         ChatItem::Verdict { summary, .. } => summary.clone(),
@@ -4664,7 +4755,7 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
         ChatItem::Tool { detail, .. } => 2 + usize::from(!detail.is_empty()),
         ChatItem::Diff { files, .. } => 1 + files.len(),
         ChatItem::Route { body, .. } => 1 + body.lines().count().max(1),
-        ChatItem::Spawn { .. } => 2,
+        ChatItem::Spawn { .. } | ChatItem::Close { .. } => 2,
         ChatItem::Notice { text, .. } => text.lines().count().max(1),
         ChatItem::Error { message, .. } => message.lines().count().max(1),
         ChatItem::Verdict { summary, .. } => 1 + summary.lines().count(),
@@ -4796,6 +4887,20 @@ fn bound_chat_item(item: ChatItem) -> ChatItem {
                 summary,
             })
         }
+        ChatItem::Close {
+            parent,
+            child,
+            name,
+            by_user,
+        } => {
+            let fixed = parent.as_str().len().saturating_add(child.as_str().len());
+            bounded_chat_field(name, fixed).map(|name| ChatItem::Close {
+                parent,
+                child,
+                name,
+                by_user,
+            })
+        }
         ChatItem::Notice { text, member } => {
             let fixed = member.as_ref().map_or(0, |member| member.as_str().len());
             bounded_chat_field(text, fixed).map(|text| ChatItem::Notice { text, member })
@@ -4866,6 +4971,12 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
             child,
             summary,
         } => parent.as_str().len() + child.as_str().len() + summary.len(),
+        ChatItem::Close {
+            parent,
+            child,
+            name,
+            ..
+        } => parent.as_str().len() + child.as_str().len() + name.len(),
         ChatItem::Notice { text, member } => {
             text.len() + member.as_ref().map_or(0, |member| member.as_str().len())
         }

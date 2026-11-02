@@ -95,7 +95,11 @@ fn runtime_unavailable_disables_stale_controls_and_attach() {
     state.mark_runtime_unavailable();
 
     assert!(!state.has_cancelable_work());
-    assert!(state.request_attach(0).is_none());
+    assert!(
+        state
+            .request_attach_member_by_name(&MemberId::new("builder"))
+            .is_none()
+    );
     assert!(state.take_attach_request().is_none());
     assert!(state.chat().iter().any(|item| matches!(
         item,

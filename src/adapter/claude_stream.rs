@@ -22,6 +22,8 @@ const TOOL_OUTPUT_MAX: usize = 32_000;
 pub struct ClaudeStreamAdapter {
     binary: String,
     cwd: std::path::PathBuf,
+    /// Asterline's shared skills and this project's state, outside `cwd`.
+    extra_dirs: Vec<std::path::PathBuf>,
     session_name: String,
     model: Option<String>,
     permission_mode: Option<PermissionMode>,
@@ -34,6 +36,7 @@ impl ClaudeStreamAdapter {
         Self {
             binary: "claude".to_string(),
             cwd: member.resolved_cwd(workspace),
+            extra_dirs: crate::state_paths::agent_access_dirs(workspace),
             session_name: native_session_name(&member.display_name),
             model: member.model.clone(),
             permission_mode: member.permission_mode,
@@ -94,6 +97,11 @@ impl StreamAdapter for ClaudeStreamAdapter {
             // actually removes every unlisted built-in tool from the session.
             args.push("--tools".to_string());
             args.push(self.allowed_tools.join(","));
+        }
+        // The skill and roster live under the Asterline home, not the project.
+        for dir in &self.extra_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.display().to_string());
         }
         if let Some(system_prompt) = &self.system_prompt {
             args.push("--append-system-prompt".to_string());
@@ -304,15 +312,22 @@ impl LineParser for ClaudeLineParser {
                 // Main-agent content is already represented by `stream_event`
                 // partials. `--forward-subagent-text` marks forwarded child
                 // blocks so their text/thinking can be surfaced without
-                // duplicating the main answer.
-                if value.get("parent_tool_use_id").is_some()
-                    || value["message"].get("parent_tool_use_id").is_some()
+                // duplicating the main answer. The main agent's own messages
+                // carry `"parent_tool_use_id": null`; only a non-empty string
+                // marks a child.
+                let is_child = |parent: &Value| parent.as_str().is_some_and(|id| !id.is_empty());
+                if is_child(&value["parent_tool_use_id"])
+                    || is_child(&value["message"]["parent_tool_use_id"])
                 {
                     let content = value["message"]["content"].as_array();
                     for block in content.into_iter().flatten() {
                         match str_field(block, "type") {
                             Some("thinking") => {
-                                if let Some(thinking) = str_field(block, "thinking") {
+                                // Current Claude builds send only a signature, so
+                                // the text is often empty: show nothing then.
+                                if let Some(thinking) = str_field(block, "thinking")
+                                    .filter(|thinking| !thinking.trim().is_empty())
+                                {
                                     out.push(AgentEvent::Reasoning(format!(
                                         "[subagent] {thinking}"
                                     )));
@@ -350,8 +365,7 @@ impl LineParser for ClaudeLineParser {
                     self.message_emitted = true;
                 }
                 if value.get("is_error").and_then(Value::as_bool) == Some(true) {
-                    let message = str_field(&value, "result").unwrap_or("claude reported an error");
-                    out.push(AgentEvent::Fatal(message.to_string()));
+                    out.push(AgentEvent::Fatal(result_error_message(&value)));
                 }
             }
             Some(other) => out.push(AgentEvent::Log(format!("claude event: {other}"))),
@@ -377,6 +391,29 @@ impl LineParser for ClaudeLineParser {
         } else {
             Vec::new()
         }
+    }
+}
+
+/// The message of an `is_error` result: its text, else the `errors` list some
+/// CLI builds send with an empty result, else the result's subtype.
+fn result_error_message(value: &Value) -> String {
+    if let Some(text) = str_field(value, "result").filter(|text| !text.trim().is_empty()) {
+        return text.to_string();
+    }
+    let errors: Vec<&str> = value
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if !errors.is_empty() {
+        return errors.join("; ");
+    }
+    match str_field(value, "subtype").filter(|text| !text.is_empty()) {
+        Some(subtype) => format!("claude reported an error ({subtype})"),
+        None => "claude reported an error".to_string(),
     }
 }
 
@@ -441,6 +478,18 @@ mod tests {
                 .any(|w| w == ["--name", "Asterline · Reviewer"])
         );
         assert!(command.args.windows(2).any(|w| w == ["--effort", "high"]));
+        // The shared skills and this project's state sit outside the workspace.
+        for dir in crate::state_paths::agent_access_dirs(Path::new("/tmp/ws")) {
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|w| w[0] == "--add-dir" && w[1] == dir.display().to_string()),
+                "missing --add-dir {}: {:?}",
+                dir.display(),
+                command.args
+            );
+        }
         assert!(
             command
                 .args
@@ -650,6 +699,46 @@ mod tests {
     }
 
     #[test]
+    fn main_agent_assistant_messages_with_a_null_parent_are_not_subagent_output() {
+        let events = parse_all(&[
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"text","text":"main answer"}]}}"#,
+            r#"{"type":"assistant","message":{"parent_tool_use_id":null,"content":[{"type":"thinking","thinking":"main thoughts"}]}}"#,
+        ]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Reasoning(_))),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, AgentEvent::Log(message) if message.contains("subagent"))
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn child_messages_need_a_real_parent_and_non_empty_thinking() {
+        let events = parse_all(&[
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_x","message":{"content":[{"type":"thinking","thinking":"child thoughts"}]}}"#,
+            r#"{"type":"assistant","message":{"parent_tool_use_id":"toolu_y","content":[{"type":"thinking","thinking":"nested parent"}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_z","message":{"content":[{"type":"thinking","thinking":"  \n","signature":"sig"}]}}"#,
+        ]);
+        let reasoning: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning,
+            ["[subagent] child thoughts", "[subagent] nested parent"]
+        );
+    }
+
+    #[test]
     fn tool_input_and_multiline_result_are_preserved() {
         let events = parse_all(&[
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}}"#,
@@ -696,6 +785,19 @@ mod tests {
             r#"{"type":"result","is_error":true,"result":"rate limited","session_id":"s"}"#,
         ]);
         assert!(events.contains(&AgentEvent::Fatal("rate limited".to_string())));
+    }
+
+    #[test]
+    fn error_result_without_text_still_names_the_cause() {
+        let events = parse_all(&[
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","errors":["model 'x' not found"]}"#,
+        ]);
+        assert!(events.contains(&AgentEvent::Fatal("model 'x' not found".to_string())));
+        let events =
+            parse_all(&[r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#]);
+        assert!(events.contains(&AgentEvent::Fatal(
+            "claude reported an error (error_max_turns)".to_string()
+        )));
     }
 
     #[test]

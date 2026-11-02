@@ -258,5 +258,5 @@ fails, then restart Asterline.
 
 ### Asterline cannot write project state
 
-Asterline creates `.asterline/` in the selected workspace. Confirm that the
-workspace is writable, or pass a different workspace with `--workspace`.
+Asterline keeps its state under `~/.asterline` (or `$ASTERLINE_HOME`). Confirm
+that this directory is writable; the workspace itself is not written to.

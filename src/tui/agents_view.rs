@@ -41,7 +41,10 @@ const HINTS_HEAD: &str = "↑/↓ navigate   Home/End first/last   Enter/→ ope
 const HINTS_TAIL: &str = "Ctrl+N new   Esc close";
 const HINT_RENAME: &str = "Ctrl+R rename";
 const HINT_DELETE: &str = "Ctrl+X delete";
+const HINT_REMOVE: &str = "Ctrl+X remove";
 const HINT_ARMED: &str = "Press Ctrl+X again to delete";
+const HINT_ARMED_REMOVE: &str = "Press Ctrl+X again to remove";
+const HINT_ARMED_STOP_REMOVE: &str = "Press Ctrl+X again to stop and remove";
 const HINT_RENAMING: &str = "Enter save   Esc cancel";
 /// The rename editor's prompt, in place of the search prompt's `> `.
 const RENAME_PROMPT: &str = "> Rename: ";
@@ -50,14 +53,20 @@ pub(crate) const HINTS: &str =
     "↑/↓ navigate   Home/End first/last   Enter/→ open   Ctrl+N new   Esc close";
 
 /// The hint line for the current state: the rename editor's, the armed
-/// deletion's, or the navigation keys plus the rename and delete keys the
-/// selected row allows.
+/// deletion's (saying "stop and remove" for a busy sub-agent), or the
+/// navigation keys plus the rename, delete, and remove keys the selected row
+/// allows.
 fn hint_line(state: &AppState) -> String {
     if state.agents_rename().is_some() {
         return HINT_RENAMING.to_string();
     }
     if state.agents_delete_armed() {
-        return HINT_ARMED.to_string();
+        return match (state.agents_can_remove(), state.agents_remove_busy()) {
+            (true, true) => HINT_ARMED_STOP_REMOVE,
+            (true, false) => HINT_ARMED_REMOVE,
+            (false, _) => HINT_ARMED,
+        }
+        .to_string();
     }
     let mut parts = vec![HINTS_HEAD];
     if state.agents_can_rename() {
@@ -65,6 +74,9 @@ fn hint_line(state: &AppState) -> String {
     }
     if state.agents_can_delete() {
         parts.push(HINT_DELETE);
+    }
+    if state.agents_can_remove() {
+        parts.push(HINT_REMOVE);
     }
     parts.push(HINTS_TAIL);
     parts.join("   ")

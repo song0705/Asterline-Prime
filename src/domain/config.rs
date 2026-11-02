@@ -8,23 +8,21 @@ use std::{env, fs, io};
 
 use crate::adapter::models::{model_family_words, run_with_timeout};
 use crate::domain::event::SpawnRequest;
+use crate::domain::model_directory::ModelDirectory;
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MAX_SUB_AGENTS, MemberId, PermissionMode, SandboxPolicy,
     TeamConfig, TeamMember, normalize_member_id,
 };
 use crate::fs_safety;
+use crate::state_paths;
 
 const TEAM_PROTOCOL_BEGIN: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_BEGIN -->";
 const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
-pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL.md";
-/// Live roster and member status. Rewritten whenever the team or a status changes.
-pub const ASTERLINE_ROSTER_PATH: &str = ".asterline/roster.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 24;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 27;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
-pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
 const ASTERLINE_BRAINSTORM_SKILL: &str =
     include_str!("../../.agents/skills/asterline-brainstorm/SKILL.md");
 const MANAGED_SKILL_MARKER: &str =
@@ -35,22 +33,47 @@ const MIN_AGY_VERSION: (u64, u64, u64) = (1, 1, 12);
 // incorrectly hide an installed Agy binary.
 const BACKEND_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Ensure the workspace skill file is present and, when Asterline manages it,
+/// The shared team skill: `<asterline home>/skills/asterline-team/SKILL.md`.
+pub fn team_skill_path() -> PathBuf {
+    skill_file(&state_paths::skills_dir(), ASTERLINE_TEAM_SKILL_NAME)
+}
+
+/// The shared brainstorm skill:
+/// `<asterline home>/skills/asterline-brainstorm/SKILL.md`.
+pub fn brainstorm_skill_path() -> PathBuf {
+    skill_file(&state_paths::skills_dir(), ASTERLINE_BRAINSTORM_SKILL_NAME)
+}
+
+/// Live roster and member status for `workspace`, rewritten whenever the team
+/// or a status changes.
+pub fn roster_path(workspace: &Path) -> PathBuf {
+    state_paths::roster_path(workspace)
+}
+
+fn skill_file(skills_dir: &Path, name: &str) -> PathBuf {
+    skills_dir.join(name).join("SKILL.md")
+}
+
+/// Ensure the shared team skill is present and, when Asterline manages it,
 /// upgraded to the embedded protocol version. User-rewritten copies are left alone.
-pub fn ensure_team_skill(workspace: &Path) -> io::Result<()> {
-    let path = managed_skill_path(workspace, ASTERLINE_TEAM_SKILL_NAME)?;
+pub fn ensure_team_skill() -> io::Result<()> {
+    ensure_team_skill_in(&state_paths::ensure_skills_root()?)
+}
+
+fn ensure_team_skill_in(skills_dir: &Path) -> io::Result<()> {
+    let path = managed_skill_path(skills_dir, ASTERLINE_TEAM_SKILL_NAME)?;
     match fs::symlink_metadata(&path) {
         Ok(_) => {
             let existing = fs_safety::read_regular_to_string(&path, "team skill")?;
             if is_managed_skill(&existing)
                 && skill_version(&existing) < ASTERLINE_TEAM_SKILL_VERSION
             {
-                fs_safety::write_regular_file(&path, "team skill", ASTERLINE_TEAM_SKILL)?;
+                fs_safety::write_regular_file_atomic(&path, "team skill", ASTERLINE_TEAM_SKILL)?;
             }
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs_safety::write_regular_file(&path, "team skill", ASTERLINE_TEAM_SKILL)
+            fs_safety::write_regular_file_atomic(&path, "team skill", ASTERLINE_TEAM_SKILL)
         }
         Err(error) => Err(error),
     }
@@ -58,31 +81,53 @@ pub fn ensure_team_skill(workspace: &Path) -> io::Result<()> {
 
 /// Install the default brainstorm protocol once. Existing deployment-local
 /// copies are always preserved so teams can customize the method and card text.
-pub fn ensure_brainstorm_skill(workspace: &Path) -> io::Result<()> {
-    let path = managed_skill_path(workspace, ASTERLINE_BRAINSTORM_SKILL_NAME)?;
+pub fn ensure_brainstorm_skill() -> io::Result<()> {
+    ensure_brainstorm_skill_in(&state_paths::ensure_skills_root()?)
+}
+
+fn ensure_brainstorm_skill_in(skills_dir: &Path) -> io::Result<()> {
+    let path = managed_skill_path(skills_dir, ASTERLINE_BRAINSTORM_SKILL_NAME)?;
     match fs::symlink_metadata(&path) {
         Ok(_) => fs_safety::read_regular_to_string(&path, "brainstorm skill").map(|_| ()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs_safety::write_regular_file(&path, "brainstorm skill", ASTERLINE_BRAINSTORM_SKILL)
+            fs_safety::write_regular_file_atomic(
+                &path,
+                "brainstorm skill",
+                ASTERLINE_BRAINSTORM_SKILL,
+            )
         }
         Err(error) => Err(error),
     }
 }
 
-/// Load the deployment-local brainstorm protocol, falling back to the embedded
-/// default for tests and workspaces that have not been initialized yet.
-pub fn brainstorm_skill_text(workspace: &Path) -> String {
-    managed_skill_path(workspace, ASTERLINE_BRAINSTORM_SKILL_NAME)
-        .and_then(|path| fs_safety::read_regular_to_string(&path, "brainstorm skill"))
-        .unwrap_or_else(|_| ASTERLINE_BRAINSTORM_SKILL.to_string())
+/// Load the brainstorm protocol, falling back to the embedded default for
+/// tests and installs that have not been initialized yet.
+pub fn brainstorm_skill_text() -> String {
+    brainstorm_skill_text_in(&state_paths::skills_dir())
 }
 
-fn managed_skill_path(workspace: &Path, skill_name: &str) -> io::Result<PathBuf> {
-    let directory = fs_safety::ensure_workspace_directory(
-        workspace,
-        &[".agents", "skills", skill_name],
-        false,
-    )?;
+fn brainstorm_skill_text_in(skills_dir: &Path) -> String {
+    fs_safety::read_regular_to_string(
+        &skill_file(skills_dir, ASTERLINE_BRAINSTORM_SKILL_NAME),
+        "brainstorm skill",
+    )
+    .unwrap_or_else(|_| ASTERLINE_BRAINSTORM_SKILL.to_string())
+}
+
+/// The embedded team skill, for migration tests.
+#[cfg(test)]
+pub(crate) fn embedded_team_skill() -> &'static str {
+    ASTERLINE_TEAM_SKILL
+}
+
+/// The embedded brainstorm skill, for migration to tell a customized copy from
+/// the stock one.
+pub(crate) fn embedded_brainstorm_skill() -> &'static str {
+    ASTERLINE_BRAINSTORM_SKILL
+}
+
+fn managed_skill_path(skills_dir: &Path, skill_name: &str) -> io::Result<PathBuf> {
+    let directory = fs_safety::ensure_workspace_directory(skills_dir, &[skill_name], true)?;
     Ok(directory.join("SKILL.md"))
 }
 
@@ -106,14 +151,15 @@ fn skill_version(text: &str) -> u32 {
 }
 
 /// True only for files that explicitly opt into Asterline-managed upgrades.
-fn is_managed_skill(text: &str) -> bool {
+pub(crate) fn is_managed_skill(text: &str) -> bool {
     text.contains(MANAGED_SKILL_MARKER)
 }
 
 pub fn team_skill_hint() -> String {
     format!(
-        "The Asterline team skill is available at {ASTERLINE_TEAM_SKILL_PATH}. Read this skill when you need its team controls. \
-         If a tool or plan is waiting for the user to approve in Asterline, wait — do not retry or assume it ran."
+        "The Asterline team skill is available at {}. Read this skill when you need its team controls. \
+         If a tool or plan is waiting for the user to approve in Asterline, wait — do not retry or assume it ran.",
+        team_skill_path().display()
     )
 }
 
@@ -641,13 +687,21 @@ pub fn default_member(backend: BackendKind) -> TeamMember {
 }
 
 /// Prepend a compact Asterline team hint to each member's system prompt.
-/// Detailed protocol lives in the repo skill at `.agents/skills`.
+/// Detailed protocol lives in the shared skill under `<asterline home>/skills`.
 pub fn inject_team_protocol(team: &mut TeamConfig) {
+    inject_team_protocol_with(team, &ModelDirectory::default());
+}
+
+/// [`inject_team_protocol`], with the models the installed backends offer
+/// listed for the members that may open sub-agents.
+pub fn inject_team_protocol_with(team: &mut TeamConfig, models: &ModelDirectory) {
+    let model_block = models.protocol_block();
+    let roster = roster_path(&team.workspace);
     let protocols: Vec<String> = team
         .members
         .iter()
         .map(|me| match &me.parent {
-            Some(parent) => build_sub_agent_protocol(me.id.as_str(), parent.as_str()),
+            Some(parent) => build_sub_agent_protocol(me.id.as_str(), parent.as_str(), &roster),
             None => {
                 let teammates: Vec<String> = team
                     .members
@@ -659,7 +713,13 @@ pub fn inject_team_protocol(team: &mut TeamConfig) {
                     .sub_agents_of(&me.id)
                     .map(|child| child.listing_label())
                     .collect();
-                build_protocol(me.id.as_str(), &teammates, &sub_agents)
+                build_protocol(
+                    me.id.as_str(),
+                    &teammates,
+                    &sub_agents,
+                    model_block.as_deref(),
+                    &roster,
+                )
             }
         })
         .collect();
@@ -711,11 +771,18 @@ pub fn strip_team_protocol(prompt: &str) -> String {
     out
 }
 
-fn build_protocol(me: &str, teammates: &[String], sub_agents: &[String]) -> String {
+fn build_protocol(
+    me: &str,
+    teammates: &[String],
+    sub_agents: &[String],
+    model_block: Option<&str>,
+    roster: &Path,
+) -> String {
     let mut protocol = format!(
         "You are \"{me}\", a member of an Asterline multi-agent team.\n\
-         {}\n",
-        team_skill_hint()
+         {}\n{}\n",
+        team_skill_hint(),
+        roster_hint(roster)
     );
     if teammates.is_empty() {
         protocol.push_str("You are the only member.\n");
@@ -732,20 +799,33 @@ fn build_protocol(me: &str, teammates: &[String], sub_agents: &[String]) -> Stri
          backend, model, and effort are optional and default to yours. Name it after its job (reviewer, \
          test-writer, researcher; helper if none), never a model or CLI, since the list shows the model. \
          Its final reply comes back to you automatically as a message from it. To give a sub-agent more \
-         work, send @@spawn again with the same name.\n"
+         work, send @@spawn again with the same name. To close a sub-agent you no longer need, send \
+         @@close {{\"name\":\"reviewer\"}}.\n"
     ));
+    if let Some(block) = model_block {
+        protocol.push_str(block);
+    }
     protocol.push_str("All other text you write is shown to the user.");
     protocol
 }
 
-fn build_sub_agent_protocol(me: &str, parent: &str) -> String {
+/// Where an agent finds the live roster; the shared skill points here.
+fn roster_hint(roster: &Path) -> String {
+    format!(
+        "The live team roster (default target, and every member's id, name, backend, and status) is at {}.",
+        roster.display()
+    )
+}
+
+fn build_sub_agent_protocol(me: &str, parent: &str, roster: &Path) -> String {
     format!(
         "You are \"{me}\", a sub-agent opened by \"{parent}\" in an Asterline multi-agent team.\n\
-         {}\n\
+         {}\n{}\n\
          When {parent} gives you a task, your final reply is handed back to {parent} automatically; \
          you do not need to send it yourself. You cannot open sub-agents of your own.\n\
          All other text you write is shown to the user.",
-        team_skill_hint()
+        team_skill_hint(),
+        roster_hint(roster)
     )
 }
 
@@ -1044,9 +1124,14 @@ mod tests {
         inject_team_protocol(&mut config);
         let prompt = config.members[0].system_prompt.as_ref().unwrap();
         assert!(prompt.contains("Asterline team skill"));
-        assert!(prompt.contains(ASTERLINE_TEAM_SKILL_PATH));
+        assert!(prompt.contains(&team_skill_path().display().to_string()));
+        assert!(team_skill_path().is_absolute());
+        assert!(
+            prompt.contains(&roster_path(Path::new("/tmp/ws")).display().to_string()),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(".agents/skills"));
         assert!(!prompt.contains("$asterline-team"));
-        assert!(!prompt.contains(ASTERLINE_ROSTER_PATH));
         assert!(!prompt.contains("@@team_message"));
         assert!(!prompt.contains("@@team_member"));
         assert!(prompt.contains("reviewer"));
@@ -1078,9 +1163,9 @@ mod tests {
     fn ensure_team_skill_writes_repo_skill_when_missing() {
         let dir = std::env::temp_dir().join(format!("asterline-skill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        ensure_team_skill(&dir).unwrap();
+        ensure_team_skill_in(&dir).unwrap();
 
-        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        let path = skill_file(&dir, ASTERLINE_TEAM_SKILL_NAME);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("name: asterline-team"));
         assert!(text.contains("@@team_message"));
@@ -1093,9 +1178,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("asterline-brainstorm-skill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        ensure_brainstorm_skill(&dir).unwrap();
+        ensure_brainstorm_skill_in(&dir).unwrap();
 
-        let path = dir.join(ASTERLINE_BRAINSTORM_SKILL_PATH);
+        let path = skill_file(&dir, ASTERLINE_BRAINSTORM_SKILL_NAME);
         let installed = std::fs::read_to_string(&path).unwrap();
         assert!(installed.contains("name: asterline-brainstorm"));
         assert!(installed.contains("@@brainstorm_card"));
@@ -1106,9 +1191,9 @@ mod tests {
             "Use deployment-specific value, novelty,",
         );
         std::fs::write(&path, &custom).unwrap();
-        ensure_brainstorm_skill(&dir).unwrap();
+        ensure_brainstorm_skill_in(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
-        assert_eq!(brainstorm_skill_text(&dir), custom);
+        assert_eq!(brainstorm_skill_text_in(&dir), custom);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1118,7 +1203,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("asterline-skill-upgrade-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        let path = skill_file(&dir, ASTERLINE_TEAM_SKILL_NAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
@@ -1128,9 +1213,9 @@ mod tests {
         )
         .unwrap();
 
-        ensure_team_skill(&dir).unwrap();
+        ensure_team_skill_in(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 24"));
+        assert!(text.contains("version: 27"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -1143,12 +1228,12 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("asterline-skill-custom-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        let path = skill_file(&dir, ASTERLINE_TEAM_SKILL_NAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let custom = "# My custom team notes\nDo not overwrite me.\n";
         std::fs::write(&path, custom).unwrap();
 
-        ensure_team_skill(&dir).unwrap();
+        ensure_team_skill_in(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, custom);
 
@@ -1162,12 +1247,12 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        let path = skill_file(&dir, ASTERLINE_TEAM_SKILL_NAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let custom = "---\nname: asterline-team\nmetadata:\n  version: 1\n---\n# Custom protocol\n";
         std::fs::write(&path, custom).unwrap();
 
-        ensure_team_skill(&dir).unwrap();
+        ensure_team_skill_in(&dir).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
         std::fs::remove_dir_all(&dir).ok();
@@ -1186,29 +1271,29 @@ mod tests {
         let managed_old = format!("---\nversion: 1\n---\n{MANAGED_SKILL_MARKER}\n");
         std::fs::write(&victim, &managed_old).unwrap();
 
-        let team_path = dir.join(ASTERLINE_TEAM_SKILL_PATH);
+        let team_path = skill_file(&dir, ASTERLINE_TEAM_SKILL_NAME);
         std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
         symlink(&victim, &team_path).unwrap();
-        assert!(ensure_team_skill(&dir).is_err());
+        assert!(ensure_team_skill_in(&dir).is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), managed_old);
 
-        let brainstorm_path = dir.join(ASTERLINE_BRAINSTORM_SKILL_PATH);
+        let brainstorm_path = skill_file(&dir, ASTERLINE_BRAINSTORM_SKILL_NAME);
         std::fs::create_dir_all(brainstorm_path.parent().unwrap()).unwrap();
         std::fs::write(&victim, "PRIVATE_LOCAL_CONTENT").unwrap();
         symlink(&victim, &brainstorm_path).unwrap();
-        assert!(ensure_brainstorm_skill(&dir).is_err());
-        assert!(!brainstorm_skill_text(&dir).contains("PRIVATE_LOCAL_CONTENT"));
+        assert!(ensure_brainstorm_skill_in(&dir).is_err());
+        assert!(!brainstorm_skill_text_in(&dir).contains("PRIVATE_LOCAL_CONTENT"));
 
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v24() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 24);
+    fn embedded_team_skill_is_protocol_v26() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 27);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 24")
+                .any(|line| line.trim() == "version: 27")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1232,9 +1317,12 @@ mod tests {
             ASTERLINE_TEAM_SKILL
                 .contains("Writing the plan, review, or patch \"for the user\" is not delivery")
         );
-        assert!(ASTERLINE_TEAM_SKILL.contains(ASTERLINE_ROSTER_PATH));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 24);
+        assert!(ASTERLINE_TEAM_SKILL.contains("`roster.md`"));
+        assert!(!ASTERLINE_TEAM_SKILL.contains(".asterline/"));
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 27);
         assert!(ASTERLINE_TEAM_SKILL.contains("@@spawn"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("@@close"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("exact `model` ids"));
         assert!(ASTERLINE_TEAM_SKILL.contains("[hand-back from"));
         assert!(ASTERLINE_TEAM_SKILL.contains("at most 8 sub-agents"));
         assert!(ASTERLINE_TEAM_SKILL.contains("write defaults"));
@@ -1454,7 +1542,7 @@ mod tests {
 
     #[test]
     fn protocol_tells_agents_to_name_sub_agents_after_their_job() {
-        let protocol = build_protocol("main", &[], &[]);
+        let protocol = build_protocol("main", &[], &[], None, Path::new("/tmp/ws/roster.md"));
         assert!(protocol.contains("Name it after its job"));
         assert!(protocol.contains("never a model or CLI"));
         assert!(protocol.contains(r#"{"name":"reviewer""#));

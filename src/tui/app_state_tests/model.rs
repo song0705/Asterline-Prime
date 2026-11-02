@@ -1283,3 +1283,40 @@ fn team_editor_lists_top_level_members_only() {
     let ids: Vec<&str> = editor.members().iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["builder", "reviewer"]);
 }
+
+#[test]
+fn the_runtime_is_given_the_discovered_models_once_and_again_when_they_change() {
+    let mut state = model_state();
+
+    let first = state.pending_model_directory().expect("catalogs are ready");
+    assert_eq!(first.installed, Some(all_detected()));
+    let codex: Vec<&str> = first
+        .models(BackendKind::Codex)
+        .expect("codex catalog")
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(codex, ["gpt-5.6", "gpt-mini"]);
+    assert!(first.models(BackendKind::Grok).is_none());
+
+    state.mark_model_directory_sent(first);
+    assert!(state.pending_model_directory().is_none(), "nothing changed");
+
+    // A catalog that is being reloaded keeps what the runtime already has.
+    let cwd = PathBuf::from("/tmp/ws");
+    state.model_catalog.seed_loading(BackendKind::Codex, &cwd);
+    assert!(state.pending_model_directory().is_none());
+
+    // A newly landed catalog is sent.
+    state.model_catalog.seed_catalog(
+        BackendKind::Grok,
+        &cwd,
+        DiscoveredCatalog {
+            models: vec![model("grok-4.5", &[], true)],
+            ..Default::default()
+        },
+    );
+    let next = state.pending_model_directory().expect("grok landed");
+    assert!(next.models(BackendKind::Grok).is_some());
+    assert!(next.models(BackendKind::Codex).is_some());
+}

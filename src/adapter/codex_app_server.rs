@@ -1028,16 +1028,17 @@ impl AppServerEventMapper {
                 self.terminal = Some(ok);
             }
             "error" => {
-                let message = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex App Server error");
-                if is_recoverable_stream_error(message) {
+                let message = error_notification_message(params);
+                let will_retry = params
+                    .get("willRetry")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if will_retry || is_recoverable_stream_error(&message) {
                     let _ = events.send(AgentEvent::ParseWarning(format!(
                         "codex transient stream error: {message}"
                     )));
                 } else {
-                    let _ = events.send(AgentEvent::Fatal(message.to_string()));
+                    let _ = events.send(AgentEvent::Fatal(message));
                     self.terminal = Some(false);
                 }
             }
@@ -1478,6 +1479,19 @@ fn resume_target_is_missing(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// The text of an `error` notification. App Server nests it as
+/// `params.error.message` (beside `codexErrorInfo` and `willRetry`); older
+/// builds put `params.message` at the top.
+fn error_notification_message(params: &Value) -> String {
+    ["/error/message", "/message", "/error"]
+        .iter()
+        .filter_map(|pointer| params.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .unwrap_or("Codex App Server error")
+        .to_string()
+}
+
 fn is_recoverable_stream_error(message: &str) -> bool {
     message
         .trim_start()
@@ -1501,6 +1515,45 @@ mod tests {
         mapper.handle_notification(method, &params, &tx);
         drop(tx);
         rx.try_iter().collect()
+    }
+
+    #[test]
+    fn error_notification_shows_the_real_message() {
+        let params: Value = serde_json::from_str(
+            r#"{"error":{"message":"The 'gpt-astra' model is not supported when using Codex with a ChatGPT account.","codexErrorInfo":"modelNotFound","additionalDetails":null},"willRetry":false,"threadId":"t","turnId":"u"}"#,
+        )
+        .unwrap();
+        let events = mapper_events("error", params);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Fatal(
+                "The 'gpt-astra' model is not supported when using Codex with a ChatGPT account."
+                    .to_string()
+            )]
+        );
+        // The older flat shape and a retried error keep working.
+        assert_eq!(
+            mapper_events("error", json!({ "message": "boom" })),
+            vec![AgentEvent::Fatal("boom".to_string())]
+        );
+        let retried = mapper_events(
+            "error",
+            json!({ "error": { "message": "stream dropped" }, "willRetry": true }),
+        );
+        assert!(
+            matches!(retried.as_slice(), [AgentEvent::ParseWarning(text)] if text.contains("stream dropped"))
+        );
+    }
+
+    #[test]
+    fn model_metadata_warning_is_a_warning_not_a_failure() {
+        let events = mapper_events(
+            "warning",
+            json!({ "message": "Model metadata for `gpt-astra` not found. Defaulting to fallback metadata" }),
+        );
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::ParseWarning(text)] if text.contains("gpt-astra"))
+        );
     }
 
     #[test]

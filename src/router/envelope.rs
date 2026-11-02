@@ -10,6 +10,7 @@
 //! @@team_message {"to":"all","body":"let's agree on the data model first"}
 //! @@team_member {"display_name":"QA","backend":"codex","role":"tests"}
 //! @@spawn {"name":"reviewer","task":"review the diff","backend":"claude","model":"opus","effort":"high"}
+//! @@close {"name":"reviewer"}
 //! @@run_step {"action":"add","owner":"builder","title":"Write parser tests"}
 //! @@run_step {"action":"done","step":1,"note":"Covered lexer edge cases"}
 //! @@run_step {"action":"assign","step":2,"owner":"reviewer"}
@@ -24,7 +25,7 @@ use serde::Deserialize;
 
 use crate::domain::config::default_member;
 pub use crate::domain::event::SpawnRequest;
-use crate::domain::event::{RouteTo, RunStepRequest, RunStepStatus, TeamMessage};
+use crate::domain::event::{CloseRequest, RouteTo, RunStepRequest, RunStepStatus, TeamMessage};
 use crate::domain::mode::{BrainstormCard, BrainstormVote, ReviewVerdict, ReviewVerdictKind};
 use crate::domain::team::{
     BackendKind, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy, TeamMember,
@@ -34,6 +35,7 @@ use crate::domain::team::{
 const TEAM_MESSAGE_PREFIX: &str = "@@team_message";
 const TEAM_MEMBER_PREFIX: &str = "@@team_member";
 const SPAWN_PREFIX: &str = "@@spawn";
+const CLOSE_PREFIX: &str = "@@close";
 const RUN_STEP_PREFIX: &str = "@@run_step";
 const REVIEW_PREFIX: &str = "@@review";
 const BRAINSTORM_CARD_PREFIX: &str = "@@brainstorm_card";
@@ -54,6 +56,8 @@ pub struct ParsedAgentOutput {
     pub members: Vec<TeamMember>,
     /// Sub-agent requests parsed from the output, in order.
     pub spawns: Vec<SpawnRequest>,
+    /// Requests to close one of the sender's sub-agents, in order.
+    pub closes: Vec<CloseRequest>,
     /// Run checklist mutations parsed from the output, in order.
     pub run_steps: Vec<RunStepRequest>,
     /// Review verdicts parsed from the output, in order.
@@ -121,6 +125,14 @@ struct TeamMemberRaw {
     session_id: Option<String>,
     #[serde(default)]
     effort: Option<Effort>,
+}
+
+#[derive(Deserialize)]
+struct CloseRaw {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +217,7 @@ enum EnvelopeValue {
     Message(TeamMessage),
     Member(TeamMember),
     Spawn(SpawnRequest),
+    Close(CloseRequest),
     Run(RunStepRequest),
     Review(ReviewVerdict),
     BrainstormCard(BrainstormCard),
@@ -224,6 +237,10 @@ fn parse_member_envelope(payload: &str) -> Result<EnvelopeValue, String> {
 
 fn parse_spawn_envelope(payload: &str) -> Result<EnvelopeValue, String> {
     parse_spawn(payload).map(EnvelopeValue::Spawn)
+}
+
+fn parse_close_envelope(payload: &str) -> Result<EnvelopeValue, String> {
+    parse_close(payload).map(EnvelopeValue::Close)
 }
 
 fn parse_run_envelope(payload: &str) -> Result<EnvelopeValue, String> {
@@ -252,6 +269,7 @@ const ENVELOPE_PARSERS: &[(&str, EnvelopeParser)] = &[
     (TEAM_MESSAGE_PREFIX, parse_message_envelope),
     (TEAM_MEMBER_PREFIX, parse_member_envelope),
     (SPAWN_PREFIX, parse_spawn_envelope),
+    (CLOSE_PREFIX, parse_close_envelope),
     (RUN_STEP_PREFIX, parse_run_envelope),
     (REVIEW_PREFIX, parse_review_envelope),
     (BRAINSTORM_CARD_PREFIX, parse_brainstorm_card_envelope),
@@ -265,6 +283,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
     let mut messages = Vec::new();
     let mut members = Vec::new();
     let mut spawns = Vec::new();
+    let mut closes = Vec::new();
     let mut run_steps = Vec::new();
     let mut reviews = Vec::new();
     let mut brainstorm_cards = Vec::new();
@@ -315,6 +334,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
                     Ok(EnvelopeValue::Message(message)) => messages.push(message),
                     Ok(EnvelopeValue::Member(member)) => members.push(member),
                     Ok(EnvelopeValue::Spawn(request)) => spawns.push(request),
+                    Ok(EnvelopeValue::Close(request)) => closes.push(request),
                     Ok(EnvelopeValue::Run(request)) => run_steps.push(request),
                     Ok(EnvelopeValue::Review(review)) => reviews.push(review),
                     Ok(EnvelopeValue::BrainstormCard(card)) => brainstorm_cards.push(card),
@@ -338,6 +358,7 @@ pub fn parse_agent_output(text: &str) -> ParsedAgentOutput {
         messages,
         members,
         spawns,
+        closes,
         run_steps,
         reviews,
         brainstorm_cards,
@@ -477,6 +498,19 @@ fn parse_spawn(payload: &str) -> Result<SpawnRequest, String> {
         effort: optional(raw.effort),
         role: optional(raw.role),
     })
+}
+
+/// `@@close` names the sub-agent by `name` (or `id`).
+fn parse_close(payload: &str) -> Result<CloseRequest, String> {
+    let raw: CloseRaw =
+        serde_json::from_str(payload).map_err(|err| format!("invalid @@close envelope: {err}"))?;
+    let name = [raw.name, raw.id]
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+        .ok_or_else(|| "@@close needs a non-empty name".to_string())?;
+    Ok(CloseRequest { name })
 }
 
 /// `@@goal_complete` takes an optional JSON object; a bare line completes the
@@ -1261,6 +1295,46 @@ mod tests {
             assert_eq!(parsed.warnings.len(), 1, "{line}");
             assert!(parsed.warnings[0].contains("@@spawn"), "{line}");
         }
+    }
+
+    #[test]
+    fn parses_close_by_name_or_id() {
+        let parsed = parse_agent_output(
+            "Done with it.\n@@close {\"name\":\" helper \"}\n@@close {\"id\":\"reviewer\"}",
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.visible_text, "Done with it.");
+        assert_eq!(
+            parsed.closes,
+            vec![
+                CloseRequest {
+                    name: "helper".to_string()
+                },
+                CloseRequest {
+                    name: "reviewer".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_close_warns_and_keeps_line() {
+        for line in [
+            r#"@@close {}"#,
+            r#"@@close {"name":"  "}"#,
+            "@@close not-json",
+        ] {
+            let parsed = parse_agent_output(line);
+            assert!(parsed.closes.is_empty(), "{line}");
+            assert_eq!(parsed.visible_text, line);
+            assert!(parsed.warnings[0].contains("@@close"), "{line}");
+        }
+    }
+
+    #[test]
+    fn ignores_close_examples_inside_markdown_code() {
+        let parsed = parse_agent_output("```\n@@close {\"name\":\"x\"}\n```");
+        assert!(parsed.closes.is_empty());
     }
 
     #[test]

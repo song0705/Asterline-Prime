@@ -496,6 +496,12 @@ fn paint_key(state: &AppState, width: usize) -> PaintKey {
             .members()
             .iter()
             .map(|member| state.member_model_label(member))
+            .chain(
+                state
+                    .departed_members()
+                    .iter()
+                    .filter_map(|gone| state.member_model_label_by_id(&gone.id)),
+            )
             .collect(),
     }
 }
@@ -747,6 +753,16 @@ fn item_rev(item: &ChatItem) -> u64 {
         } => (
             10,
             parent.as_str().len() + child.as_str().len() + summary.len(),
+            child.as_str().as_bytes(),
+        ),
+        ChatItem::Close {
+            parent,
+            child,
+            name,
+            by_user,
+        } => (
+            12,
+            parent.as_str().len() + child.as_str().len() + name.len() + usize::from(*by_user),
             child.as_str().as_bytes(),
         ),
         ChatItem::Error { message, .. } => (8, message.len(), message.as_bytes()),
@@ -1765,7 +1781,10 @@ fn render_tool_row(
 }
 
 fn is_agent_message(item: &ChatItem) -> bool {
-    matches!(item, ChatItem::Route { .. } | ChatItem::Spawn { .. })
+    matches!(
+        item,
+        ChatItem::Route { .. } | ChatItem::Spawn { .. } | ChatItem::Close { .. }
+    )
 }
 
 /// Agent-to-agent traffic, drawn like a tool group: a `⇄ agents` title and one
@@ -1806,7 +1825,19 @@ fn push_recipient_names(state: &AppState, names: &[String], spans: &mut Vec<Span
                 member.id.as_str().eq_ignore_ascii_case(name)
                     || member.display_name.eq_ignore_ascii_case(name)
             })
-            .map_or_else(|| name.clone(), |member| member.display_name.clone());
+            .map(|member| member.display_name.clone())
+            .or_else(|| {
+                // A removed sub-agent is still named by its display name.
+                state
+                    .departed_members()
+                    .iter()
+                    .find(|gone| {
+                        gone.id.as_str().eq_ignore_ascii_case(name)
+                            || gone.display_name.eq_ignore_ascii_case(name)
+                    })
+                    .map(|gone| gone.display_name.clone())
+            })
+            .unwrap_or_else(|| name.clone());
         spans.push(Span::styled(
             shown,
             theme::bold(named_member_color(state, name)),
@@ -1866,6 +1897,34 @@ fn render_agent_message_row(
                 .member_model_label_by_id(child)
                 .unwrap_or_else(|| summary.clone());
             (label, None)
+        }
+        ChatItem::Close {
+            parent,
+            child: _,
+            name,
+            by_user,
+        } => {
+            // The sub-agent is off the roster, so the row carries its name.
+            let removed = || Span::styled(name.clone(), theme::muted());
+            if *by_user {
+                // No `parent → child` arrow: it would read as the parent
+                // having closed it.
+                spans.push(kind("remove"));
+                spans.push(removed());
+                ("by you".to_string(), None)
+            } else {
+                spans.push(kind("close"));
+                match state.focus() {
+                    Some(focus) if focus == parent => spans.push(removed()),
+                    Some(_) => spans.push(agent_name_span(state, parent)),
+                    None => {
+                        spans.push(agent_name_span(state, parent));
+                        spans.push(Span::styled(" → ", theme::muted()));
+                        spans.push(removed());
+                    }
+                }
+                (String::new(), None)
+            }
         }
         _ => return,
     };
@@ -2042,7 +2101,7 @@ fn item_member(item: &ChatItem) -> Option<&MemberId> {
         | ChatItem::Tool { member, .. }
         | ChatItem::Diff { member, .. } => Some(member),
         ChatItem::Route { from, .. } => Some(from),
-        ChatItem::Spawn { parent, .. } => Some(parent),
+        ChatItem::Spawn { parent, .. } | ChatItem::Close { parent, .. } => Some(parent),
         ChatItem::Error { member, .. } => member.as_ref(),
         ChatItem::Verdict { member, .. } => Some(member),
         ChatItem::User { .. } | ChatItem::Notice { .. } | ChatItem::GoalMarker { .. } => None,
@@ -2400,7 +2459,7 @@ fn render_item_wide(
         ChatItem::Diff { files, ok, .. } => {
             render_file_changes(state, files, *ok, width, out);
         }
-        ChatItem::Route { .. } | ChatItem::Spawn { .. } => {
+        ChatItem::Route { .. } | ChatItem::Spawn { .. } | ChatItem::Close { .. } => {
             render_agent_messages(&[item], width, state, out);
         }
         ChatItem::Notice { text, .. } => {

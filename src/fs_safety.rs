@@ -60,6 +60,11 @@ pub fn ensure_workspace_directory(
     Ok(current)
 }
 
+/// Restrict a directory this process just created to its owner.
+pub fn restrict_new_directory(path: &Path) -> io::Result<()> {
+    restrict_directory(path)
+}
+
 pub fn reject_symlink(path: &Path, label: &str) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
@@ -128,6 +133,31 @@ pub fn write_regular_file(path: &Path, label: &str, contents: &str) -> io::Resul
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     restrict_file(file)
+}
+
+/// Replace a shared regular file by writing a sibling and renaming it over the
+/// target, so a concurrent reader sees either the old or the new contents and
+/// never a half-written file. A symlinked target is refused.
+pub fn write_regular_file_atomic(path: &Path, label: &str, contents: &str) -> io::Result<()> {
+    reject_symlink(path, label)?;
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let temp = PathBuf::from(name);
+    let _ = fs::remove_file(&temp);
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_no_follow(&mut options);
+        let mut file = options.open(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        restrict_file(file)?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn ensure_regular_file(path: &Path, label: &str) -> io::Result<()> {

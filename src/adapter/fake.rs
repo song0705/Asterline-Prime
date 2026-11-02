@@ -256,15 +256,19 @@ fn spawn_response(backend: BackendKind, prompt: &str) -> Option<String> {
         .map(|name| name.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_'))
         .filter(|name| !name.is_empty())
         .unwrap_or("reviewer");
-    let other = match backend {
-        BackendKind::Claude | BackendKind::Grok => BackendKind::Codex,
-        BackendKind::Codex | BackendKind::Agy => BackendKind::Claude,
-    };
     // `spawn:sol` mimics a model that names its sub-agent after the model it
     // asked for, so the name fallback can be exercised without a real backend.
-    let model = match name {
-        "sol" => ",\"model\":\"gpt-6.1-sol\"",
-        _ => "",
+    // That model belongs to Codex, so the request names the codex backend
+    // whichever backend the asking member runs on.
+    let (other, model) = match name {
+        "sol" => (BackendKind::Codex, ",\"model\":\"gpt-6.1-sol\""),
+        _ => (
+            match backend {
+                BackendKind::Claude | BackendKind::Grok => BackendKind::Codex,
+                BackendKind::Codex | BackendKind::Agy => BackendKind::Claude,
+            },
+            "",
+        ),
     };
     let task = prompt.replace(['"', '\\'], "'").replace('\n', " ");
     Some(format!(
@@ -493,6 +497,13 @@ mod tests {
         let events = run(&FakeRunner::team(BackendKind::Claude), "spawn:sol please");
         let parsed = crate::router::parse_agent_output(completed_text(&events));
         assert_eq!(parsed.spawns[0].name, "sol");
+        assert_eq!(parsed.spawns[0].model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(parsed.spawns[0].backend.as_deref(), Some("codex"));
+
+        // Whichever backend asks, `spawn:sol` opens a codex sub-agent.
+        let from_codex = run(&FakeRunner::team(BackendKind::Codex), "spawn:sol please");
+        let parsed = crate::router::parse_agent_output(completed_text(&from_codex));
+        assert_eq!(parsed.spawns[0].backend.as_deref(), Some("codex"));
         assert_eq!(parsed.spawns[0].model.as_deref(), Some("gpt-6.1-sol"));
     }
 

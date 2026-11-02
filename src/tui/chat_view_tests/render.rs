@@ -547,12 +547,12 @@ fn draw_view(state: &AppState, width: u16, height: u16) -> String {
 }
 
 #[test]
-fn the_mode_shows_as_a_chip_in_the_member_bar_not_as_a_composer_label() {
+fn the_mode_shows_in_the_footer_not_the_header_or_a_composer_label() {
     let mut state = ready_in("/tmp/ws");
     let view = draw_view(&state, 60, 10);
     assert!(
-        !title_row(&view).contains("mode"),
-        "normal mode needs no chip: {view}"
+        !view.contains("mode ·") && !title_row(&view).contains("mode"),
+        "normal mode needs no label: {view}"
     );
 
     state.apply(RuntimeEvent::ModeChanged {
@@ -560,9 +560,13 @@ fn the_mode_shows_as_a_chip_in_the_member_bar_not_as_a_composer_label() {
     });
     let view = draw_view(&state, 60, 10);
     assert!(!view.contains("mode:"), "{view}");
+    assert!(!title_row(&view).contains("mode"), "{view}");
     assert!(
-        title_row(&view).contains(" review mode "),
-        "the chip belongs in the member bar: {view}"
+        view.lines()
+            .last()
+            .unwrap_or_default()
+            .contains("review mode ·"),
+        "the mode leads the footer hints: {view}"
     );
 }
 

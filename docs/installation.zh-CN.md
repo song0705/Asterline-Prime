@@ -228,4 +228,4 @@ macOS 和 Windows 用户需要把结果与 `SHA256SUMS` 中同名文件的记录
 
 ### 无法写入项目状态
 
-Asterline 会在所选工作区中创建 `.asterline/`。请确认工作区可写，或通过 `--workspace` 指定其他目录。
+Asterline 把状态放在 `~/.asterline`（或 `$ASTERLINE_HOME`）下。请确认该目录可写；工作区本身不会被写入。

@@ -1063,7 +1063,7 @@ impl TeamRuntime {
     }
 
     fn with_brainstorm_skill(&self, prompt: String) -> String {
-        let skill = brainstorm_skill_text(&self.config.workspace);
+        let skill = brainstorm_skill_text();
         format!(
             "{prompt}\n\nDeployed ${ASTERLINE_BRAINSTORM_SKILL_NAME} protocol \
              (deployment-local and authoritative for card content and method):\n\n{skill}"

@@ -1,4 +1,4 @@
-//! The top header (title bar + member chips + rule) and the bottom footer
+//! The top header (the open window's agent) and the bottom footer
 //! (search prompt, alerts, running status, run hint, or key hints).
 
 use ratatui::Frame;
@@ -9,6 +9,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::domain::event::MemberStatus;
 use crate::domain::mode::TerminalMode;
+use crate::domain::team::DefaultTarget;
 use crate::tui::app_state::{AppState, MemberView, member_status_is_active};
 use crate::tui::runs_view::run_footer_hint;
 use crate::tui::theme;
@@ -32,99 +33,48 @@ pub(crate) fn display_workspace(workspace: &str, home: Option<&str>) -> String {
 /// Columns kept clear between the key hints and the workspace path.
 const FOOTER_PATH_GAP: usize = 2;
 
-/// Header: one line of member chips (a status glyph, name and model each),
-/// then the mode chip when a collaboration mode is active. No title row and no
-/// rule: the product name and version live in `/help`, the path in the footer.
+/// Header: one line naming the agent whose window is open: a status glyph,
+/// its name, and its model label. The All view shows the default member. No
+/// title row and no rule: the product name and version live in `/help`, the
+/// path in the footer, the active mode in the footer hints.
 pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // Compact member chips, each led by a status glyph. The member
-    // shown in the main window is underlined. Sub-agents stay out of the bar
-    // (a count stands in for them) except the one being viewed or selected,
-    // which sits right after its parent.
-    let mut chips = vec![Span::raw("  ")];
-    let mut first = true;
-    let mut shown_children = Vec::new();
-    for (i, member) in state.members().iter().enumerate() {
-        if member.parent.is_some() {
-            continue;
-        }
-        push_member_chip(&mut chips, state, i, member, &mut first);
-        for (child_index, child) in state.members().iter().enumerate() {
-            if child.parent.as_ref() == Some(&member.id)
-                && (state.focus() == Some(&child.id)
-                    || state.header_selected() == Some(child_index))
-            {
-                push_member_chip(&mut chips, state, child_index, child, &mut first);
-                shown_children.push(child_index);
-            }
-        }
+    let mut chip = vec![Span::raw("  ")];
+    match header_member(state) {
+        Some(member) => push_member_chip(&mut chip, state, member),
+        None => chip.push(Span::styled("starting…", theme::muted())),
     }
-    // The active collaboration mode, as a chip right after the agents.
-    // Normal mode shows nothing.
-    if state.active_mode() != TerminalMode::Normal {
-        chips.push(Span::raw("  "));
-        chips.push(Span::styled(
-            format!(" {} mode ", state.active_mode()),
-            theme::bold(theme::accent_color()).bg(theme::user_band_bg()),
-        ));
-    }
-    // Count only the sub-agents the bar does not already show. A busy one
-    // tints the count; the bar carries no spinner or status text.
-    let hidden: Vec<&MemberView> = state
-        .members()
-        .iter()
-        .enumerate()
-        .filter(|(index, member)| member.parent.is_some() && !shown_children.contains(index))
-        .map(|(_, member)| member)
-        .collect();
-    if !hidden.is_empty() {
-        let busy = hidden
-            .iter()
-            .any(|member| member_status_is_active(member.status));
-        let label = format!(
-            "  +{} sub-agent{}",
-            hidden.len(),
-            if hidden.len() == 1 { "" } else { "s" }
-        );
-        chips.push(Span::styled(
-            label,
-            if busy {
-                theme::warning()
-            } else {
-                theme::muted()
-            },
-        ));
-    }
-    if state.members().is_empty() {
-        chips.push(Span::styled("starting…", theme::muted()));
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(chips)), area);
+    frame.render_widget(Paragraph::new(Line::from(chip)), area);
 }
 
-fn push_member_chip(
-    chips: &mut Vec<Span<'static>>,
-    state: &AppState,
-    index: usize,
-    member: &MemberView,
-    first: &mut bool,
-) {
-    if !*first {
-        chips.push(Span::raw("  "));
+/// The member the header names: the focused one, or in the All view the
+/// default member (falling back to the first top-level member).
+fn header_member(state: &AppState) -> Option<&MemberView> {
+    let members = state.members();
+    if let Some(focus) = state.focus()
+        && let Some(member) = members.iter().find(|member| &member.id == focus)
+    {
+        return Some(member);
     }
-    *first = false;
+    if let Some(DefaultTarget::Member(id)) = state.default_target()
+        && let Some(member) = members.iter().find(|member| &member.id == id)
+    {
+        return Some(member);
+    }
+    members
+        .iter()
+        .find(|member| member.parent.is_none())
+        .or_else(|| members.first())
+}
+
+fn push_member_chip(chips: &mut Vec<Span<'static>>, state: &AppState, member: &MemberView) {
     chips.push(Span::styled(
         format!("{} ", status_glyph(member.status)),
         theme::member_dot_style(member.status),
     ));
-    let mut name_style = if state.header_selected() == Some(index) {
-        theme::selection()
-    } else {
-        theme::backend_bold_shaded(member.backend, state.member_color_index(&member.id))
-    };
-    if state.focus() == Some(&member.id) {
-        name_style = name_style.add_modifier(Modifier::UNDERLINED);
-    }
-    chips.push(Span::styled(member.display_name.clone(), name_style));
+    chips.push(Span::styled(
+        member.display_name.clone(),
+        theme::backend_bold_shaded(member.backend, state.member_color_index(&member.id)),
+    ));
     chips.push(Span::styled(
         format!(" · {}", state.member_model_label(member)),
         theme::muted(),
@@ -252,6 +202,14 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             "Enter send · ← agents · /help",
             theme::muted(),
         ));
+    }
+
+    // The active collaboration mode leads the hints (normal mode shows nothing).
+    if state.active_mode() != TerminalMode::Normal {
+        parts.insert(
+            0,
+            Span::styled(format!("{} mode · ", state.active_mode()), theme::muted()),
+        );
     }
 
     // The workspace, `~`-abbreviated and clipped from the left so the project

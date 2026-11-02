@@ -12,7 +12,8 @@ coordination, and troubleshooting. For the product overview, return to the
 At startup, Asterline chooses a roster in this order:
 
 1. `--team <PATH>` loads that JSON file.
-2. `<workspace>/.asterline/team.json` is reused if it exists.
+2. The project's saved `team.json` (see [Runtime data](#runtime-data)) is reused
+   if it exists.
 3. Otherwise supported backend executables are detected on `PATH` and
    Asterline starts straight into a chat with one general-purpose `main`
    agent on the first one found (Codex, then Claude, Grok, Agy), using that
@@ -282,7 +283,7 @@ use `default` to clear the explicit ID.
 
 Asterline names its Codex threads and Claude sessions `Asterline · <member>`
 so they are recognizable in native history that exposes a title. A saved roster
-at `<workspace>/.asterline/team.json` is also bound to that containing
+in the project's state directory (`team.json`) is also bound to that containing
 workspace: on a project move, Asterline corrects a stale serialized workspace
 before launching members, so new native transcripts remain associated with the
 project you opened. Native session pickers filter by working directory. Claude
@@ -436,25 +437,52 @@ instead of presenting the shortened value as complete.
 
 ## Runtime data
 
-The default workspace state is:
+Asterline writes nothing into the project folder. Its files live under the
+Asterline home, `~/.asterline` (`%USERPROFILE%\.asterline` on Windows), or the
+directory named by the `ASTERLINE_HOME` environment variable:
 
 ```text
-<workspace>/.asterline/
-├── team.json
-├── roster.md
-└── asterline.sqlite3
+~/.asterline/
+├── skills/
+│   ├── asterline-team/SKILL.md
+│   └── asterline-brainstorm/SKILL.md
+└── projects/<workspace key>/
+    ├── team.json
+    ├── roster.md
+    ├── agy/                 Agy logs
+    └── asterline.sqlite3
 ```
+
+The workspace key is the canonical absolute workspace path with every
+character that is not an ASCII letter, digit, `-`, or `_` replaced by `-`, as
+Claude Code does for `~/.claude/projects`: `/home/me/app` becomes
+`-home-me-app`. A path with any non-ASCII character (for example a Chinese
+folder name) also gets `-` and the first 8 hex digits of the SHA-256 of the
+full path appended, so different folders never share a key. Directories are
+created with mode `0700`.
+
+Claude, Grok, and Agy are started with `--add-dir` for `~/.asterline/skills`
+and the project's state directory so they can read the team skill and roster.
+
+**Moving old state.** Earlier versions kept this data in
+`<workspace>/.asterline/` and generated `.agents/skills/asterline-team/` and
+`.agents/skills/asterline-brainstorm/` in the project. On first launch in a
+workspace, Asterline moves `<workspace>/.asterline/` to the project state
+directory (the database, its `-wal`/`-shm` files, `team.json`, `roster.md`)
+and removes the skill files it generated, then any of `.agents/skills/…`,
+`.agents/skills`, and `.agents` that are left empty. Files with other content
+are never deleted, and a checkout of Asterline itself (a `Cargo.toml` whose
+package is `asterline`) keeps its `.agents/skills`. If the new state directory
+already has a database, it wins: the old folder is left untouched and a notice
+says so once. A migration that cannot finish (for example another Asterline is
+still using the old folder) is reported and retried on the next launch.
 
 SQLite stores conversations, tool events, teammate routes, raw backend events,
 logs, approvals, session identifiers, runs, checklists, timelines, and
 verification outcomes.
 
-Protect this directory like any other development transcript. Most repositories
-should ignore it:
-
-```gitignore
-.asterline/
-```
+Protect this directory like any other development transcript. It is outside
+your repositories, so there is nothing to add to `.gitignore`.
 
 Reopening Asterline restores the selected conversation by default. `/new` and
 `/clear` both create a clean conversation in normal mode and new backend
@@ -462,7 +490,7 @@ sessions while retaining older database records. They are rejected while
 members, runs, or verification are active; press `Esc` and wait for
 cancellation first.
 `--no-restore` skips startup replay without deleting data. `--db <PATH>` moves
-the database outside the workspace.
+the database to another location.
 
 `/resume` opens the Agents list on its saved chats (the **Inactive** section);
 `/new <prompt>` starts a clean chat and sends the prompt. Restoring a chat also restores the
@@ -502,16 +530,18 @@ limits what the underlying process can access.
 
 ## Agent-to-agent coordination
 
-Asterline creates `.agents/skills/asterline-team/SKILL.md` when it is missing
-and tells each member that this team skill is available at that path. The full
-protocol remains in the workspace instead of being repeated in every ordinary
+Asterline creates `~/.asterline/skills/asterline-team/SKILL.md` when it is
+missing (and upgrades it when Asterline ships a newer version of the skill that
+it manages) and tells each member that this team skill is available at that
+absolute path. The full protocol stays in the file instead of being repeated in every ordinary
 chat turn; this reminder deliberately does not invoke `$asterline-team`, so it
 does not force Codex to expand the whole skill. Live roster identity and member
-status are rewritten to `.asterline/roster.md` whenever the team or a member's
-status changes. The team skill tells agents to read that file; it is not copied
-into each prompt.
+status are rewritten to the project's `roster.md` (its absolute path is in each
+member's protocol text) whenever the team or a member's status changes. The
+team skill tells agents to read that file; its contents are not copied into
+each prompt.
 
-It also creates `.agents/skills/asterline-brainstorm/SKILL.md` when missing.
+It also creates `~/.asterline/skills/asterline-brainstorm/SKILL.md` when missing.
 Brainstorm mode loads that file for every generation, vote, and synthesis
 dispatch. Existing copies are never upgraded or overwritten, so deployments
 can customize the method while retaining the `@@brainstorm_card` and
@@ -581,9 +611,14 @@ sends the parent one short explanation; hand-backs and refusals count against
 `max_auto_relays` like any other automatic relay.
 
 Sub-agents belong to the current chat only. They are never written to
-`.asterline/team.json` (not even after `/model` or `/team` changes), they are
+the saved `team.json` (not even after `/model` or `/team` changes), they are
 saved with the chat so `/resume` and a normal restart bring them back with
-their sessions, and `/new` removes them. `/model` on a viewed sub-agent changes
+their sessions, and `/new` removes them all. A single sub-agent can be removed
+with `Ctrl+X` (twice) on its row in the Agents list, or by its parent with
+`@@close {"name":"reviewer"}` (`"id"` also works); a busy one is stopped first,
+its past messages stay in the chat, and the parent gets a one-line note. Both
+are refused for a sub-agent that fills a seat of the running review, plan, or
+brainstorm run. `/model` on a viewed sub-agent changes
 only that sub-agent. The `/team` editor lists top-level members only; a
 sub-agent whose parent you remove is removed with it. In `team.json`, a
 `parent` member field marks a sub-agent and is written only to the chat
@@ -642,7 +677,7 @@ Press `e` to enter a model name manually.
 
 ### The wrong roster opens
 
-Edit `.asterline/team.json`, use `/model` to change the model, or use `/team`
+Edit the project's `team.json` (under `~/.asterline/projects/`), use `/model` to change the model, or use `/team`
 and press `s` to apply roster changes. Deleting `team.json` makes the next
 launch start from the default `main` agent again.
 

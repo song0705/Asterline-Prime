@@ -281,6 +281,17 @@ fn run_loop(
         if state.warm_model_catalog_once() {
             dirty = true;
         }
+        if let Some(models) = state.pending_model_directory() {
+            // A busy queue just retries on the next pass.
+            match handle.try_send(UiCommand::SetModelDirectory(models.clone())) {
+                RuntimeCommandSend::Sent => state.mark_model_directory_sent(models),
+                RuntimeCommandSend::Full => {}
+                RuntimeCommandSend::Disconnected => {
+                    state.mark_runtime_unavailable();
+                    dirty = true;
+                }
+            }
+        }
         if let Some(member) = state.take_attach_release_pending()
             && !handle.finish_attach(member, Vec::new())
         {
@@ -849,8 +860,6 @@ fn handle_action_inner(action: Action, state: &mut AppState, handle: &RuntimeHan
         Action::CursorLeft => {
             if state.drawer() == Some(drawers::Drawer::Runs) {
                 state.select_older_run();
-            } else if state.header_selected().is_some() {
-                state.select_prev_member();
             } else if state.drawer().is_none()
                 && state.completion().is_none()
                 && state.composer().is_empty()
@@ -865,8 +874,6 @@ fn handle_action_inner(action: Action, state: &mut AppState, handle: &RuntimeHan
         Action::CursorRight => {
             if state.drawer() == Some(drawers::Drawer::Runs) {
                 state.select_newer_run();
-            } else if state.header_selected().is_some() {
-                state.select_next_member();
             } else {
                 state.cursor_right();
             }
@@ -925,8 +932,8 @@ fn handle_action_inner(action: Action, state: &mut AppState, handle: &RuntimeHan
         Action::ToggleThinking => state.toggle_thinking_expansion(),
         Action::ToggleDiffs => state.toggle_diffs_expansion(),
         Action::ToggleTools => state.toggle_tools_expansion(),
-        Action::NextMember => state.select_next_member(),
-        Action::PrevMember => state.select_prev_member(),
+        // Ctrl+N only means something inside the Agents list.
+        Action::NewChat => {}
         // Ctrl+X only means something inside the Agents list.
         Action::DeleteItem => {}
         Action::Complete => {
@@ -941,8 +948,6 @@ fn handle_action_inner(action: Action, state: &mut AppState, handle: &RuntimeHan
                 state.clear_find();
             } else if state.completion().is_some() {
                 state.dismiss_popup();
-            } else if state.header_selected().is_some() {
-                state.clear_header_selection();
             } else if state.drawer().is_some() {
                 state.close_drawer();
             } else {
@@ -970,17 +975,6 @@ fn handle_action_inner(action: Action, state: &mut AppState, handle: &RuntimeHan
             if state.completion().is_some() && state.accept_completion() {
                 return;
             }
-            if let Some(idx) = state.header_selected() {
-                // Selecting a member and pressing Enter attaches to its live
-                // backend session after the runtime grants an ordered,
-                // globally-quiescent reservation.
-                if let Some(member) = state.request_attach(idx)
-                    && !send_runtime(state, handle, UiCommand::RequestAttach { member })
-                {
-                    state.attach_request_send_failed();
-                }
-                return;
-            }
             submit(state, handle);
         }
     }
@@ -1005,7 +999,7 @@ fn abort_active_work(state: &mut AppState, handle: &RuntimeHandle) -> bool {
 /// and the page keys move the highlight, Enter or → opens the highlighted
 /// agent, ← closes (only while the search is empty), Esc clears the search and
 /// then closes. Ctrl+R renames the highlighted chat and Ctrl+X (twice) deletes
-/// a saved one. Anything else is ignored so it cannot reach the composer.
+/// a saved one or removes a sub-agent. Anything else is ignored so it cannot reach the composer.
 fn handle_agents_action(action: Action, state: &mut AppState) {
     if state.agents_rename().is_some() {
         handle_agents_rename_action(action, state);
@@ -1030,12 +1024,13 @@ fn handle_agents_action(action: Action, state: &mut AppState) {
             state.apply_selected_agent();
         }
         // Ctrl+N: start a new chat and leave the list.
-        Action::NextMember => {
+        Action::NewChat => {
             state.queue_command_and_close(UiCommand::NewSession { prompt: None });
         }
         // Ctrl+R: rename the highlighted chat.
         Action::HistorySearch => state.begin_agents_rename(),
-        // Ctrl+X: arm, then confirm, the deletion of a saved chat.
+        // Ctrl+X: arm, then confirm, the deletion of a saved chat or the
+        // removal of a sub-agent.
         Action::DeleteItem => state.press_agents_delete(),
         Action::CursorLeft if state.agents_query().is_empty() => state.close_drawer(),
         Action::CloseOverlay => state.escape_agents(),
@@ -3178,21 +3173,6 @@ mod tests {
     }
 
     #[test]
-    fn left_with_a_selected_header_member_keeps_cycling_members() {
-        let (handle, join, _events) = focus_test_runtime();
-        let mut state = focus_test_state(0);
-        state.select_next_member();
-
-        handle_action(Action::CursorLeft, &mut state, &handle);
-
-        assert_eq!(state.drawer(), None);
-        assert_eq!(state.header_selected(), Some(1));
-
-        handle.send(UiCommand::Shutdown);
-        let _ = join.join();
-    }
-
-    #[test]
     fn left_still_switches_between_several_pending_approvals() {
         let (handle, join, _events) = focus_test_runtime();
         let mut state = focus_test_state(2);
@@ -3439,7 +3419,7 @@ mod tests {
         handle_action(Action::CursorLeft, &mut state, &handle);
         assert_eq!(state.drawer(), Some(Drawer::Agents));
 
-        handle_action(Action::NextMember, &mut state, &handle);
+        handle_action(Action::NewChat, &mut state, &handle);
 
         assert_eq!(state.drawer(), None);
         wait_for_event(&events, |event| {

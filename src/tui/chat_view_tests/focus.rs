@@ -576,26 +576,32 @@ fn layout_text_and_selection_reflect_the_focused_window() {
 }
 
 #[test]
-fn header_lists_the_members_and_leaves_the_agent_hint_to_the_footer() {
+fn header_names_only_the_open_agent_and_leaves_the_agent_hint_to_the_footer() {
     let state = focused_state(Vec::new(), Some(reviewer()));
     let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
 
     draw(&mut terminal, &state);
     let view = format!("{}", terminal.backend());
+    let header = view.lines().next().unwrap_or_default();
 
-    assert!(view.contains("● Builder · codex"), "{view}");
-    assert!(view.contains("● Reviewer · claude"), "{view}");
+    assert!(header.contains("● Reviewer · claude"), "{view}");
+    assert!(!header.contains("Builder"), "{view}");
     // The hint lives in the footer only, never twice.
-    assert!(
-        !view.lines().next().unwrap_or_default().contains("← agents"),
-        "{view}"
-    );
+    assert!(!header.contains("← agents"), "{view}");
     assert_eq!(view.matches("← agents").count(), 1, "{view}");
     assert!(
         view.lines().last().unwrap_or_default().contains("← agents")
             || view.contains("Enter send · ← agents"),
         "{view}"
     );
+
+    // The All view names the default member.
+    let all = focused_state(Vec::new(), None);
+    draw(&mut terminal, &all);
+    let view = format!("{}", terminal.backend());
+    let header = view.lines().next().unwrap_or_default();
+    assert!(header.contains("● Builder · codex"), "{view}");
+    assert!(!header.contains("Reviewer"), "{view}");
 }
 
 #[test]
@@ -1269,74 +1275,7 @@ fn tree_state(chat: Vec<ChatItem>, focus: Option<MemberId>) -> AppState {
 }
 
 #[test]
-fn header_folds_sub_agents_into_a_count_and_shows_the_viewed_one() {
-    let state = tree_state(Vec::new(), Some(builder()));
-    let mut terminal = Terminal::new(TestBackend::new(110, 12)).unwrap();
-
-    draw(&mut terminal, &state);
-    let header = format!("{}", terminal.backend())
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-
-    assert!(header.contains("Builder · codex"), "{header}");
-    assert!(header.contains("Reviewer · claude"), "{header}");
-    // A busy hidden sub-agent only tints the count: no "running" text on the bar.
-    assert!(header.contains("+2 sub-agents"), "{header}");
-    assert!(!header.contains("running"), "{header}");
-    assert!(!header.contains("Scout"), "{header}");
-    assert!(!header.contains("Tester"), "{header}");
-
-    // Viewing a sub-agent puts its chip right after its parent.
-    let state = tree_state(Vec::new(), Some(MemberId::new("scout")));
-    draw(&mut terminal, &state);
-    let header = format!("{}", terminal.backend())
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let at = |needle: &str| header.find(needle).unwrap_or(usize::MAX);
-    assert!(at("Builder") < at("Scout"), "{header}");
-    assert!(at("Scout") < at("Reviewer"), "{header}");
-    assert!(!header.contains("Tester"), "{header}");
-    // The viewed sub-agent is on the bar, so only the other one is counted
-    // (and it is not running).
-    assert!(header.contains("+1 sub-agent"), "{header}");
-    assert!(!header.contains("+1 sub-agents"), "{header}");
-    assert!(!header.contains("running"), "{header}");
-}
-
-#[test]
-fn header_omits_the_sub_agent_count_once_the_only_one_is_on_the_bar() {
-    let mut state = AppState::new(Vec::new());
-    let mut child = member_summary(
-        "scout",
-        "Scout",
-        BackendKind::Claude,
-        "research",
-        MemberStatus::Idle,
-    );
-    child.parent = Some(builder());
-    state.apply(RuntimeEvent::Ready {
-        modes: Default::default(),
-        mode_overrides: Default::default(),
-        suggested_verify: None,
-        team: "t".to_string(),
-        workspace: String::new(),
-        default_target: None,
-        runs: Vec::new(),
-        members: vec![
-            member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            ),
-            child,
-        ],
-    });
+fn header_shows_one_agent_and_never_a_sub_agent_count() {
     let mut terminal = Terminal::new(TestBackend::new(110, 12)).unwrap();
     let header = |state: &AppState, terminal: &mut Terminal<TestBackend>| {
         draw(terminal, state);
@@ -1347,64 +1286,29 @@ fn header_omits_the_sub_agent_count_once_the_only_one_is_on_the_bar() {
             .to_string()
     };
 
-    state.set_focus(Some(builder()));
-    let hidden = header(&state, &mut terminal);
-    assert!(hidden.contains("+1 sub-agent"), "{hidden}");
-    assert!(!hidden.contains("Scout"), "{hidden}");
+    let top = header(&tree_state(Vec::new(), Some(builder())), &mut terminal);
+    assert!(top.contains("Builder · codex"), "{top}");
+    for other in ["Reviewer", "Scout", "Tester", "sub-agent", "running"] {
+        assert!(!top.contains(other), "{other}: {top}");
+    }
 
-    state.set_focus(Some(MemberId::new("scout")));
-    let shown = header(&state, &mut terminal);
-    assert!(shown.contains("Scout · claude"), "{shown}");
-    assert!(!shown.contains("sub-agent"), "{shown}");
+    // Viewing a sub-agent shows that sub-agent alone.
+    let child = header(
+        &tree_state(Vec::new(), Some(MemberId::new("scout"))),
+        &mut terminal,
+    );
+    assert!(child.contains("Scout"), "{child}");
+    for other in ["Builder", "Reviewer", "Tester", "sub-agent"] {
+        assert!(!child.contains(other), "{other}: {child}");
+    }
 
-    // No sub-agents at all: no count either.
-    let state = focused_state(Vec::new(), Some(builder()));
-    assert!(!header(&state, &mut terminal).contains("sub-agent"));
-}
-
-#[test]
-fn header_counts_a_single_sub_agent_in_the_singular() {
-    let mut state = AppState::new(Vec::new());
-    state.apply(RuntimeEvent::Ready {
-        modes: Default::default(),
-        mode_overrides: Default::default(),
-        suggested_verify: None,
-        team: "t".to_string(),
-        workspace: String::new(),
-        default_target: None,
-        runs: Vec::new(),
-        members: vec![
-            member_summary(
-                "builder",
-                "Builder",
-                BackendKind::Codex,
-                "impl",
-                MemberStatus::Idle,
-            ),
-            MemberSummary {
-                parent: Some(builder()),
-                ..member_summary(
-                    "scout",
-                    "Scout",
-                    BackendKind::Claude,
-                    "sub-agent",
-                    MemberStatus::Idle,
-                )
-            },
-        ],
-    });
-    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-
-    draw(&mut terminal, &state);
-    let header = format!("{}", terminal.backend())
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-
-    assert!(header.contains("+1 sub-agent"), "{header}");
-    assert!(!header.contains("sub-agents"), "{header}");
-    assert!(!header.contains("running"), "{header}");
+    // The All view names the default member (builder here).
+    let all = header(&tree_state(Vec::new(), None), &mut terminal);
+    assert!(all.contains("Builder"), "{all}");
+    assert!(
+        !all.contains("Reviewer") && !all.contains("sub-agent"),
+        "{all}"
+    );
 }
 
 #[test]
@@ -1537,8 +1441,12 @@ fn header_dot(terminal: &Terminal<TestBackend>, name: &str) -> (String, ratatui:
     (cell.symbol().to_string(), cell.style())
 }
 
-fn header_with(builder: MemberStatus, reviewer: MemberStatus) -> Terminal<TestBackend> {
-    let state = focused_state_with(Vec::new(), Some(builder_id()), builder, reviewer);
+fn header_with(
+    focus: MemberId,
+    builder: MemberStatus,
+    reviewer: MemberStatus,
+) -> Terminal<TestBackend> {
+    let state = focused_state_with(Vec::new(), Some(focus), builder, reviewer);
     let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
     draw(&mut terminal, &state);
     terminal
@@ -1550,13 +1458,14 @@ fn builder_id() -> MemberId {
 
 #[test]
 fn header_dot_is_lit_when_running_and_dark_when_idle() {
-    let terminal = header_with(MemberStatus::Running, MemberStatus::Idle);
+    let terminal = header_with(builder_id(), MemberStatus::Running, MemberStatus::Idle);
 
     let (glyph, lit) = header_dot(&terminal, "Builder");
     assert_eq!(glyph, "●");
     assert_eq!(lit.fg, theme::emphasis().fg);
     assert!(lit.add_modifier.contains(ratatui::style::Modifier::BOLD));
 
+    let terminal = header_with(reviewer(), MemberStatus::Running, MemberStatus::Idle);
     let (glyph, dark) = header_dot(&terminal, "Reviewer");
     assert_eq!(glyph, "●", "idle keeps the same dot shape");
     assert_eq!(dark.fg, theme::dim().fg);
@@ -1566,9 +1475,8 @@ fn header_dot_is_lit_when_running_and_dark_when_idle() {
 
 #[test]
 fn header_dot_is_lit_for_queued_and_waiting_too() {
-    let terminal = header_with(MemberStatus::Queued, MemberStatus::Waiting);
-
-    for name in ["Builder", "Reviewer"] {
+    for (focus, name) in [(builder_id(), "Builder"), (reviewer(), "Reviewer")] {
+        let terminal = header_with(focus, MemberStatus::Queued, MemberStatus::Waiting);
         let (glyph, style) = header_dot(&terminal, name);
         assert_eq!(glyph, "●", "{name}");
         assert_eq!(style.fg, theme::dot_lit().fg, "{name}");
@@ -1578,12 +1486,20 @@ fn header_dot_is_lit_for_queued_and_waiting_too() {
 
 #[test]
 fn header_dot_is_yellow_for_approval_and_red_for_failed() {
-    let terminal = header_with(MemberStatus::NeedsApproval, MemberStatus::Failed);
-
+    let terminal = header_with(
+        builder_id(),
+        MemberStatus::NeedsApproval,
+        MemberStatus::Failed,
+    );
     let (glyph, approval) = header_dot(&terminal, "Builder");
     assert_eq!(glyph, "!");
     assert_eq!(approval.fg, theme::warning().fg);
 
+    let terminal = header_with(
+        reviewer(),
+        MemberStatus::NeedsApproval,
+        MemberStatus::Failed,
+    );
     let (glyph, failed) = header_dot(&terminal, "Reviewer");
     assert_eq!(glyph, "✗");
     assert_eq!(failed.fg, theme::error().fg);
@@ -1668,4 +1584,135 @@ fn removed_members_keep_the_backend_name_and_the_stored_spawn_summary() {
     let text = history(&state, 90);
     assert!(has(&text, "claude · opus · high"), "{text:?}");
     assert!(text.iter().any(|l| l == "  Gone · claude"), "{text:?}");
+}
+
+#[test]
+fn a_close_is_a_row_in_the_parents_agents_group_and_names_the_removed_agent() {
+    let chat = vec![
+        route(&builder(), &["scout"], "Task line one"),
+        ChatItem::Close {
+            parent: builder(),
+            child: MemberId::new("gone"),
+            name: "Gone".to_string(),
+            by_user: false,
+        },
+    ];
+
+    // The removed agent is no longer on the roster, so the row carries its name.
+    let parent = history(&tree_state(chat.clone(), Some(builder())), 90);
+    assert!(has(&parent, "⇄ agents"), "{parent:?}");
+    assert!(has(&parent, "· close  Gone"), "{parent:?}");
+    assert_eq!(
+        parent.iter().filter(|l| l.contains("⇄ agents")).count(),
+        1,
+        "{parent:?}"
+    );
+
+    // Another member does not see it.
+    let other = history(
+        &tree_state(chat.clone(), Some(MemberId::new("reviewer"))),
+        90,
+    );
+    assert!(!has(&other, "· close"), "{other:?}");
+
+    let all = history(&tree_state(chat, None), 90);
+    assert!(has(&all, "· close  Builder → Gone"), "{all:?}");
+}
+
+#[test]
+fn a_close_by_the_user_reads_as_the_users_action() {
+    let chat = vec![ChatItem::Close {
+        parent: builder(),
+        child: MemberId::new("gone"),
+        name: "Gone".to_string(),
+        by_user: true,
+    }];
+    // The parent's window and "All" show it; another member's does not.
+    for focus in [None, Some(builder())] {
+        let text = history(&tree_state(chat.clone(), focus.clone()), 90);
+        assert!(has(&text, "· remove Gone  by you"), "{focus:?}: {text:?}");
+        assert!(!has(&text, "Builder"), "{focus:?}: {text:?}");
+        assert!(!has(&text, "→"), "{focus:?}: {text:?}");
+    }
+}
+
+fn gone_member() -> crate::domain::DepartedMember {
+    crate::domain::DepartedMember {
+        id: MemberId::new("gone"),
+        display_name: "Gone".to_string(),
+        backend: BackendKind::Claude,
+        model: Some("opus".to_string()),
+        effort: Some(Effort::High),
+    }
+}
+
+/// A chat with a spawned-then-removed sub-agent `gone` that is off the roster.
+fn departed_chat() -> Vec<ChatItem> {
+    let gone = MemberId::new("gone");
+    vec![
+        ChatItem::Spawn {
+            parent: builder(),
+            child: gone.clone(),
+            summary: "claude · opus · high".to_string(),
+        },
+        route(&builder(), &["gone"], "Please review"),
+        agent(&gone, "Gone", BackendKind::Claude, "last words"),
+        route(&gone, &["builder"], "Done"),
+    ]
+}
+
+fn assert_departed_rows_use_name_and_model_label(text: &[String]) {
+    assert!(
+        text.iter().any(|l| l == "  Gone · Opus 9 · high"),
+        "{text:?}"
+    );
+    assert!(
+        has(text, "· spawn  Builder → Gone  Opus 9 · high"),
+        "{text:?}"
+    );
+    assert!(has(text, "· Builder → Gone"), "{text:?}");
+    assert!(has(text, "· Gone → Builder"), "{text:?}");
+    assert!(!has(text, "→ gone") && !has(text, "gone →"), "{text:?}");
+}
+
+#[test]
+fn a_removed_sub_agents_messages_keep_its_name_and_model_label() {
+    let mut state = tree_state(departed_chat(), None);
+    seed_models(&mut state, "Opus 9");
+    // Before it is known to be departed the rows fall back to the id.
+    let before = history(&state, 90);
+    assert!(before.iter().any(|l| l == "  Gone · claude"), "{before:?}");
+
+    // The live removal event teaches the view the name and model settings.
+    state.apply(RuntimeEvent::SubAgentClosed {
+        parent: builder(),
+        child: MemberId::new("gone"),
+        by_user: true,
+        departed: gone_member(),
+    });
+    let text = history(&state, 90);
+    assert_departed_rows_use_name_and_model_label(&text);
+    assert!(has(&text, "· remove Gone  by you"), "{text:?}");
+}
+
+#[test]
+fn departed_labels_survive_a_restart_and_a_resumed_chat() {
+    // Restart: the store hands the saved departed list to a fresh view.
+    let mut state = tree_state(departed_chat(), None);
+    seed_models(&mut state, "Opus 9");
+    state.seed_departed(vec![gone_member()]);
+    assert_departed_rows_use_name_and_model_label(&history(&state, 90));
+
+    // Resume: the resumed chat brings its own departed list, replacing any
+    // other chat's, and a new chat starts with none.
+    let mut state = tree_state(Vec::new(), None);
+    seed_models(&mut state, "Opus 9");
+    state.apply(RuntimeEvent::ConversationResumed {
+        conversation: 7,
+        chat: departed_chat(),
+        departed: vec![gone_member()],
+    });
+    assert_departed_rows_use_name_and_model_label(&history(&state, 90));
+    state.apply(RuntimeEvent::SessionReset);
+    assert!(state.departed_members().is_empty());
 }

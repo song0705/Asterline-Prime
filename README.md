@@ -136,16 +136,18 @@ Asterline 不是把几个聊天窗口叠在一起。每种模式都有负责人�
 
 Asterline 不代替各提供商的认证、计费、模型授权或用量限制。
 
-重新打开默认接着上次对话。`/new`（可带第一条提示）和 `/clear` 都会开干净的新对话，mode 设置会留下来。`/resume` 在 Agents 列表里选择已保存的对话，恢复聊天、名册、后端会话、模式和 Runs。项目状态默认在：
+重新打开默认接着上次对话。`/new`（可带第一条提示）和 `/clear` 都会开干净的新对话，mode 设置会留下来。`/resume` 在 Agents 列表里选择已保存的对话，恢复聊天、名册、后端会话、模式和 Runs。项目状态默认放在 `~/.asterline`（可用 `ASTERLINE_HOME` 改位置），不会写进你的项目目录：
 
 ```text
-<workspace>/.asterline/
-├── team.json
-├── roster.md
-└── asterline.sqlite3
+~/.asterline/
+├── skills/                      共享的 Asterline skill
+└── projects/<工作区 key>/
+    ├── team.json
+    ├── roster.md
+    └── asterline.sqlite3
 ```
 
-数据库可能含提示、回复、工具输出、路由、审批和会话标识。把它当敏感开发数据；除非你有意版本管理，否则把 `.asterline/` 加进 `.gitignore`。
+工作区 key 是工作区绝对路径，其中除字母、数字、`-`、`_` 以外的字符都换成 `-`（`/home/me/app` 变成 `-home-me-app`；含非 ASCII 字符的路径还会附上一段短哈希）。数据库可能含提示、回复、工具输出、路由、审批和会话标识，请当作敏感开发数据。旧版本留在 `<workspace>/.asterline/` 的状态会在首次启动时迁移到这里。
 
 ## 安全边界
 

@@ -93,6 +93,7 @@ fn a_resumed_chat_forgets_which_groups_were_open() {
     state.apply(RuntimeEvent::ConversationResumed {
         conversation: 2,
         chat: vec![call("builder", "old.rs")],
+        departed: Vec::new(),
     });
 
     assert!(!state.tool_group_expanded(0));

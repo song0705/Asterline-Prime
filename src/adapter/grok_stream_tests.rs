@@ -96,12 +96,20 @@ fn command_uses_agent_stdio_with_flags_in_their_required_positions() {
     member.permission_mode = Some(PermissionMode::Auto);
     let runner = GrokAcpRunner::from_member(&member, Path::new("/tmp/ws"));
 
+    let skills = crate::state_paths::skills_dir().display().to_string();
+    let project = crate::state_paths::project_dir(Path::new("/tmp/ws"))
+        .display()
+        .to_string();
     assert_eq!(
         runner.command_args(Some(Effort::Xhigh)),
         vec![
             "--no-auto-update",
             "--sandbox",
             "workspace",
+            "--add-dir",
+            skills.as_str(),
+            "--add-dir",
+            project.as_str(),
             "--permission-mode",
             "auto",
             "agent",

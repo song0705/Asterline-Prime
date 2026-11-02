@@ -16,13 +16,13 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::event::{
-    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary, FileChangeItem,
-    LogEntry, LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId, RunStatus, RunStepStatus,
-    RunStepSummary, RunSummary, RunVerification, TurnId,
+    AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary, DepartedMember,
+    FileChangeItem, LogEntry, LogLevel, MessageId, ModeRunStatus, RunEventSummary, RunId,
+    RunStatus, RunStepStatus, RunStepSummary, RunSummary, RunVerification, TurnId,
 };
 use crate::domain::goal::{GoalState, GoalStatus};
 use crate::domain::mode::{CollabMode, ModeStatusSummary, ModesConfig, TerminalMode};
-use crate::domain::team::{BackendKind, MemberId, TeamConfig};
+use crate::domain::team::{BackendKind, Effort, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
 
@@ -200,6 +200,18 @@ impl SqliteStore {
                 mode_overrides_json TEXT NOT NULL DEFAULT '{}',
                 updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+            );
+
+            -- Sub-agents removed from a chat: what its earlier messages need to
+            -- keep their display name and model label.
+            CREATE TABLE IF NOT EXISTS departed_members (
+                conversation_id INTEGER NOT NULL,
+                member_id       TEXT NOT NULL,
+                display_name    TEXT NOT NULL,
+                backend         TEXT NOT NULL,
+                model           TEXT,
+                effort          TEXT,
+                PRIMARY KEY (conversation_id, member_id)
             );
 
             CREATE TABLE IF NOT EXISTS conversation_goals (
@@ -1182,6 +1194,7 @@ impl SqliteStore {
                 "DELETE FROM messages WHERE conversation_id = ?1",
                 "DELETE FROM conversation_snapshots WHERE conversation_id = ?1",
                 "DELETE FROM conversation_goals WHERE conversation_id = ?1",
+                "DELETE FROM departed_members WHERE conversation_id = ?1",
             ] {
                 self.conn.execute(sql, params![conversation])?;
             }
@@ -1191,6 +1204,56 @@ impl SqliteStore {
             )?;
             Ok(removed > 0)
         })
+    }
+
+    // --- departed sub-agents ---------------------------------------------
+
+    /// Remember a sub-agent removed from the active conversation.
+    pub fn record_departed_member(&self, member: &DepartedMember) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO departed_members
+                (conversation_id, member_id, display_name, backend, model, effort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(conversation_id, member_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                backend = excluded.backend,
+                model = excluded.model,
+                effort = excluded.effort",
+            params![
+                self.conversation.get(),
+                member.id.as_str(),
+                member.display_name,
+                member.backend.as_str(),
+                member.model,
+                member.effort.map(Effort::as_str),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sub-agents removed from the active conversation.
+    pub fn departed_members(&self) -> Result<Vec<DepartedMember>> {
+        self.departed_members_for(self.conversation.get())
+    }
+
+    /// Sub-agents removed from one saved conversation, oldest first.
+    pub fn departed_members_for(&self, conversation: i64) -> Result<Vec<DepartedMember>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, display_name, backend, model, effort
+             FROM departed_members WHERE conversation_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![conversation], |row| {
+            let backend: String = row.get(2)?;
+            let effort: Option<String> = row.get(4)?;
+            Ok(DepartedMember {
+                id: MemberId::new(row.get::<_, String>(0)?),
+                display_name: row.get(1)?,
+                backend: read_backend(Some(&backend))?,
+                model: row.get(3)?,
+                effort: effort.as_deref().and_then(Effort::parse),
+            })
+        })?;
+        rows.collect()
     }
 
     // --- goals -----------------------------------------------------------
@@ -2356,6 +2419,12 @@ fn chat_item_replay_bytes(item: &ChatItem) -> usize {
             child,
             summary,
         } => parent.as_str().len() + child.as_str().len() + summary.len(),
+        ChatItem::Close {
+            parent,
+            child,
+            name,
+            ..
+        } => parent.as_str().len() + child.as_str().len() + name.len(),
         ChatItem::Notice { text, member } => {
             text.len() + member.as_ref().map_or(0, |member| member.as_str().len())
         }

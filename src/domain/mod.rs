@@ -5,13 +5,15 @@ pub mod config;
 pub mod event;
 pub mod goal;
 pub mod mode;
+pub mod model_directory;
 pub mod team;
 
 pub use event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, ConversationSummary,
-    FileChangeItem, LogEntry, LogLevel, MemberStatus, MemberSummary, MessageId, MessageTarget,
-    ModeRunStatus, RouteTo, RunEventSummary, RunId, RunStatus, RunStepRequest, RunStepStatus,
-    RunStepSummary, RunSummary, RunVerification, RuntimeEvent, TeamMessage, TurnId, UiCommand,
+    DepartedMember, FileChangeItem, LogEntry, LogLevel, MemberStatus, MemberSummary, MessageId,
+    MessageTarget, ModeRunStatus, RouteTo, RunEventSummary, RunId, RunStatus, RunStepRequest,
+    RunStepStatus, RunStepSummary, RunSummary, RunVerification, RuntimeEvent, TeamMessage, TurnId,
+    UiCommand,
 };
 pub use mode::{
     AutoSeat, BrainstormModeConfig, CollabMode, DEFAULT_PARTICIPANT_COUNT, MAX_PARTICIPANT_COUNT,

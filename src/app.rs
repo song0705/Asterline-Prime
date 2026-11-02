@@ -17,7 +17,9 @@ use crate::domain::config::{
 use crate::domain::event::{ChatItem, RuntimeEvent};
 use crate::domain::team::TeamConfig;
 use crate::fs_safety;
+use crate::legacy_migration;
 use crate::runtime::{self, Runners, RuntimeHandle};
+use crate::state_paths;
 use crate::store::sqlite::SqliteStore;
 use crate::tui;
 use crate::tui::app_state::AppState;
@@ -158,9 +160,12 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         .clone()
         .unwrap_or_else(|| cwd.to_path_buf());
 
-    let requested_state_dir =
-        fs_safety::ensure_workspace_directory(&requested_workspace, &[".asterline"], true)?;
-    let saved_team = requested_state_dir.join("team.json");
+    // Asterline keeps its files under its own home, never in the project. A
+    // workspace that does not exist yet is created, as it always was.
+    ensure_workspace_exists(&requested_workspace)?;
+    let mut startup_notices = legacy_migration::migrate_workspace(&requested_workspace);
+    let requested_state_dir = state_paths::ensure_project_dir(&requested_workspace)?;
+    let saved_team = requested_state_dir.join(state_paths::TEAM_FILE);
     // Only an implicitly reused saved roster participates in conversation
     // snapshot restoration. An explicit --team file or a freshly created
     // default team is a launch-time choice and must not be overwritten by an
@@ -179,7 +184,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         },
     };
     // A CLI workspace is an explicit launch-time override. A roster loaded
-    // from `<cwd>/.asterline/team.json` belongs to that directory as well: if
+    // from this directory's `team.json` belongs to that directory as well: if
     // a project was moved, its serialized `workspace` value is stale, and
     // continuing to use it would make native Codex/Claude transcripts belong
     // to the old project. An explicitly supplied `--team` file retains its
@@ -192,8 +197,12 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         runtime::save_team_config(&saved_team, &team)?;
     }
     let workspace = team.workspace.clone();
-    ensure_team_skill(&team.workspace)?;
-    ensure_brainstorm_skill(&team.workspace)?;
+    if state_paths::project_key(&workspace) != state_paths::project_key(&requested_workspace) {
+        ensure_workspace_exists(&workspace)?;
+        startup_notices.extend(legacy_migration::migrate_workspace(&workspace));
+    }
+    ensure_team_skill()?;
+    ensure_brainstorm_skill()?;
 
     let db_path = match &config.db_path {
         Some(path) => {
@@ -202,8 +211,7 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             }
             path.clone()
         }
-        None => fs_safety::ensure_workspace_directory(&workspace, &[".asterline"], true)?
-            .join("asterline.sqlite3"),
+        None => state_paths::ensure_project_dir(&workspace)?.join(state_paths::DB_FILE),
     };
     fs_safety::ensure_private_regular_file(&db_path, "SQLite database")?;
     let instance_lock = InstanceLock::acquire(&db_path)?;
@@ -250,8 +258,18 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         };
         (chat, logs)
     };
+    let mut chat = chat;
+    chat.extend(
+        startup_notices
+            .into_iter()
+            .map(|text| ChatItem::Notice { member: None, text }),
+    );
     let mut state = AppState::new(chat);
     state.seed_logs(logs);
+    if !config.no_restore {
+        // Sub-agents removed earlier in this chat keep their message labels.
+        state.seed_departed(store.departed_members().unwrap_or_default());
+    }
 
     // Bound the runtime-to-TUI stream so a fast or malformed backend cannot
     // turn a slow terminal renderer into an unbounded in-memory queue.
@@ -279,6 +297,20 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         state,
         instance_lock,
     }))
+}
+
+fn ensure_workspace_exists(workspace: &Path) -> io::Result<()> {
+    if !workspace.is_dir() {
+        std::fs::create_dir_all(workspace)?;
+    }
+    if workspace.is_dir() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("workspace is not a directory: {}", workspace.display()),
+        ))
+    }
 }
 
 /// The team for a workspace with no saved or explicit config. There is no
@@ -401,7 +433,7 @@ impl AppConfig {
          Options:\n\
          \x20 --team <PATH>       Load a team config (JSON) instead of the saved one.\n\
          \x20 --workspace <PATH>  Working directory for members. Default: current directory.\n\
-         \x20 --db <PATH>         SQLite path. Default: <workspace>/.asterline/asterline.sqlite3.\n\
+         \x20 --db <PATH>         SQLite path. Default: <asterline home>/projects/<workspace key>/asterline.sqlite3.\n\
          \x20 --no-restore        Do not replay persisted chat history on startup.\n\
          \x20 --debug             Developer mode.\n\
          \x20 --manual-approvals  Show the composer card for Codex tool asks (off by default).\n\
@@ -415,7 +447,10 @@ impl AppConfig {
          With no --team, Asterline starts a chat with one `main` agent on the first\n\
          detected backend (Codex, Claude, Grok, Agy) using its default model. Switch\n\
          models in the session with /model; the choice is saved in\n\
-         <workspace>/.asterline/team.json."
+         <asterline home>/projects/<workspace key>/team.json. The asterline home is\n\
+         ~/.asterline, or $ASTERLINE_HOME when set; the workspace key is its absolute\n\
+         path with every other character turned into `-`. Nothing is written into the\n\
+         workspace itself."
     }
 }
 
@@ -632,6 +667,7 @@ mod tests {
         assert!(prompt.contains("Asterline team skill"));
         assert!(!prompt.contains("$asterline-team"));
         assert!(!prompt.contains(".asterline/roster.md"));
+        assert!(!prompt.contains(".agents/skills"));
         assert!(prompt.contains("reviewer"));
     }
 
@@ -664,10 +700,9 @@ mod tests {
         .unwrap();
 
         let prepared = prepare(&config, &dir).unwrap().expect("prepared");
-        assert!(
-            dir.join(crate::domain::config::ASTERLINE_TEAM_SKILL_PATH)
-                .is_file()
-        );
+        assert!(crate::domain::config::team_skill_path().is_file());
+        assert!(!dir.join(".agents").exists());
+        assert!(!dir.join(".asterline").exists());
         let Prepared {
             handle,
             join,
@@ -721,7 +756,7 @@ mod tests {
         )
         .unwrap();
         launch.members[0].effort = Some(crate::domain::team::Effort::Low);
-        let team_path = dir.join(".asterline").join("team.json");
+        let team_path = state_paths::team_config_path(&dir);
         std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
         runtime::save_team_config(&team_path, &launch).unwrap();
 
@@ -874,12 +909,10 @@ mod tests {
         .unwrap();
 
         let prepared = prepare(&config, &invocation).unwrap().expect("prepared");
-        assert!(
-            team_workspace
-                .join(".asterline/asterline.sqlite3")
-                .is_file()
-        );
-        assert!(!invocation.join(".asterline/asterline.sqlite3").exists());
+        assert!(state_paths::db_path(&team_workspace).is_file());
+        assert!(!state_paths::db_path(&invocation).exists());
+        assert_eq!(std::fs::read_dir(&team_workspace).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&invocation).unwrap().count(), 0);
         let ready = prepared
             .events
             .recv_timeout(Duration::from_secs(2))
@@ -905,7 +938,7 @@ mod tests {
         let moved_workspace = root.join("moved-location");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&previous_workspace).unwrap();
-        std::fs::create_dir_all(moved_workspace.join(".asterline")).unwrap();
+        std::fs::create_dir_all(state_paths::project_dir(&moved_workspace)).unwrap();
 
         let team = crate::domain::config::default_team(
             &previous_workspace,
@@ -917,7 +950,7 @@ mod tests {
             },
         )
         .unwrap();
-        let saved_team = moved_workspace.join(".asterline/team.json");
+        let saved_team = state_paths::team_config_path(&moved_workspace);
         runtime::save_team_config(&saved_team, &team).unwrap();
 
         let config = AppConfig::parse(["--fake", "--no-restore"]).unwrap();
@@ -935,16 +968,8 @@ mod tests {
         ));
         let saved: TeamConfig = load_team_config(&saved_team).unwrap();
         assert_eq!(saved.workspace, moved_workspace);
-        assert!(
-            moved_workspace
-                .join(".asterline/asterline.sqlite3")
-                .is_file()
-        );
-        assert!(
-            !previous_workspace
-                .join(".asterline/asterline.sqlite3")
-                .exists()
-        );
+        assert!(state_paths::db_path(&moved_workspace).is_file());
+        assert!(!state_paths::db_path(&previous_workspace).exists());
 
         prepared.handle.send(UiCommand::Shutdown);
         prepared.join.join().unwrap();
@@ -986,8 +1011,10 @@ mod tests {
         .unwrap();
 
         let prepared = prepare(&config, &root).unwrap().expect("prepared");
-        assert!(cli_workspace.join(".asterline/asterline.sqlite3").is_file());
-        assert!(!declared_workspace.join(".asterline").exists());
+        assert!(state_paths::db_path(&cli_workspace).is_file());
+        assert!(!state_paths::db_path(&declared_workspace).exists());
+        assert_eq!(std::fs::read_dir(&cli_workspace).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&declared_workspace).unwrap().count(), 0);
         let ready = prepared
             .events
             .recv_timeout(Duration::from_secs(2))
@@ -1001,5 +1028,71 @@ mod tests {
         prepared.handle.send(UiCommand::Shutdown);
         prepared.join.join().unwrap();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn startup_moves_old_in_project_state_and_the_chat_is_still_there() {
+        let root =
+            std::env::temp_dir().join(format!("asterline-app-legacy-{}", std::process::id()));
+        let workspace = root.join("项目 with spaces");
+        let _ = std::fs::remove_dir_all(&root);
+        let old = workspace.join(".asterline");
+        std::fs::create_dir_all(&old).unwrap();
+        let team = crate::domain::config::default_team(
+            &workspace,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap();
+        runtime::save_team_config(&old.join("team.json"), &team).unwrap();
+        {
+            let store = SqliteStore::open(old.join("asterline.sqlite3")).unwrap();
+            store.current_conversation().unwrap();
+            let turn = store.create_turn().unwrap();
+            store
+                .record_user(
+                    turn,
+                    std::slice::from_ref(&team.members[0].id),
+                    "chat from the old layout",
+                )
+                .unwrap();
+        }
+        // Generated skill files from the old layout are cleaned up as well.
+        let skill_dir = workspace.join(".agents/skills/asterline-team");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: asterline-team\n---\n<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->\n",
+        )
+        .unwrap();
+
+        let config =
+            AppConfig::parse(["--workspace", workspace.to_str().unwrap(), "--fake"]).unwrap();
+        let prepared = prepare(&config, &root).unwrap().expect("prepared");
+
+        assert!(prepared.state.chat().iter().any(|item| matches!(
+            item,
+            ChatItem::User { body, .. } if body == "chat from the old layout"
+        )));
+        assert!(
+            prepared.state.chat().iter().any(|item| matches!(
+                item,
+                ChatItem::Notice { text, .. } if text.contains("Moved Asterline state")
+            )),
+            "the move is announced"
+        );
+        assert!(state_paths::db_path(&workspace).is_file());
+        assert!(state_paths::team_config_path(&workspace).is_file());
+        // The project folder is left with nothing of Asterline's.
+        assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 0);
+
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(state_paths::project_dir(&workspace)).ok();
     }
 }

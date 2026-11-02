@@ -42,7 +42,7 @@ asterline [OPTIONS]
 从 `PATH` 加载 JSON 团队配置，而不是使用已保存的团队。
 
 ```bash
-asterline --team .asterline/team.json
+asterline --team ./team.json
 ```
 
 ### `--workspace <PATH>`
@@ -56,7 +56,8 @@ asterline --workspace /path/to/project
 ### `--db <PATH>`
 
 设置 SQLite 数据库路径。默认是
-`<workspace>/.asterline/asterline.sqlite3`。
+`~/.asterline/projects/<工作区 key>/asterline.sqlite3`（设置了 `$ASTERLINE_HOME` 时以它为 home；
+见[运行时数据](configuration.zh-CN.md#运行时数据)）。
 
 ```bash
 asterline --db /path/to/asterline.sqlite3
@@ -209,7 +210,7 @@ Codex Skill 的 `@<Codex 成员> /skill` 才会转换。`@member /` 会列出真
 
 `/clear` 不接受参数，效果与单独的 `/new` 相同，是完整的新建对话操作，而不是仅隐藏屏幕历史
 （`/clear text` 会提示 `Usage: /clear`）。正常重新打开会复用当前选中的对话，不会清空它。`/new`
-还会移除本对话的子 Agent（见[子 Agent](configuration.zh-CN.md#子-agent)）。旧对话会留在
+还会移除本对话的子 Agent（见[子 Agent](configuration.zh-CN.md#子-agent)；也可以在 Agents 列表里用 `Ctrl+X` 逐个移除）。旧对话会留在
 Agents 列表的 **Inactive** 分组里（见 [Agents 列表](#agents-列表)）；在该列表里按 `Ctrl+N` 等同于 `/new`。
 
 ### `/resume`
@@ -407,7 +408,7 @@ Claude Code 没有列出模型的命令，因此 Asterline 始终提供它的别
 保存 `effort`；Agent 的当前模型沿用它原有的 effort，其他模型则把 effort 交给 CLI 决定。
 AGY 的合并行里由变体 id 携带档位，因此不会写入 `effort`。换成另一个 CLI 的模型时，还会把该
 Agent 切换到那个 CLI 的默认权限预设，并启动全新的原生 session。修改会保存到
-`.asterline/team.json`，聊天里会出现一行 `Model: …` 记录。Agent 正在工作时会拒绝并给出提示，
+该项目的 `team.json`，聊天里会出现一行 `Model: …` 记录。Agent 正在工作时会拒绝并给出提示，
 先按 `Esc` 停止即可。
 
 **切换时如何延续对话。** 同一个 CLI 内换模型会沿用原生 session，上下文原样保留，
@@ -464,7 +465,13 @@ Asterline 就把保存下来的聊天记录当作依据：下一条发给该 Age
   `Enter save   Esc cancel`。
 - `Ctrl+X`（搜索为空，仅限 **Inactive** 行）删除已保存的对话及其全部消息、运行和审批。第一次按下时提示行变为
   `Press Ctrl+X again to delete`；在同一行再按一次 `Ctrl+X` 才会删除。按其他任何键或移动选择都会取消。当前
-  对话和在线 Agent 不能删除。提示行只在适用的行上列出 `Ctrl+R rename` 和 `Ctrl+X delete`。
+  对话和顶层在线 Agent 不能删除。提示行只在适用的行上列出 `Ctrl+R rename` 和 `Ctrl+X delete`。
+- `Ctrl+X`（搜索为空）在**子 Agent** 行上移除这一个子 Agent，同样需要连按两次：提示行变为
+  `Press Ctrl+X again to remove`；若它正在工作、排队、等待或待审批，则变为
+  `Press Ctrl+X again to stop and remove`（先中断它的工作，并丢弃它排队的消息和待处理的审批）。子 Agent 行的提示行会列出
+  `Ctrl+X remove`。父 Agent 会收到一条系统消息，子 Agent 以往的消息仍保留在聊天里。该键在顶层成员和**全部**行上无效；
+  占着进行中 review、plan 或 brainstorm 席位的子 Agent 会被拒绝移除，需先按 `Esc` 取消该运行。被移除的
+  review 或 brainstorm 席位（`reviewer`、`ideator-N`）在下一次运行时会重新开出。如果你正在查看被移除的子 Agent，视图会回到它的父 Agent。
 - `Enter` 或 `→` 把主聊天切换到选中项并关闭列表；用鼠标点击某一行效果相同。
 - `Esc` 先清空已输入的搜索，搜索为空时才关闭列表。`←` 仅在搜索为空时关闭列表。
 
@@ -534,7 +541,7 @@ stdout、stderr、工具活动和适配器警告。
 模式被覆盖的字段写入 `team.json` 作为这支队伍的默认，`r` 清除该字段的本对话
 覆盖并回落。不按 `s` / `w` 直接关闭会丢弃 pending。
 
-`/mode <name>` 仍是键盘快路径：立刻切模式、不打开面板，聊天里出现一行 `Mode: …` 说明新模式；若当前配置无法运行该模式（只剩显式绑定不可行的情况，例如把 reviewer 绑成 builder），会直接说明原因。非 `normal` 模式下，成员栏会显示 ` review mode ` 标签。选择
+`/mode <name>` 仍是键盘快路径：立刻切模式、不打开面板，聊天里出现一行 `Mode: …` 说明新模式；若当前配置无法运行该模式（只剩显式绑定不可行的情况，例如把 reviewer 绑成 builder），会直接说明原因。非 `normal` 模式下，底部提示行开头会显示 `review mode ·`。选择
 `review`、`plan`、`brainstorm` 或 `team` 后，下一条直接输入任务即可，**不要**加
 `@member` 前缀；该消息会按所选模式交给配置的参与成员。`@member <消息>` 有意
 始终是一对一指令，会绕开当前协作 Run。`/new` 把新对话重置为 `normal`，但保留
@@ -737,7 +744,7 @@ brainstorm 运行重跑当前生成波次（或投票/综合阶段）；处于�
 | `↑` / `↓`                      | 在输入框、历史或当前选择列表中移动                          |
 | `Tab`                          | 接受补全                                                    |
 | `Ctrl+R`                       | 反向搜索提示历史（在 Agents 列表里：重命名对话）            |
-| `Ctrl+X`（Agents 列表）        | 连按两次删除选中的已保存对话                                |
+| `Ctrl+X`（Agents 列表）        | 连按两次删除已保存对话或移除子 Agent                        |
 | `n` / `p`                      | 输入框为空时跳到下一/上一条 `/find` 结果                    |
 | `PageUp` / `PageDown`          | 按页滚动聊天或当前抽屉                                      |
 | `←`（输入框为空时）            | 打开 Agents 列表（成员、子 Agent、已保存对话）              |
@@ -751,7 +758,7 @@ brainstorm 运行重跑当前生成波次（或投票/综合阶段）；处于�
 | `Ctrl+O`                       | 显示完整工具输出并展开所有工具组（开关）                    |
 | `Ctrl+L`                       | 打开日志                                                    |
 | `Ctrl+P`                       | 打开命令面板                                                |
-| `Ctrl+N` / `Ctrl+B`            | 聚焦下一/上一个成员                                         |
+| `Ctrl+N`                       | 新建对话（在 Agents 列表里）                                |
 | `Ctrl+A` / `Ctrl+E`            | 移到行首/行尾                                               |
 | `Ctrl+U` / `Cmd+Backspace`     | 清空输入框当前行（其它行保留）                              |
 | `Ctrl+W`                       | 删除前一个词                                                |
@@ -833,8 +840,7 @@ Claude 或 Grok 历史，显示标题、项目、更新时间和原生 ID，并�
 
 ## 接入原生会话
 
-按 `Ctrl+N` 或 `Ctrl+B` 聚焦顶部成员栏，用 `←`、`→` 移动，再按 `Enter`。
-也可以使用 `/attach <member>` 或 `@member /attach`。Asterline 会暂时挂起 TUI，打开
+使用 `/attach <member>` 或 `@member /attach`。Asterline 会暂时挂起 TUI，打开
 所选成员的原生交互式 CLI。请使用该 CLI 支持的退出方式（通常是 `/exit`）；只有后端接受
 EOF 时，EOF 才会返回 Asterline。
 

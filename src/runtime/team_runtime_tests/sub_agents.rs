@@ -69,6 +69,21 @@ fn has_notice(step: &RuntimeStep, needle: &str) -> bool {
     notices(step).iter().any(|text| text.contains(needle))
 }
 
+/// Rows the chat shows as sent by Asterline itself ("from asterline").
+fn system_rows(step: &RuntimeStep) -> Vec<(MemberId, String)> {
+    route_events(step)
+        .into_iter()
+        .filter(|(from, _, _)| from.as_str() == "asterline")
+        .flat_map(|(_, to, body)| to.into_iter().map(move |to| (id(&to), body.clone())))
+        .collect()
+}
+
+fn has_system_row(step: &RuntimeStep, to: &MemberId, needle: &str) -> bool {
+    system_rows(step)
+        .iter()
+        .any(|(target, body)| target == to && body.contains(needle))
+}
+
 #[test]
 fn spawn_creates_a_child_that_inherits_from_the_parent_and_gets_the_task() {
     let mut rt = spawn_runtime();
@@ -188,8 +203,18 @@ fn spawn_refuses_an_unknown_backend_or_effort_and_tells_the_parent() {
 
     assert!(rt.config.member(&id("a")).is_none());
     assert!(rt.config.member(&id("b")).is_none());
-    assert!(has_notice(&step, "could not spawn a: unknown backend"));
-    assert!(has_notice(&step, "could not spawn b: unknown effort"));
+    assert!(has_system_row(
+        &step,
+        &main_id(),
+        "\"a\" was refused: unknown backend"
+    ));
+    assert!(has_system_row(
+        &step,
+        &main_id(),
+        "\"b\" was refused: unknown effort"
+    ));
+    // The refusal is shown once, as the row from Asterline, not also as a notice.
+    assert!(!has_notice(&step, "could not spawn"));
 }
 
 #[test]
@@ -199,7 +224,11 @@ fn spawn_refuses_effort_the_backend_cannot_use() {
     let step = main_replies(&mut rt, &spawn_line("a", r#","effort":"ultra""#));
 
     assert!(rt.config.member(&id("a")).is_none());
-    assert!(has_notice(&step, "does not support ultra effort"));
+    assert!(has_system_row(
+        &step,
+        &main_id(),
+        "does not support ultra effort"
+    ));
 }
 
 #[test]
@@ -381,7 +410,7 @@ fn spawn_refuses_a_name_that_belongs_to_a_top_level_member() {
     let step = main_replies(&mut rt, &spawn_line("other", ""));
 
     assert_eq!(rt.config.sub_agent_count(), 0);
-    assert!(has_notice(&step, "not your sub-agent"));
+    assert!(has_system_row(&step, &main_id(), "not your sub-agent"));
 }
 
 #[test]
@@ -401,8 +430,12 @@ fn spawn_with_an_existing_name_reuses_the_child_and_delivers_the_task() {
     );
 
     assert_eq!(rt.config.sub_agent_count(), 1);
-    // The existing child is kept as it was; the new backend is ignored.
-    assert_eq!(rt.config.member(&id("reviewer")), Some(&first));
+    // The existing child is the same member, now on the backend asked for
+    // (see the re-spawn tests); the other fields keep their values.
+    let updated = rt.config.member(&id("reviewer")).unwrap();
+    assert_eq!(updated.backend, BackendKind::Codex);
+    assert_eq!(updated.id, first.id);
+    assert_eq!(updated.parent, first.parent);
     assert!(!has_notice(&step, "spawned"));
     let action = step
         .actions
@@ -428,7 +461,7 @@ fn spawn_refuses_another_parents_child() {
     let step = main_replies(&mut rt, &spawn_line("helper", ""));
 
     assert_eq!(rt.config.sub_agent_count(), 1);
-    assert!(has_notice(&step, "not your sub-agent"));
+    assert!(has_system_row(&step, &main_id(), "not your sub-agent"));
 }
 
 #[test]
@@ -448,7 +481,7 @@ fn spawn_stops_at_the_sub_agent_limit_but_still_reuses_existing_children() {
 
     assert_eq!(rt.config.sub_agent_count(), MAX_SUB_AGENTS);
     assert!(rt.config.member(&id("one-too-many")).is_none());
-    assert!(has_notice(&step, "maximum of 8 sub-agents"));
+    assert!(has_system_row(&step, &main_id(), "maximum of 8 sub-agents"));
 
     let reuse = complete_ok(&mut rt, &main_id(), &spawn_line("kid0", ""));
     assert!(!has_notice(&reuse, "could not spawn"));
@@ -462,14 +495,18 @@ fn a_sub_agent_cannot_spawn() {
     let step = complete_ok(&mut rt, &id("reviewer"), &spawn_line("grandchild", ""));
 
     assert!(rt.config.member(&id("grandchild")).is_none());
-    assert!(has_notice(&step, "Reviewer could not spawn grandchild"));
-    assert!(has_notice(&step, "cannot open sub-agents"));
-    // The refusal is about the member that asked, so only its window shows it.
-    assert!(step.events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::MemberNotice { member, text }
-            if member == &id("reviewer") && text.contains("could not spawn grandchild")
-    )));
+    assert!(has_system_row(
+        &step,
+        &id("reviewer"),
+        "cannot open sub-agents"
+    ));
+    assert!(has_system_row(
+        &step,
+        &id("reviewer"),
+        "\"grandchild\" was refused"
+    ));
+    // Shown once, as the row from Asterline in the asking member's window.
+    assert!(!has_notice(&step, "could not spawn"));
 }
 
 #[test]
@@ -499,7 +536,10 @@ fn spawn_is_refused_outside_normal_and_team_mode() {
             &mut step,
         );
         assert_eq!(rt.config.sub_agent_count(), 0, "{mode:?}");
-        assert!(has_notice(&step, "normal or team mode"), "{mode:?}");
+        assert!(
+            has_system_row(&step, &main_id(), "normal or team mode"),
+            "{mode:?}"
+        );
     }
 }
 
@@ -510,7 +550,11 @@ fn spawn_in_team_mode_respects_the_roster_lock() {
     let coordinator = locked.config.default_member_ids()[0].clone();
     let step = complete_ok(&mut locked, &coordinator, &spawn_line("reviewer", ""));
     assert_eq!(locked.config.sub_agent_count(), 0);
-    assert!(has_notice(&step, "locked to the current roster"));
+    assert!(has_system_row(
+        &step,
+        &coordinator,
+        "locked to the current roster"
+    ));
 
     let mut open = spawn_runtime();
     open.config.modes.team = Some(TeamModeConfig {
@@ -1070,4 +1114,957 @@ fn parents_protocol_documents_spawn_and_children_get_theirs() {
     assert!(child_prompt.contains("handed back"));
     assert!(child_prompt.contains("cannot open sub-agents"));
     assert!(!child_prompt.contains("@@spawn"));
+}
+
+// ---- model list: protocol, resolution, re-spawn, failure text ----
+
+fn model(id: &str, name: &str, efforts: &[Effort]) -> crate::adapter::DiscoveredModel {
+    let mut model = crate::adapter::DiscoveredModel::simple(id);
+    model.name = name.to_string();
+    model.supported_efforts = efforts.to_vec();
+    model
+}
+
+const TO_MAX: [Effort; 5] = [
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::Xhigh,
+    Effort::Max,
+];
+const TO_ULTRA: [Effort; 6] = [
+    Effort::Low,
+    Effort::Medium,
+    Effort::High,
+    Effort::Xhigh,
+    Effort::Max,
+    Effort::Ultra,
+];
+
+/// Codex and Claude catalogs, newest first, both backends installed.
+fn model_directory() -> crate::domain::model_directory::ModelDirectory {
+    use crate::domain::config::DetectedBackends;
+    crate::domain::model_directory::ModelDirectory {
+        installed: Some(DetectedBackends {
+            codex: true,
+            claude: true,
+            grok: false,
+            agy: false,
+        }),
+        catalogs: vec![
+            (
+                BackendKind::Codex,
+                vec![
+                    model("gpt-6.1-sol", "GPT-6.1-Sol", &TO_ULTRA),
+                    model("gpt-6-astra", "GPT-6-Astra", &TO_ULTRA),
+                    model("gpt-6.1-terra", "GPT-6.1-Terra", &TO_MAX),
+                    model("gpt-6-sol", "GPT-6-Sol", &TO_MAX),
+                    model("gpt-reserve", "gpt-reserve", &[]),
+                ],
+            ),
+            (
+                BackendKind::Claude,
+                vec![
+                    {
+                        let mut opus = model("opus", "Opus", &TO_MAX);
+                        opus.alt_ids = vec!["claude-opus-4-8".to_string()];
+                        opus
+                    },
+                    model("sonnet", "Sonnet", &TO_MAX),
+                ],
+            ),
+        ],
+    }
+}
+
+fn runtime_with_models() -> TeamRuntime {
+    let mut rt = spawn_runtime();
+    rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    rt
+}
+
+/// The text of the system note `main` received after its last reply.
+fn parent_notes(step: &RuntimeStep) -> Vec<String> {
+    route_events(step)
+        .into_iter()
+        .filter(|(from, to, _)| from == &id("asterline") && to == &["main"])
+        .map(|(_, _, body)| body)
+        .collect()
+}
+
+#[test]
+fn protocol_lists_the_models_once_the_catalog_arrives() {
+    let mut rt = spawn_runtime();
+    let before = rt
+        .config
+        .member(&main_id())
+        .unwrap()
+        .system_prompt
+        .clone()
+        .unwrap_or_default();
+    assert!(!before.contains("Models you can use in @@spawn"));
+
+    let step = rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+
+    let prompt = rt
+        .config
+        .member(&main_id())
+        .unwrap()
+        .system_prompt
+        .clone()
+        .unwrap();
+    assert!(prompt.contains("Models you can use in @@spawn"));
+    assert!(prompt.contains("use these exact ids"));
+    assert!(prompt.contains(
+        "codex: gpt-6.1-sol (GPT-6.1-Sol; low…ultra), gpt-6-astra (GPT-6-Astra; low…ultra), \
+         gpt-6.1-terra (GPT-6.1-Terra; low…max), gpt-6-sol (GPT-6-Sol; low…max), gpt-reserve"
+    ));
+    assert!(prompt.contains("claude: opus (Opus; low…max), sonnet (Sonnet; low…max)"));
+    // The running member's runner is rebuilt with the new text, no restart.
+    let upsert = step
+        .runner_changes
+        .iter()
+        .find_map(|change| match change {
+            RunnerChange::Upsert { member, .. } if member.id == main_id() => Some(member),
+            _ => None,
+        })
+        .expect("main's runner is refreshed");
+    assert!(
+        upsert
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("gpt-6-astra (GPT-6-Astra; low…ultra)")
+    );
+    // The same list again changes nothing; a changed one refreshes.
+    let again = rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    assert!(again.runner_changes.is_empty());
+    // Sub-agents cannot spawn, so their protocol carries no list.
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    assert!(
+        !rt.config
+            .member(&id("reviewer"))
+            .unwrap()
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("Models you can use")
+    );
+}
+
+#[test]
+fn a_busy_member_gets_the_model_list_when_its_next_run_starts() {
+    let mut rt = spawn_runtime();
+    let started = rt.on_ui_command(user("go"));
+    assert_eq!(started.actions[0].member, main_id());
+
+    let step = rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    assert!(
+        !step.runner_changes.iter().any(
+            |change| matches!(change, RunnerChange::Upsert { member, .. } if member.id == main_id())
+        ),
+        "a running member keeps its runner"
+    );
+    complete_ok(&mut rt, &main_id(), "done");
+    let next = rt.on_ui_command(user("again"));
+    assert!(
+        next.runner_changes.iter().any(
+            |change| matches!(change, RunnerChange::Upsert { member, .. }
+            if member.id == main_id()
+                && member.system_prompt.as_deref().unwrap_or("").contains("gpt-6-astra"))
+        ),
+        "refreshed before the run"
+    );
+    assert_eq!(next.actions[0].member, main_id());
+}
+
+#[test]
+fn a_loose_model_name_is_resolved_and_the_parent_is_told_which_id_ran() {
+    let mut rt = runtime_with_models();
+
+    let step = main_replies(
+        &mut rt,
+        &spawn_line(
+            "helper",
+            r#","backend":"codex","model":"gpt-astra","effort":"max""#,
+        ),
+    );
+
+    let child = rt.config.member(&id("helper")).expect("opened");
+    assert_eq!(child.backend, BackendKind::Codex);
+    assert_eq!(child.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(child.effort, Some(Effort::Max));
+    assert_eq!(
+        parent_notes(&step),
+        vec![
+            r#"Sub-agent "helper" opened on codex · gpt-6-astra (GPT-6-Astra) · max."#.to_string()
+        ]
+    );
+}
+
+#[test]
+fn exact_ids_alternate_ids_and_display_names_resolve() {
+    let mut rt = runtime_with_models();
+
+    let exact = main_replies(
+        &mut rt,
+        &spawn_line("a", r#","backend":"codex","model":"gpt-6-astra""#),
+    );
+    assert_eq!(
+        rt.config.member(&id("a")).unwrap().model.as_deref(),
+        Some("gpt-6-astra")
+    );
+    assert!(parent_notes(&exact).is_empty(), "an exact id needs no note");
+
+    main_replies_again(&mut rt, &spawn_line("b", r#","model":"claude-opus-4-8""#));
+    assert_eq!(
+        rt.config.member(&id("b")).unwrap().model.as_deref(),
+        Some("claude-opus-4-8")
+    );
+
+    let display = main_replies_again(
+        &mut rt,
+        &spawn_line("c", r#","backend":"codex","model":"GPT 6 Astra""#),
+    );
+    assert_eq!(
+        rt.config.member(&id("c")).unwrap().model.as_deref(),
+        Some("gpt-6-astra")
+    );
+    assert!(parent_notes(&display)[0].contains("gpt-6-astra (GPT-6-Astra)"));
+}
+
+/// A further `main` turn after the first one has finished.
+fn main_replies_again(rt: &mut TeamRuntime, reply: &str) -> RuntimeStep {
+    complete_ok(rt, &main_id(), "settle");
+    main_replies(rt, reply)
+}
+
+#[test]
+fn an_ambiguous_model_name_uses_the_newest_match_and_says_so() {
+    let mut rt = runtime_with_models();
+
+    let step = main_replies(
+        &mut rt,
+        &spawn_line("coder", r#","backend":"codex","model":"sol""#),
+    );
+
+    assert_eq!(
+        rt.config.member(&id("coder")).unwrap().model.as_deref(),
+        Some("gpt-6.1-sol")
+    );
+    let note = parent_notes(&step).join(" ");
+    assert!(note.contains("gpt-6.1-sol"), "{note}");
+    assert!(note.contains("matches several"), "{note}");
+    assert!(note.contains("gpt-6-sol"), "{note}");
+}
+
+#[test]
+fn an_unknown_model_is_refused_with_the_valid_ids() {
+    let mut rt = runtime_with_models();
+
+    let step = main_replies(
+        &mut rt,
+        &spawn_line("coder", r#","backend":"codex","model":"banana""#),
+    );
+
+    assert!(rt.config.member(&id("coder")).is_none());
+    let note = parent_notes(&step).join(" ");
+    assert!(note.contains("was refused"), "{note}");
+    assert!(note.contains("gpt-6-astra (GPT-6-Astra)"), "{note}");
+    assert!(note.contains("gpt-6.1-sol (GPT-6.1-Sol)"), "{note}");
+}
+
+#[test]
+fn an_effort_the_model_lacks_is_refused_with_the_supported_ones() {
+    let mut rt = runtime_with_models();
+
+    let step = main_replies(
+        &mut rt,
+        &spawn_line(
+            "coder",
+            r#","backend":"codex","model":"gpt-6-sol","effort":"ultra""#,
+        ),
+    );
+
+    assert!(rt.config.member(&id("coder")).is_none());
+    let note = parent_notes(&step).join(" ");
+    assert!(note.contains("low, medium, high, xhigh, max"), "{note}");
+    // Not changed silently into something else.
+    assert!(note.contains("does not support ultra"), "{note}");
+}
+
+#[test]
+fn unknown_catalog_passes_the_request_through() {
+    let mut rt = spawn_runtime();
+    let mut directory = model_directory();
+    directory
+        .catalogs
+        .retain(|(backend, _)| *backend == BackendKind::Codex);
+    rt.on_ui_command(UiCommand::SetModelDirectory(directory));
+
+    // Claude's catalog is unknown: whatever the agent wrote is used.
+    main_replies(
+        &mut rt,
+        &spawn_line("coder", r#","model":"whatever-9","effort":"high""#),
+    );
+
+    let child = rt.config.member(&id("coder")).unwrap();
+    assert_eq!(child.model.as_deref(), Some("whatever-9"));
+    assert_eq!(child.effort, Some(Effort::High));
+}
+
+#[test]
+fn a_backend_that_is_not_installed_is_refused() {
+    let mut rt = spawn_runtime();
+    let mut directory = model_directory();
+    directory.installed = Some(crate::domain::config::DetectedBackends {
+        codex: false,
+        claude: true,
+        grok: false,
+        agy: false,
+    });
+    directory
+        .catalogs
+        .retain(|(backend, _)| *backend == BackendKind::Claude);
+    rt.on_ui_command(UiCommand::SetModelDirectory(directory));
+
+    let step = main_replies(&mut rt, &spawn_line("coder", r#","backend":"codex""#));
+
+    assert!(rt.config.member(&id("coder")).is_none());
+    assert!(
+        parent_notes(&step)
+            .join(" ")
+            .contains("codex is not installed")
+    );
+}
+
+#[test]
+fn an_inherited_effort_the_chosen_model_lacks_is_dropped() {
+    let mut rt = spawn_runtime();
+    rt.config.members[0].effort = Some(Effort::Ultra);
+    rt.config.members[0].backend = BackendKind::Codex;
+    rt.config.members[0].model = Some("gpt-6.1-sol".to_string());
+    rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+
+    main_replies(&mut rt, &spawn_line("coder", r#","model":"gpt-6-sol""#));
+
+    let child = rt.config.member(&id("coder")).unwrap();
+    assert_eq!(child.model.as_deref(), Some("gpt-6-sol"));
+    assert_eq!(child.effort, None);
+}
+
+#[test]
+fn respawn_switches_the_model_then_delivers_the_task() {
+    let mut rt = runtime_with_models();
+    main_replies(
+        &mut rt,
+        &spawn_line(
+            "helper",
+            r#","backend":"codex","model":"gpt-6.1-sol","effort":"high""#,
+        ),
+    );
+    complete_ok(&mut rt, &id("helper"), "first");
+    complete_ok(&mut rt, &main_id(), "noted");
+
+    rt.on_ui_command(user("again"));
+    let step = complete_ok(
+        &mut rt,
+        &main_id(),
+        r#"@@spawn {"name":"helper","task":"second round","model":"astra","backend":"codex"}"#,
+    );
+
+    let child = rt.config.member(&id("helper")).unwrap();
+    assert_eq!(child.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(child.backend, BackendKind::Codex);
+    // Not named in the request: kept.
+    assert_eq!(child.effort, Some(Effort::High));
+    assert_eq!(rt.config.sub_agent_count(), 1);
+    assert!(step.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. } if member.id == id("helper")
+            && member.model.as_deref() == Some("gpt-6-astra")
+    )));
+    assert!(parent_notes(&step).iter().any(|note| {
+        note.contains(r#"Sub-agent "helper" switched to codex · gpt-6-astra (GPT-6-Astra) · high."#)
+    }));
+    let action = step
+        .actions
+        .iter()
+        .find(|action| action.member == id("helper"))
+        .expect("task delivered");
+    assert!(action.prompt.contains("second round"));
+}
+
+#[test]
+fn respawn_without_model_fields_leaves_the_child_alone() {
+    let mut rt = runtime_with_models();
+    main_replies(
+        &mut rt,
+        &spawn_line("helper", r#","backend":"codex","model":"gpt-6.1-sol""#),
+    );
+    complete_ok(&mut rt, &id("helper"), "first");
+    complete_ok(&mut rt, &main_id(), "noted");
+    let before = rt.config.member(&id("helper")).cloned().unwrap();
+
+    rt.on_ui_command(user("again"));
+    let step = complete_ok(
+        &mut rt,
+        &main_id(),
+        r#"@@spawn {"name":"helper","task":"more"}"#,
+    );
+
+    assert_eq!(rt.config.member(&id("helper")), Some(&before));
+    assert!(parent_notes(&step).is_empty());
+}
+
+#[test]
+fn respawn_to_another_backend_starts_a_fresh_session_with_that_backends_defaults() {
+    let mut rt = runtime_with_models();
+    main_replies(&mut rt, &spawn_line("helper", ""));
+    complete_ok(&mut rt, &id("helper"), "first");
+    complete_ok(&mut rt, &main_id(), "noted");
+
+    rt.on_ui_command(user("again"));
+    complete_ok(
+        &mut rt,
+        &main_id(),
+        r#"@@spawn {"name":"helper","task":"more","backend":"codex","model":"terra","effort":"max"}"#,
+    );
+
+    let child = rt.config.member(&id("helper")).unwrap();
+    assert_eq!(child.backend, BackendKind::Codex);
+    assert_eq!(child.model.as_deref(), Some("gpt-6.1-terra"));
+    assert_eq!(child.effort, Some(Effort::Max));
+    assert_eq!(child.session_id, None);
+    assert_eq!(
+        child.codex_permissions_preset(),
+        Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+    );
+}
+
+#[test]
+fn respawn_with_a_bad_effort_for_the_childs_own_model_is_refused() {
+    let mut rt = runtime_with_models();
+    main_replies(
+        &mut rt,
+        &spawn_line("helper", r#","backend":"codex","model":"gpt-6-sol""#),
+    );
+    complete_ok(&mut rt, &id("helper"), "first");
+    complete_ok(&mut rt, &main_id(), "noted");
+
+    rt.on_ui_command(user("again"));
+    let step = complete_ok(
+        &mut rt,
+        &main_id(),
+        r#"@@spawn {"name":"helper","task":"more","effort":"ultra"}"#,
+    );
+
+    assert_eq!(
+        rt.config.member(&id("helper")).unwrap().effort,
+        Some(Effort::High)
+    );
+    assert!(
+        parent_notes(&step)
+            .join(" ")
+            .contains("does not support ultra")
+    );
+}
+
+#[test]
+fn respawn_of_a_busy_child_is_refused_instead_of_changing_it_mid_run() {
+    let mut rt = runtime_with_models();
+    main_replies(
+        &mut rt,
+        &spawn_line("helper", r#","backend":"codex","model":"gpt-6.1-sol""#),
+    );
+    // The child is still working on its first task.
+    rt.on_ui_command(user("again"));
+    let step = complete_ok(
+        &mut rt,
+        &main_id(),
+        r#"@@spawn {"name":"helper","task":"more","model":"astra"}"#,
+    );
+
+    assert_eq!(
+        rt.config.member(&id("helper")).unwrap().model.as_deref(),
+        Some("gpt-6.1-sol")
+    );
+    assert!(
+        parent_notes(&step).join(" ").contains("still working"),
+        "{:?}",
+        route_events(&step)
+    );
+}
+
+#[test]
+fn a_failed_child_hands_back_the_real_error() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("helper", ""));
+    let child = id("helper");
+    let message = "The 'gpt-astra' model is not supported when using Codex with a ChatGPT account.";
+    rt.on_agent_event(&child, AgentEvent::Fatal(message.to_string()));
+    let failed = rt.on_agent_event(
+        &child,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+
+    assert_eq!(
+        route_events(&failed)[0].2,
+        format!("Helper could not finish the task: {message}")
+    );
+}
+
+#[test]
+fn a_refused_spawn_is_shown_once_as_the_row_from_asterline() {
+    let mut rt = spawn_runtime();
+
+    let step = main_replies(&mut rt, &spawn_line("a", r#","effort":"ultra""#));
+
+    let rows = system_rows(&step);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].1.contains("was refused"), "{rows:?}");
+    // No notice repeats it ("Main could not spawn a: ...").
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(text) | RuntimeEvent::MemberNotice { text, .. }
+                if text.contains("could not spawn") || text.contains("does not support ultra")
+        )),
+        "{:?}",
+        step.events
+    );
+}
+
+// ---- removing a sub-agent: the user's Ctrl+X and the parent's @@close ----
+
+fn remove(member: &str) -> UiCommand {
+    UiCommand::RemoveSubAgent { member: id(member) }
+}
+
+/// `(parent, child, display name, removed by the user)` of each removal.
+fn closed_events(step: &RuntimeStep) -> Vec<(MemberId, MemberId, String, bool)> {
+    step.events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::SubAgentClosed {
+                parent,
+                child,
+                by_user,
+                departed,
+            } => Some((
+                parent.clone(),
+                child.clone(),
+                departed.display_name.clone(),
+                *by_user,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ready_without(step: &RuntimeStep, gone: &str) -> bool {
+    step.events.iter().any(|event| {
+        matches!(
+            event,
+            RuntimeEvent::Ready { members, .. }
+                if members.iter().all(|m| m.id != id(gone))
+        )
+    })
+}
+
+/// `main` with an idle `reviewer` sub-agent whose first task is done.
+fn runtime_with_idle_reviewer() -> TeamRuntime {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    complete_ok(&mut rt, &id("reviewer"), "r");
+    complete_ok(&mut rt, &main_id(), "done");
+    rt
+}
+
+#[test]
+fn the_user_removes_an_idle_sub_agent_and_the_parent_is_told() {
+    let mut rt = runtime_with_idle_reviewer();
+    let original = rt.store.active_conversation();
+    rt.on_agent_event(
+        &id("reviewer"),
+        AgentEvent::SessionDiscovered(AgentSessionId("child-session".to_string())),
+    );
+
+    let step = rt.on_ui_command(remove("reviewer"));
+
+    assert!(rt.config.member(&id("reviewer")).is_none());
+    assert_eq!(rt.config.sub_agent_count(), 0);
+    assert!(!rt.members.contains_key(&id("reviewer")));
+    assert!(rt.sessions.get(&id("reviewer")).is_none());
+    assert!(step.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Remove(member) if member == &id("reviewer")
+    )));
+    assert!(ready_without(&step, "reviewer"));
+    assert_eq!(
+        closed_events(&step),
+        vec![(main_id(), id("reviewer"), "Reviewer".to_string(), true)]
+    );
+    // Its name and model settings are saved with the chat, to label its
+    // earlier messages after a restart or /resume.
+    let departed = rt.store.departed_members().unwrap();
+    assert_eq!(departed.len(), 1);
+    assert_eq!(departed[0].id, id("reviewer"));
+    assert_eq!(departed[0].display_name, "Reviewer");
+    // The team file never held it, and the roster file is rewritten.
+    assert!(
+        step.persist_team
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .all(|m| m.parent.is_none())
+    );
+    // The parent's protocol no longer lists it.
+    let prompt = rt
+        .config
+        .member(&main_id())
+        .unwrap()
+        .system_prompt
+        .clone()
+        .unwrap();
+    assert!(!prompt.contains("Your sub-agents"), "{prompt}");
+    assert!(step.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. }
+            if member.id == main_id()
+                && !member.system_prompt.clone().unwrap_or_default().contains("Your sub-agents")
+    )));
+    // The parent gets the note as a visible row and as a prompt.
+    let note = r#"Sub-agent "reviewer" was removed by the user."#;
+    assert!(
+        has_system_row(&step, &main_id(), note),
+        "{:?}",
+        system_rows(&step)
+    );
+    let action = step
+        .actions
+        .iter()
+        .find(|action| action.member == main_id())
+        .expect("the parent is told");
+    assert!(action.prompt.contains("[system message from Asterline]"));
+    assert!(action.prompt.contains(note));
+
+    // Persisted: a restart and resuming the chat do not bring it back.
+    let launch = rt.config.without_sub_agents();
+    let restored = rt.store.restore_active_team_config(&launch).unwrap();
+    assert!(restored.member(&id("reviewer")).is_none());
+    complete_ok(&mut rt, &main_id(), "noted");
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: original,
+    });
+    assert!(rt.config.member(&id("reviewer")).is_none());
+    assert!(rt.config.member(&main_id()).is_some());
+}
+
+#[test]
+fn removing_a_busy_sub_agent_interrupts_it_first_and_drops_what_waited_for_it() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let child = id("reviewer");
+    // The task is running; one more message waits behind it.
+    rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(child.clone()),
+        body: "and also this".to_string(),
+    });
+    assert_eq!(rt.members[&child].queue.len(), 1);
+
+    let step = rt.on_ui_command(remove("reviewer"));
+
+    // Interrupted like Esc would, queue dropped, but it leaves only once the
+    // run has actually ended.
+    assert!(
+        rt.members[&child]
+            .running
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Relaxed)
+    );
+    assert!(rt.members[&child].queue.is_empty());
+    assert!(has_notice(&step, "cancelling reviewer"));
+    assert!(rt.config.member(&child).is_some());
+    assert!(closed_events(&step).is_empty());
+
+    let step = rt.on_agent_event(
+        &child,
+        AgentEvent::Exited {
+            code: None,
+            ok: false,
+        },
+    );
+
+    assert!(rt.config.member(&child).is_none());
+    assert!(!rt.members.contains_key(&child));
+    assert!(rt.closing.is_empty());
+    assert_eq!(closed_events(&step).len(), 1);
+    assert!(ready_without(&step, "reviewer"));
+    // Not handed back as if it had finished; the parent only hears of the removal.
+    assert!(
+        !route_events(&step)
+            .iter()
+            .any(|(from, _, _)| from == &child)
+    );
+    let note = r#"Sub-agent "reviewer" was removed by the user."#;
+    assert!(has_system_row(&step, &main_id(), note));
+    let action = step
+        .actions
+        .iter()
+        .find(|action| action.member == main_id())
+        .expect("the parent is told");
+    assert!(action.prompt.contains(note));
+}
+
+#[test]
+fn removing_a_sub_agent_waiting_on_an_approval_rejects_it() {
+    let mut rt = spawn_runtime().with_approvals(true);
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let child = id("reviewer");
+    rt.on_agent_event(
+        &child,
+        AgentEvent::NativeApprovalRequested {
+            request_id: 7,
+            action: "run a command".to_string(),
+            body: String::new(),
+        },
+    );
+    assert!(!rt.native_approvals.is_empty());
+
+    let step = rt.on_ui_command(remove("reviewer"));
+
+    assert!(rt.native_approvals.is_empty());
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ApprovalResolved {
+            decision: ApprovalDecision::Reject,
+            ..
+        }
+    )));
+    assert!(step.runner_controls.iter().any(|control| matches!(
+        control,
+        RunnerControl::ResolveNativeApproval {
+            decision: ApprovalDecision::Reject,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn removal_is_refused_for_top_level_and_unknown_members() {
+    let mut rt = runtime_with_idle_reviewer();
+
+    for name in ["main", "other", "nobody"] {
+        let step = rt.on_ui_command(remove(name));
+        assert!(closed_events(&step).is_empty(), "{name}");
+        assert!(step.runner_changes.is_empty(), "{name}");
+        assert!(
+            step.events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::Notice(_))),
+            "{name}: {:?}",
+            step.events
+        );
+    }
+    let step = rt.on_ui_command(remove("main"));
+    assert!(has_notice(&step, "Main is not a sub-agent"));
+    assert!(rt.config.member(&main_id()).is_some());
+    assert!(rt.config.member(&id("other")).is_some());
+    assert!(rt.config.member(&id("reviewer")).is_some());
+}
+
+#[test]
+fn a_second_removal_while_the_first_winds_down_is_refused() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    rt.on_ui_command(remove("reviewer"));
+
+    let step = rt.on_ui_command(remove("reviewer"));
+
+    assert!(has_notice(&step, "already being removed"));
+}
+
+#[test]
+fn nothing_new_reaches_a_sub_agent_that_is_being_removed() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let child = id("reviewer");
+    rt.on_ui_command(remove("reviewer"));
+
+    rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(child.clone()),
+        body: "too late".to_string(),
+    });
+    assert!(rt.members[&child].queue.is_empty());
+
+    let step = rt.on_agent_event(
+        &child,
+        AgentEvent::Exited {
+            code: None,
+            ok: false,
+        },
+    );
+    assert!(rt.config.member(&child).is_none());
+    assert!(!step.actions.iter().any(|action| action.member == child));
+}
+
+#[test]
+fn close_from_the_parent_removes_the_sub_agent_and_confirms() {
+    for line in [
+        r#"@@close {"name":"reviewer"}"#,
+        r#"@@close {"id":"reviewer"}"#,
+        r#"@@close {"name":"Reviewer"}"#,
+    ] {
+        let mut rt = runtime_with_idle_reviewer();
+        rt.on_ui_command(user("clean up"));
+
+        let step = complete_ok(&mut rt, &main_id(), &format!("Done with it.\n{line}"));
+
+        assert!(rt.config.member(&id("reviewer")).is_none(), "{line}");
+        assert_eq!(
+            closed_events(&step),
+            vec![(main_id(), id("reviewer"), "Reviewer".to_string(), false)],
+            "{line}"
+        );
+        assert!(ready_without(&step, "reviewer"), "{line}");
+        assert!(step.runner_changes.iter().any(|change| matches!(
+            change,
+            RunnerChange::Remove(member) if member == &id("reviewer")
+        )));
+        let note = r#"Sub-agent "reviewer" closed."#;
+        assert!(has_system_row(&step, &main_id(), note), "{line}");
+        let action = step
+            .actions
+            .iter()
+            .find(|action| action.member == main_id())
+            .expect("the parent gets the confirmation");
+        assert!(action.prompt.contains(note), "{line}");
+    }
+}
+
+#[test]
+fn close_of_a_busy_sub_agent_stops_it_and_confirms_once_it_has_ended() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let child = id("reviewer");
+    rt.on_ui_command(user("more"));
+    let step = complete_ok(&mut rt, &main_id(), r#"@@close {"name":"reviewer"}"#);
+    assert!(closed_events(&step).is_empty());
+    assert!(
+        rt.members[&child]
+            .running
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Relaxed)
+    );
+
+    let step = rt.on_agent_event(
+        &child,
+        AgentEvent::Exited {
+            code: None,
+            ok: false,
+        },
+    );
+
+    assert!(rt.config.member(&child).is_none());
+    assert!(has_system_row(
+        &step,
+        &main_id(),
+        r#"Sub-agent "reviewer" closed."#
+    ));
+}
+
+#[test]
+fn close_is_refused_for_unknown_names_and_members_that_are_not_the_senders() {
+    let mut rt = runtime_with_idle_reviewer();
+    // `other` has a sub-agent of its own.
+    let mut helper = TeamMember::new("helper", "Helper", BackendKind::Codex, "sub-agent");
+    helper.parent = Some(id("other"));
+    let mut members = rt.config.members.clone();
+    members.push(helper);
+    rt.on_ui_command(UiCommand::ReplaceTeam {
+        members,
+        default_target: Some(DefaultTarget::Member(main_id())),
+    });
+    assert!(rt.config.member(&id("helper")).is_some());
+
+    for (name, needle) in [
+        ("ghost", "no sub-agent named"),
+        ("other", "not your sub-agent"),
+        ("main", "not your sub-agent"),
+        ("helper", "not your sub-agent"),
+    ] {
+        rt.on_ui_command(user("go"));
+        let step = complete_ok(
+            &mut rt,
+            &main_id(),
+            &format!(r#"@@close {{"name":"{name}"}}"#),
+        );
+        assert!(closed_events(&step).is_empty(), "{name}");
+        assert!(
+            has_system_row(&step, &main_id(), "was refused")
+                && has_system_row(&step, &main_id(), needle),
+            "{name}: {:?}",
+            system_rows(&step)
+        );
+    }
+    assert!(rt.config.member(&id("helper")).is_some());
+    assert!(rt.config.member(&id("other")).is_some());
+    assert!(rt.config.member(&id("reviewer")).is_some());
+}
+
+#[test]
+fn a_sub_agent_cannot_close_its_sibling_or_itself() {
+    let mut rt = spawn_runtime();
+    main_replies(
+        &mut rt,
+        &format!("{}\n{}", spawn_line("a", ""), spawn_line("b", "")),
+    );
+
+    let step = complete_ok(&mut rt, &id("a"), r#"@@close {"name":"b"}"#);
+    assert!(closed_events(&step).is_empty());
+    assert!(has_system_row(&step, &id("a"), "not your sub-agent"));
+    assert!(rt.config.member(&id("b")).is_some());
+}
+
+#[test]
+fn a_malformed_close_line_stays_visible_and_changes_nothing() {
+    let mut rt = runtime_with_idle_reviewer();
+    rt.on_ui_command(user("go"));
+
+    let step = complete_ok(&mut rt, &main_id(), r#"@@close {"name":"  "}"#);
+
+    assert!(closed_events(&step).is_empty());
+    assert!(rt.config.member(&id("reviewer")).is_some());
+}
+
+#[test]
+fn the_protocol_text_documents_close_for_parents_only() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let main_prompt = rt
+        .config
+        .member(&main_id())
+        .unwrap()
+        .system_prompt
+        .clone()
+        .unwrap();
+    assert!(main_prompt.contains("@@close"));
+    let child_prompt = rt
+        .config
+        .member(&id("reviewer"))
+        .unwrap()
+        .system_prompt
+        .clone()
+        .unwrap();
+    assert!(!child_prompt.contains("@@close"));
 }

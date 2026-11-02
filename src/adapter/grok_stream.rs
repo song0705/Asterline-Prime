@@ -38,6 +38,8 @@ const ACP_OUTPUT_QUEUE_CAPACITY: usize = 128;
 pub struct GrokAcpRunner {
     binary: String,
     cwd: PathBuf,
+    /// Asterline's shared skills and this project's state, outside `cwd`.
+    extra_dirs: Vec<PathBuf>,
     sandbox: SandboxPolicy,
     model: Option<String>,
     permission_mode: Option<PermissionMode>,
@@ -50,6 +52,7 @@ impl GrokAcpRunner {
         Self {
             binary: "grok".to_string(),
             cwd: member.resolved_cwd(workspace),
+            extra_dirs: crate::state_paths::agent_access_dirs(workspace),
             sandbox: member.sandbox,
             model: member.model.clone(),
             permission_mode: member.permission_mode,
@@ -70,6 +73,11 @@ impl GrokAcpRunner {
             "--sandbox".to_string(),
             self.sandbox.grok_arg().to_string(),
         ];
+        // The skill and roster live under the Asterline home, not the project.
+        for dir in &self.extra_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.display().to_string());
+        }
         match self.permission_mode {
             Some(PermissionMode::BypassPermissions) => {
                 // Confirmed on grok 1.0.4: `--permission-mode always-approve`
