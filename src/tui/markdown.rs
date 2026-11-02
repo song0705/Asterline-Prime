@@ -548,7 +548,9 @@ pub(crate) fn highlight_code_line(line: &str, extension: &str) -> Vec<Span<'stat
     }
 }
 
-/// Render a parsed table with per-column width alignment and box-drawing rules.
+/// Render a parsed table with box-drawing rules. Columns keep their natural
+/// width when the table fits; otherwise the widest columns shrink and long
+/// cells wrap onto extra lines inside the same row (nothing is truncated).
 fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
     if table.rows.is_empty() {
         return Vec::new();
@@ -557,37 +559,44 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
     if cols == 0 {
         return Vec::new();
     }
-    // Column widths, capped so a wide table still fits the available space.
-    let cap = (width / cols).max(6);
-    let mut col_w = vec![0usize; cols];
-    for row in &table.rows {
-        for (i, cell) in row.iter().enumerate() {
-            col_w[i] = col_w[i].max(display_width(cell.trim()).min(cap));
-        }
-    }
+    let col_w = table_column_widths(table, cols, width);
 
     let header_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(Color::Gray);
     let rule_style = Style::default().fg(Color::DarkGray);
     let mut out = vec![Line::from(Span::styled(
         table_rule(&col_w, '┌', '┬', '┐'),
         rule_style,
     ))];
     for (r, row) in table.rows.iter().enumerate() {
-        let mut spans = vec![Span::styled("│ ", rule_style)];
-        for (c, w) in col_w.iter().enumerate() {
-            let raw = row.get(c).map(|s| s.trim()).unwrap_or("");
-            let cell = pad_to(raw, *w, table.alignments.get(c).copied());
-            let style = if r < table.head_rows {
-                header_style
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            spans.push(Span::styled(cell, style));
-            spans.push(Span::styled(" │ ", rule_style));
+        let style = if r < table.head_rows {
+            header_style
+        } else {
+            body_style
+        };
+        let cells: Vec<Vec<String>> = col_w
+            .iter()
+            .enumerate()
+            .map(|(c, w)| wrap_cell(row.get(c).map(|s| s.trim()).unwrap_or(""), *w))
+            .collect();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        for line_index in 0..height {
+            let mut spans = vec![Span::styled("│ ", rule_style)];
+            for (c, w) in col_w.iter().enumerate() {
+                let piece = cells[c].get(line_index).map(String::as_str).unwrap_or("");
+                spans.push(Span::styled(
+                    pad_to(piece, *w, table.alignments.get(c).copied()),
+                    style,
+                ));
+                spans.push(Span::styled(
+                    if c + 1 == cols { " │" } else { " │ " },
+                    rule_style,
+                ));
+            }
+            out.push(Line::from(spans));
         }
-        out.push(Line::from(spans));
         // Header separator rule after the last head row.
         if r + 1 == table.head_rows {
             out.push(Line::from(Span::styled(
@@ -601,6 +610,130 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
         rule_style,
     )));
     out
+}
+
+/// Pick content widths per column. Natural widths (widest cell) are used when
+/// they fit; otherwise the widest columns are capped to a common limit so the
+/// narrow ones keep their natural width. A column never shrinks below
+/// `min(natural, 6)` (and never below its widest single character), so when even
+/// those do not fit the table simply overflows.
+fn table_column_widths(table: &Table, cols: usize, width: usize) -> Vec<usize> {
+    const MIN_COL: usize = 6;
+    let mut natural = vec![0usize; cols];
+    let mut widest_char = vec![1usize; cols];
+    for row in &table.rows {
+        for (i, cell) in row.iter().enumerate() {
+            let cell = cell.trim();
+            natural[i] = natural[i].max(display_width(cell));
+            for ch in cell.chars() {
+                widest_char[i] = widest_char[i].max(char_width(ch));
+            }
+        }
+    }
+    // Row layout: "│ " + cells joined by " │ " + " │" => 3 * cols + 1 border cells.
+    let avail = width.saturating_sub(3 * cols + 1);
+    if natural.iter().sum::<usize>() <= avail {
+        return natural.into_iter().map(|w| w.max(1)).collect();
+    }
+    let floor: Vec<usize> = (0..cols)
+        .map(|i| {
+            natural[i]
+                .min(MIN_COL)
+                .max(widest_char[i])
+                .min(natural[i].max(1))
+        })
+        .collect();
+    let capped = |cap: usize| -> Vec<usize> {
+        (0..cols)
+            .map(|i| natural[i].min(cap).max(floor[i]))
+            .collect()
+    };
+    let mut cap = natural.iter().copied().max().unwrap_or(1);
+    while cap > 0 && capped(cap).iter().sum::<usize>() > avail {
+        cap -= 1;
+    }
+    let mut widths = capped(cap);
+    // Hand out leftover cells (cap steps are whole columns) to still-wrapped
+    // columns, widest natural first.
+    let mut spare = avail.saturating_sub(widths.iter().sum());
+    let mut order: Vec<usize> = (0..cols).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(natural[i]));
+    for i in order {
+        if spare == 0 {
+            break;
+        }
+        if widths[i] < natural[i] {
+            widths[i] += 1;
+            spare -= 1;
+        }
+    }
+    widths
+}
+
+/// Wrap one cell to `width` display cells. Breaks at spaces when possible,
+/// after wide (CJK) characters, and otherwise hard-breaks by display width.
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    // Tokens: (text, preceded_by_space). A token ends at whitespace or right
+    // after a wide character, which may wrap anywhere.
+    let mut tokens: Vec<(String, bool)> = Vec::new();
+    let mut cur = String::new();
+    let mut space_before = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !cur.is_empty() {
+                tokens.push((std::mem::take(&mut cur), space_before));
+            }
+            space_before = true;
+            continue;
+        }
+        cur.push(ch);
+        if char_width(ch) > 1 {
+            tokens.push((std::mem::take(&mut cur), space_before));
+            space_before = false;
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push((cur, space_before));
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut line_w = 0usize;
+    for (token, spaced) in tokens {
+        let token_w = display_width(&token);
+        let gap = usize::from(spaced && !line.is_empty());
+        if !line.is_empty() && line_w + gap + token_w <= width {
+            if gap == 1 {
+                line.push(' ');
+            }
+            line.push_str(&token);
+            line_w += gap + token_w;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line_w = 0;
+        }
+        if token_w <= width {
+            line = token;
+            line_w = token_w;
+            continue;
+        }
+        for ch in token.chars() {
+            let cw = char_width(ch);
+            if line_w + cw > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                line_w = 0;
+            }
+            line.push(ch);
+            line_w += cw;
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> String {
@@ -617,42 +750,18 @@ fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> String
     rule
 }
 
-/// Pad (and, if needed, truncate) `text` to display width `w` with alignment.
+/// Pad `text` (already wrapped to fit) to display width `w` with alignment.
 fn pad_to(text: &str, w: usize, align: Option<pulldown_cmark::Alignment>) -> String {
     use pulldown_cmark::Alignment;
-    let truncated = truncate_to_width(text, w);
-    let pad = w.saturating_sub(display_width(&truncated));
+    let pad = w.saturating_sub(display_width(text));
     match align {
-        Some(Alignment::Right) => format!("{}{}", " ".repeat(pad), truncated),
+        Some(Alignment::Right) => format!("{}{}", " ".repeat(pad), text),
         Some(Alignment::Center) => {
             let left = pad / 2;
-            format!(
-                "{}{}{}",
-                " ".repeat(left),
-                truncated,
-                " ".repeat(pad - left)
-            )
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(pad - left))
         }
-        _ => format!("{}{}", truncated, " ".repeat(pad)),
+        _ => format!("{}{}", text, " ".repeat(pad)),
     }
-}
-
-fn truncate_to_width(text: &str, max: usize) -> String {
-    if display_width(text) <= max {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let cw = char_width(ch);
-        if used + cw > max.saturating_sub(1) {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
-    out
 }
 
 /// Coalesce consecutive same-style units into spans.
@@ -895,6 +1004,75 @@ mod tests {
         assert!(t.iter().any(|l| l.contains('│')));
         assert!(t.iter().any(|l| l.contains('┼')));
         assert!(t.last().is_some_and(|line| line.ends_with('┘')));
+    }
+
+    const MODEL_TABLE: &str = "| 项目 | 内容 |\n|---|---|\n| 内置子代理工具 | gpt-6.1-sol、gpt-6-astra、gpt-6.1-terra、gpt-6-sol、gpt-6-terra、gpt-6.1-astra |\n| 默认模型配置项目 | 继承主代理 |";
+
+    fn line_widths(t: &[String]) -> Vec<usize> {
+        t.iter().map(|l| display_width(l)).collect()
+    }
+
+    #[test]
+    fn wide_table_keeps_natural_widths_without_truncation() {
+        let t = texts(&render(MODEL_TABLE, 110));
+        assert!(t.iter().all(|l| !l.contains('…')), "{t:#?}");
+        assert!(
+            t.iter().any(|l| l.contains(
+                "gpt-6.1-sol、gpt-6-astra、gpt-6.1-terra、gpt-6-sol、gpt-6-terra、gpt-6.1-astra"
+            )),
+            "{t:#?}"
+        );
+        // Column 1 keeps its natural width (widest cell, 16 cells) and the
+        // table is one physical line per row: rule + head + rule + 2 rows + rule.
+        assert_eq!(t.len(), 6, "{t:#?}");
+        let w = line_widths(&t);
+        assert!(w.iter().all(|x| *x == w[0]), "{w:?}");
+        assert!(t[1].starts_with("│ 项目"), "{t:#?}");
+        assert!(
+            t[0].starts_with(&format!("┌{}┬", "─".repeat(16 + 2))),
+            "{t:#?}"
+        );
+    }
+
+    #[test]
+    fn narrow_table_wraps_cells_with_aligned_borders() {
+        let t = texts(&render(MODEL_TABLE, 60));
+        assert!(t.iter().all(|l| !l.contains('…')), "{t:#?}");
+        assert!(t.len() > 6, "{t:#?}");
+        let w = line_widths(&t);
+        assert!(w.iter().all(|x| *x <= 60 && *x == w[0]), "{w:?}\n{t:#?}");
+        for line in &t[1..t.len() - 1] {
+            if !line.starts_with('├') {
+                assert!(line.starts_with('│') && line.ends_with('│'), "{line}");
+            }
+        }
+        // All of the long cell's text survives across the wrapped lines.
+        let joined: String = t
+            .iter()
+            .filter(|l| l.starts_with('│'))
+            .map(|l| l.split('│').nth(2).unwrap_or("").trim().to_string())
+            .collect();
+        assert!(
+            joined.contains(
+                "gpt-6.1-sol、gpt-6-astra、gpt-6.1-terra、gpt-6-sol、gpt-6-terra、gpt-6.1-astra"
+            ),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn fitting_table_uses_natural_widths() {
+        let t = texts(&render("| a | bbb |\n|:-:|--:|\n| 1 | 2 |", 40));
+        assert_eq!(
+            t,
+            [
+                "┌───┬─────┐",
+                "│ a │ bbb │",
+                "├───┼─────┤",
+                "│ 1 │   2 │",
+                "└───┴─────┘",
+            ]
+        );
     }
 
     #[test]
