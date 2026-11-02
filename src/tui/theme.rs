@@ -53,7 +53,7 @@ fn palette() -> Palette {
 fn palette_for(variant: ThemeVariant) -> Palette {
     match variant {
         ThemeVariant::Dark => Palette {
-            accent: Color::Rgb(34, 211, 238),
+            accent: Color::Rgb(141, 127, 192),
             success: Color::Rgb(74, 222, 128),
             warning: Color::Rgb(251, 191, 36),
             error: Color::Rgb(248, 113, 113),
@@ -70,7 +70,7 @@ fn palette_for(variant: ThemeVariant) -> Palette {
             chat_selection_fg: Color::Rgb(244, 244, 245),
         },
         ThemeVariant::Light => Palette {
-            accent: Color::Rgb(14, 116, 144),
+            accent: Color::Rgb(91, 79, 154),
             success: Color::Rgb(22, 101, 52),
             warning: Color::Rgb(146, 64, 14),
             error: Color::Rgb(185, 28, 28),
@@ -257,7 +257,7 @@ pub fn selection() -> Style {
 }
 
 /// Drag-select highlight in the chat column. Neutral zinc, not the accent
-/// cyan used by interactive chrome.
+/// colour used by interactive chrome.
 pub fn chat_selection() -> Style {
     let palette = palette();
     Style::default()
@@ -529,7 +529,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_selection_uses_neutral_zinc_not_accent_cyan() {
+    fn chat_selection_uses_neutral_zinc_not_accent() {
         let dark = palette_for(ThemeVariant::Dark);
         let light = palette_for(ThemeVariant::Light);
         assert_eq!(dark.chat_selection_bg, Color::Rgb(63, 63, 70));
