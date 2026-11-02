@@ -819,7 +819,7 @@ fn user_markdown_keeps_its_structure_on_the_band() {
 }
 
 #[test]
-fn text_stops_at_the_reading_width_while_the_band_spans_the_terminal() {
+fn text_uses_the_full_terminal_width() {
     let long = "word ".repeat(80);
     let state = state_over(
         vec![
@@ -832,19 +832,24 @@ fn text_stops_at_the_reading_width_while_the_band_spans_the_terminal() {
     render_chat_history(&state, 160, 0, &mut lines);
     let text = plain_text(&lines);
 
-    // The band's rows run the full 160 columns, but the text inside wraps by 120.
+    // The band's rows run the full 160 columns, and no row overflows them.
     let band_rows: Vec<&String> = text
         .iter()
         .filter(|row| row.starts_with("  word"))
         .collect();
     assert!(band_rows.iter().any(|row| theme::display_width(row) == 160));
     for row in text.iter().filter(|row| row.contains("word")) {
-        assert!(row.trim_end().chars().count() <= 120, "{row:?}");
+        assert!(theme::display_width(row) <= 160, "{row:?}");
     }
-    // The agent's reply is held to the same width.
-    assert!(text.iter().any(|row| row.trim_end().chars().count() > 100));
+    // Text is no longer held to a 120-column reading width.
+    assert!(
+        text.iter()
+            .filter(|row| row.contains("word"))
+            .any(|row| row.trim_end().chars().count() > 120),
+        "{text:#?}"
+    );
 
-    // On a terminal no wider than the cap nothing changes.
+    // On a narrower terminal nothing overflows either.
     let mut narrow = Vec::new();
     render_chat_history(&state, 100, 0, &mut narrow);
     for row in plain_text(&narrow)

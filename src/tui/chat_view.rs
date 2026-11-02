@@ -295,9 +295,6 @@ fn content_width(width: usize) -> usize {
     width.saturating_sub(INDENT_TEXT.len() + 1).max(1)
 }
 
-/// Widest a transcript row gets: long lines stay readable on wide terminals.
-const MAX_READING_WIDTH: usize = 120;
-
 const QUEUED_PREVIEW_LINE_LIMIT: usize = 3;
 
 fn queued_input_preview_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
@@ -714,7 +711,7 @@ fn render_chunk(
         let text = format!(
             "… {omitted} active output cell(s) omitted by the TUI memory limit; final results will appear on completion"
         );
-        for wrapped in markdown::wrap(&text, content_width(width.min(MAX_READING_WIDTH))) {
+        for wrapped in markdown::wrap(&text, content_width(width)) {
             lines.push(Line::from(Span::styled(
                 format!("{INDENT_TEXT}{wrapped}"),
                 theme::warning_bold(),
@@ -1097,10 +1094,6 @@ fn render_chat_history_range(
     mut live: LiveRender<'_>,
     titles: &mut Vec<(usize, usize)>,
 ) {
-    // Text never wraps wider than the reading width; only the user band
-    // keeps the full terminal width for its background.
-    let full_width = width;
-    let width = width.min(MAX_READING_WIDTH);
     let items = state.chat();
     let start = start.min(items.len());
     let end = end.min(items.len()).max(start);
@@ -1163,7 +1156,7 @@ fn render_chat_history_range(
             render_agent_messages(&run, width, state, out);
             skip_until = run_end + 1;
         } else {
-            render_item_wide(item, width, full_width, state, out, show_sender_header);
+            render_item(item, width, state, out, show_sender_header);
         }
         if is_find_current && let Some(line) = out.get_mut(before) {
             // Marker in column 0, over the first blank column of the row, so
@@ -1292,7 +1285,6 @@ fn render_live_member_activity(
     if state.focus().is_some_and(|focus| focus != member_id) {
         return false;
     }
-    let width = width.min(MAX_READING_WIDTH);
     let Some(member) = state.members().iter().find(|m| &m.id == member_id) else {
         return false;
     };
@@ -2247,10 +2239,8 @@ fn render_user_band(
     body: &str,
     targets: &[MemberId],
     width: usize,
-    full_width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
-    let full_width = full_width.max(width);
     let bg = theme::user_band_bg();
     let band = Style::default().bg(bg);
     // Rows are always padded out to the full terminal width.
@@ -2259,10 +2249,7 @@ fn render_user_band(
             .iter()
             .map(|span| theme::display_width(span.content.as_ref()))
             .sum();
-        spans.push(Span::styled(
-            " ".repeat(full_width.saturating_sub(used)),
-            band,
-        ));
+        spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), band));
         Line::from(spans)
     };
 
@@ -2357,23 +2344,9 @@ fn item_sender(item: &ChatItem) -> Option<ChatSender> {
     }
 }
 
-#[cfg(test)]
 fn render_item(
     item: &ChatItem,
     width: usize,
-    state: &AppState,
-    out: &mut Vec<Line<'static>>,
-    show_sender_header: bool,
-) {
-    render_item_wide(item, width, width, state, out, show_sender_header);
-}
-
-/// `width` is the (capped) text width; `full_width` is the terminal width the
-/// user band's background spans.
-fn render_item_wide(
-    item: &ChatItem,
-    width: usize,
-    full_width: usize,
     state: &AppState,
     out: &mut Vec<Line<'static>>,
     show_sender_header: bool,
@@ -2393,7 +2366,7 @@ fn render_item_wide(
     }
     match item {
         ChatItem::User { body, targets, .. } => {
-            render_user_band(state, body, targets, width, full_width, out);
+            render_user_band(state, body, targets, width, out);
         }
         ChatItem::Agent {
             member,
