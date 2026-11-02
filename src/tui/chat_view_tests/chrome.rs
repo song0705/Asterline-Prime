@@ -915,3 +915,47 @@ fn inline_panel_titles_start_in_the_column_of_their_body() {
         .unwrap();
     assert_eq!(first_column(&rows[title]), 2, "{rows:#?}");
 }
+
+#[test]
+fn user_band_keeps_typed_line_breaks() {
+    let body = "line one\nline two\nline three\n\nnext paragraph";
+    let state = state_over(vec![user(body, &[builder()])], Some(builder()));
+    let mut lines = Vec::new();
+    render_chat_history(&state, 70, 0, &mut lines);
+    let text = plain_text(&lines);
+    for expected in ["line one", "line two", "line three", "next paragraph"] {
+        assert_eq!(
+            text.iter().filter(|row| row.trim() == expected).count(),
+            1,
+            "{expected}: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn notices_wrap_cjk_text_with_kinsoku_and_hang_under_the_text() {
+    let notice = "这是一条很长的中文提示信息，需要在窄屏幕上换行显示。".to_string();
+    let state = AppState::new(vec![ChatItem::Notice {
+        member: None,
+        text: notice.clone(),
+    }]);
+    let mut lines = Vec::new();
+    render_chat_history(&state, 24, 0, &mut lines);
+    let text = plain_text(&lines);
+    let rows: Vec<&String> = text.iter().filter(|row| !row.trim().is_empty()).collect();
+    assert!(rows.len() >= 2, "{text:?}");
+    assert!(rows[0].starts_with("  • "), "{text:?}");
+    for row in &rows[1..] {
+        assert!(row.starts_with("    "), "{text:?}");
+        let first = row.trim_start().chars().next().unwrap();
+        assert!(!"。，、；：！？）」』”’》".contains(first), "{text:?}");
+    }
+    for row in &rows {
+        assert!(theme::display_width(row) <= 24, "{text:?}");
+    }
+    let joined: String = rows
+        .iter()
+        .map(|r| r.trim_start_matches([' ', '•']))
+        .collect();
+    assert_eq!(joined.replace(' ', ""), notice);
+}

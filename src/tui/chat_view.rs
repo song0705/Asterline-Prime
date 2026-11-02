@@ -2300,7 +2300,7 @@ fn render_user_band(
     // visibly distinct.
     let body = state.displayed_user_body(body, targets);
     let wrap_width = width.saturating_sub(2 * INDENT_TEXT.len()).max(1);
-    let rendered = markdown::render(&body, wrap_width);
+    let rendered = markdown::render_user(&body, wrap_width);
     if rendered.is_empty() {
         out.push(pad_row(vec![Span::styled(INDENT_TEXT, band)]));
     }

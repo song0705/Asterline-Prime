@@ -318,8 +318,13 @@ fn strip_leading_label(headline: &str, label: &str) -> Option<String> {
 /// Title row: `read  tui/chat_view.rs:800` instead of a JSON blob.
 pub(crate) fn tool_headline(name: &str, summary: &str, detail: &str) -> String {
     let name = name.trim();
-    let from_summary = friendly_tool_text(summary);
-    let from_detail = friendly_tool_text(detail);
+    let friendly: fn(&str) -> String = if tool_kind(name) == "Shell" {
+        friendly_shell_text
+    } else {
+        friendly_tool_text
+    };
+    let from_summary = friendly(summary);
+    let from_detail = friendly(detail);
     let hint = if is_useful_hint(name, &from_summary) {
         from_summary
     } else {
@@ -840,15 +845,150 @@ fn tool_brief_lines(value: &Value) -> String {
 
 fn shorten_loose_paths(text: &str) -> String {
     text.split_whitespace()
-        .map(|token| {
-            if token.starts_with('/') || token.starts_with("~/") {
-                crate::adapter::parser::tool_brief(&Value::String(token.to_string()))
-            } else {
+        .map(shorten_path_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shorten_path_token(token: &str) -> String {
+    if token.starts_with('/') || token.starts_with("~/") {
+        tool_brief(&Value::String(token.to_string()))
+    } else {
+        token.to_string()
+    }
+}
+
+/// Row text for a shell tool: the command itself, without the `zsh -lc '...'`
+/// wrapper some backends run it through.
+fn friendly_shell_text(raw: &str) -> String {
+    let trimmed = strip_input_label(raw.trim());
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some((_, value, _)) = split_json_payload(trimmed) else {
+        return display_shell_command(trimmed, true);
+    };
+    let brief = tool_brief(&value);
+    let command = value.as_object().and_then(|map| {
+        ["command", "cmd", "command_line"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+    });
+    if let Some(command) = command {
+        let flat = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(tail) = brief.strip_prefix(&flat) {
+            return format!("{}{tail}", display_shell_command(command, false));
+        }
+    }
+    brief
+}
+
+/// One display line for a shell command: wrapper removed, first line only
+/// (`…` marks further lines). The program name is never path-shortened; with
+/// `shorten_args`, absolute paths among the arguments are.
+fn display_shell_command(text: &str, shorten_args: bool) -> String {
+    let text = text.trim();
+    let command = unwrap_shell_wrapper(text).unwrap_or_else(|| text.to_string());
+    let mut lines = command.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    let more = lines.next().is_some();
+    let mut out = first
+        .split_whitespace()
+        .enumerate()
+        .map(|(i, token)| {
+            if i == 0 || !shorten_args {
                 token.to_string()
+            } else {
+                shorten_path_token(token)
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if more {
+        out.push_str(" …");
+    }
+    out
+}
+
+/// `/usr/bin/zsh -lc 'cat a.txt'` -> `cat a.txt`. Recognizes
+/// `<path>/{bash,zsh,sh,fish,dash}` followed by option flags ending in `-c`
+/// (`-c`, `-lc`, `-ic`, `--login -c`, ...) and one quoted script. Returns
+/// `None` when the text is not such a wrapper. A script cut off by a summary
+/// limit (missing closing quote) is accepted as is.
+fn unwrap_shell_wrapper(text: &str) -> Option<String> {
+    let mut rest = text.trim_start();
+    let (program, after) = rest.split_once(char::is_whitespace)?;
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(basename, "bash" | "zsh" | "sh" | "fish" | "dash") {
+        return None;
+    }
+    rest = after.trim_start();
+    loop {
+        let (flag, after) = rest.split_once(char::is_whitespace)?;
+        rest = after.trim_start();
+        match flag {
+            "--login" | "--noprofile" | "--norc" | "--interactive" => continue,
+            _ => {}
+        }
+        let letters = flag.strip_prefix('-')?;
+        if letters.is_empty() || !letters.chars().all(|c| matches!(c, 'l' | 'i' | 'c' | 'e')) {
+            return None;
+        }
+        if letters.contains('c') {
+            break;
+        }
+    }
+    parse_shell_word(rest)
+}
+
+/// Parse exactly one shell word that contains quoting (single quotes with the
+/// `'\''` idiom, double quotes, backslash escapes). `None` if the word is
+/// unquoted or if anything follows it.
+fn parse_shell_word(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                // Extra arguments after the script: not a plain wrapper.
+                return None;
+            }
+            '\'' => {
+                quoted = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    out.push(c);
+                }
+            }
+            '"' => {
+                quoted = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.peek().copied() {
+                            Some(n @ ('"' | '\\' | '$' | '`')) => {
+                                out.push(n);
+                                chars.next();
+                            }
+                            _ => out.push('\\'),
+                        },
+                        c => out.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                quoted = true;
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    quoted.then_some(out)
 }
 
 #[cfg(test)]
@@ -1064,5 +1204,86 @@ mod tests {
         assert!(preview.contains("assertion"), "{preview}");
         assert!(!preview.contains("large snapshot"), "{preview}");
         assert!(preview.lines().count() <= 3, "{preview}");
+    }
+
+    #[test]
+    fn shell_rows_unwrap_the_shell_wrapper() {
+        let command = "/usr/bin/zsh -lc 'cat openai-docs/SKILL.md'";
+        for name in ["shell", "Bash", "run_command", "execute"] {
+            assert_eq!(
+                tool_target(name, command, ""),
+                "cat openai-docs/SKILL.md",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            tool_target(
+                "shell",
+                "",
+                "/bin/bash --login -c \"echo \\\"hi\\\" there\""
+            ),
+            "echo \"hi\" there"
+        );
+        assert_eq!(
+            tool_target("shell", "sh -c 'echo it'\\''s ok'", ""),
+            "echo it's ok"
+        );
+        assert_eq!(
+            tool_target("shell", "/usr/bin/fish -ic 'ls -la'", ""),
+            "ls -la"
+        );
+        // A summary clipped before the closing quote still unwraps.
+        assert_eq!(
+            tool_target("shell", "/usr/bin/zsh -lc 'cat very/long/pa…", ""),
+            "cat very/long/pa…"
+        );
+        // JSON input from other backends unwraps too, and is not path-shortened.
+        assert_eq!(
+            tool_target(
+                "Bash",
+                "",
+                r#"{"command":"/bin/bash -lc 'cargo test /tmp/some/where'"}"#
+            ),
+            "cargo test /tmp/some/where"
+        );
+    }
+
+    #[test]
+    fn shell_rows_keep_the_program_path_and_non_wrappers_intact() {
+        assert_eq!(
+            tool_target("shell", "/usr/local/bin/cargo test", ""),
+            "/usr/local/bin/cargo test"
+        );
+        assert_eq!(
+            tool_target("shell", "cat /Users/me/src/tui/chat_view.rs", ""),
+            "cat tui/chat_view.rs"
+        );
+        // Extra arguments after the script, or an unquoted script: not a wrapper.
+        assert_eq!(
+            tool_target("shell", "bash -c 'echo a' _ b", ""),
+            "bash -c 'echo a' _ b"
+        );
+        assert_eq!(tool_target("shell", "/bin/sh -c ls", ""), "/bin/sh -c ls");
+        // Other tools still shorten a leading path.
+        assert_eq!(
+            tool_target("Read", "/Users/me/src/tui/chat_view.rs", ""),
+            "tui/chat_view.rs"
+        );
+    }
+
+    #[test]
+    fn multi_line_shell_commands_show_the_first_line_and_an_ellipsis() {
+        assert_eq!(
+            tool_target(
+                "Bash",
+                "",
+                "{\"command\":\"echo one\\necho two\\necho three\"}"
+            ),
+            "echo one …"
+        );
+        assert_eq!(
+            display_shell_command("/bin/zsh -lc 'git add .\ngit commit'", true),
+            "git add . …"
+        );
     }
 }

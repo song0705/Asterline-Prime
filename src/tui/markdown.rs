@@ -38,15 +38,28 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
 
 const MD_CACHE_CAP: usize = 128;
 
+/// Rendered lines keyed by (text hash, whether typed line breaks are kept).
+type RenderMap = HashMap<(u64, bool), Vec<Line<'static>>>;
+
 thread_local! {
-    static RENDER_CACHE: RefCell<(usize, HashMap<u64, Vec<Line<'static>>>)> =
+    static RENDER_CACHE: RefCell<(usize, RenderMap)> =
         RefCell::new((0, HashMap::new()));
 }
 
 /// Render Markdown `text` to styled lines wrapped to `width`.
 pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_cached(text, width, false)
+}
+
+/// Render a user's own prompt: Markdown as in [`render`], except that every
+/// line break the user typed is kept instead of being joined into one line.
+pub(crate) fn render_user(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_cached(text, width, true)
+}
+
+fn render_cached(text: &str, width: usize, keep_line_breaks: bool) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let key = fnv1a64(text.as_bytes());
+    let key = (fnv1a64(text.as_bytes()), keep_line_breaks);
     RENDER_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
         if cache.0 != width {
@@ -56,7 +69,7 @@ pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         if let Some(hit) = cache.1.get(&key) {
             return hit.clone();
         }
-        let lines = render_uncached(text, width);
+        let lines = render_uncached(text, width, keep_line_breaks);
         if cache.1.len() >= MD_CACHE_CAP {
             cache.1.clear();
         }
@@ -74,8 +87,9 @@ fn parser_options() -> Options {
     options
 }
 
-fn render_uncached(text: &str, width: usize) -> Vec<Line<'static>> {
+fn render_uncached(text: &str, width: usize, keep_line_breaks: bool) -> Vec<Line<'static>> {
     let mut renderer = Renderer::new(width);
+    renderer.keep_line_breaks = keep_line_breaks;
     let prepared = fix_cjk_emphasis(text);
     for event in Parser::new_ext(&prepared, parser_options()) {
         renderer.handle(event);
@@ -360,6 +374,8 @@ struct Renderer {
     /// Pulldown may split malformed emphasis markers into one-character text
     /// events; coalesce adjacent equal-style text before tolerant recovery.
     normal_text: Option<(String, Style)>,
+    /// Treat a soft line break in prose as a hard one (user prompts).
+    keep_line_breaks: bool,
 }
 
 impl Renderer {
@@ -382,6 +398,7 @@ impl Renderer {
             quote_has_content: false,
             pending_prefix: None,
             normal_text: None,
+            keep_line_breaks: false,
         }
     }
 
@@ -413,6 +430,9 @@ impl Renderer {
             }
             // In prose a soft break is a newline unit: the wrapper turns it
             // into a space, or into nothing between two CJK characters.
+            Event::SoftBreak if self.keep_line_breaks && matches!(self.mode, Mode::Normal) => {
+                self.flush_block();
+            }
             Event::SoftBreak => {
                 let soft = if matches!(self.mode, Mode::Normal) {
                     "\n"
@@ -1283,24 +1303,50 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-/// Width-aware word wrap for plain (unstyled) text, preserving blank lines.
-/// Shared with the non-markdown chat cells.
+/// Width-aware wrap for plain (unstyled) text, preserving blank lines. Shared
+/// with the non-markdown chat cells. It uses the same CJK-aware wrapper as
+/// markdown prose: lines break at spaces and between CJK characters (with
+/// line-start / line-end punctuation rules), and English words and URLs stay
+/// whole unless longer than the line. A raw line that already fits is kept
+/// verbatim (apart from trailing whitespace), so aligned output survives; the
+/// leading indentation of a wrapped line stays on its first row.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let options = textwrap::Options::new(width)
-        .break_words(true)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation);
     let mut out = Vec::new();
     for raw in text.split('\n') {
-        if raw.trim().is_empty() {
+        let trimmed = raw.trim_end();
+        if trimmed.is_empty() {
             out.push(String::new());
+        } else if display_width(trimmed) <= width {
+            out.push(trimmed.to_string());
         } else {
-            for line in textwrap::wrap(raw, &options) {
-                out.push(line.into_owned());
-            }
+            wrap_plain_line(trimmed, width, &mut out);
         }
     }
     out
+}
+
+fn wrap_plain_line(line: &str, width: usize, out: &mut Vec<String>) {
+    let content = line.trim_start();
+    let indent = &line[..line.len() - content.len()];
+    let units: Vec<Unit> = content.chars().map(|c| (c, Style::default())).collect();
+    let mut rows = wrap_units(&units, width);
+    let indent_width = display_width(indent);
+    if indent_width > 0 && indent_width < width {
+        let first_width: usize = rows
+            .first()
+            .map_or(0, |r| r.iter().map(|(c, _)| char_width(*c)).sum());
+        if indent_width + first_width > width {
+            rows = wrap_units(&units, width - indent_width);
+        }
+        if let Some(first) = rows.first_mut() {
+            first.splice(0..0, indent.chars().map(|c| (c, Style::default())));
+        }
+    }
+    out.extend(
+        rows.into_iter()
+            .map(|row| row.into_iter().map(|(c, _)| c).collect::<String>()),
+    );
 }
 
 #[cfg(test)]
@@ -1939,5 +1985,78 @@ mod tests {
             find_span(&lines, "https://a.io/p").content.as_ref(),
             "https://a.io/p"
         );
+    }
+
+    #[test]
+    fn user_render_keeps_typed_line_breaks_but_agent_render_joins_them() {
+        let text = "first line\nsecond line\n\nnew paragraph\n- one\n- two\n\n```\na\nb\n```";
+        let user = texts(&render_user(text, 40));
+        assert_eq!(user[0], "first line");
+        assert_eq!(user[1], "second line");
+        assert!(user.iter().any(|l| l == "new paragraph"), "{user:?}");
+        assert!(user.iter().any(|l| l.contains("• one")), "{user:?}");
+        assert!(user.iter().any(|l| l.contains("• two")), "{user:?}");
+        let code: Vec<_> = user
+            .iter()
+            .filter(|l| l.trim() == "a" || l.trim() == "b")
+            .collect();
+        assert_eq!(code.len(), 2, "{user:?}");
+        // CJK lines stay separate too, and the plain render is unaffected
+        // (the cache must not mix the two).
+        assert_eq!(texts(&render_user("你好\n世界", 40)), vec!["你好", "世界"]);
+        assert_eq!(
+            texts(&render("first line\nsecond line", 40)),
+            vec!["first line second line"]
+        );
+        assert_eq!(texts(&render("你好\n世界", 40)), vec!["你好世界"]);
+        assert_eq!(texts(&render_user("a\nb", 40)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn user_render_keeps_line_breaks_inside_list_items_aligned() {
+        let t = texts(&render_user("- one\n  two\n- three", 40));
+        assert_eq!(t, vec!["• one", "  two", "• three"]);
+    }
+
+    #[test]
+    fn plain_wrap_breaks_between_cjk_characters_and_follows_kinsoku() {
+        let text = "这是一个很长的中文句子，包含标点。还有更多内容！";
+        for width in 6..=14 {
+            let lines = wrap(text, width);
+            assert!(lines.iter().all(|l| display_width(l) <= width), "{lines:?}");
+            assert_eq!(lines.concat(), text);
+            for line in &lines {
+                assert!(
+                    !no_line_start(line.chars().next().unwrap()),
+                    "w{width}: {lines:?}"
+                );
+                assert!(
+                    !no_line_end(line.chars().last().unwrap()),
+                    "w{width}: {lines:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_wrap_keeps_words_and_urls_whole() {
+        assert_eq!(
+            wrap("see https://example.com/a/b ok", 27),
+            vec!["see https://example.com/a/b", "ok"]
+        );
+        assert_eq!(
+            wrap("go https://example.com/a/b", 20),
+            vec!["go", "https://example.com/", "a/b"]
+        );
+    }
+
+    #[test]
+    fn plain_wrap_preserves_blank_lines_indentation_and_fitting_lines() {
+        assert_eq!(wrap("a\n\n  b", 10), vec!["a", "", "  b"]);
+        assert_eq!(wrap("col1   col2", 20), vec!["col1   col2"]);
+        let lines = wrap("    indented words that wrap", 14);
+        assert_eq!(lines[0], "    indented");
+        assert!(lines.iter().all(|l| display_width(l) <= 14), "{lines:?}");
+        assert_eq!(wrap("xxxxxxxxxx", 4), vec!["xxxx", "xxxx", "xx"]);
     }
 }
