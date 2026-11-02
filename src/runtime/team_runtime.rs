@@ -21,7 +21,7 @@ use crate::adapter::parser::{
 use crate::domain::config::{
     ASTERLINE_BRAINSTORM_SKILL_NAME, MAIN_MEMBER_ID, brainstorm_skill_text,
     inject_team_protocol_with, replace_model_style_name, strip_team_protocol, strip_team_protocols,
-    sub_agent_member, team_skill_hint,
+    sub_agent_member, team_protocol_text, team_skill_hint,
 };
 use crate::domain::event::{
     AgentEvent, AgentSessionId, ApprovalDecision, ApprovalId, ChatItem, CloseRequest,
@@ -252,6 +252,13 @@ pub struct TeamRuntime {
     /// were busy when the model list changed; refreshed when their next run
     /// starts.
     protocol_stale: HashSet<MemberId>,
+    /// Where the live model list is written (`<asterline home>/skills/models.md`).
+    models_path: PathBuf,
+    /// The team instructions each member's native session was last given in
+    /// this app run (at thread start or by a note), for backends that fix
+    /// them when a session starts. Empty after launch: a resumed session's
+    /// instructions are unknown until the first prompt tells it.
+    session_protocols: HashMap<MemberId, String>,
     /// Sub-agents being removed that still have a run winding down; each is
     /// taken off the roster when that run exits.
     closing: HashMap<MemberId, CloseOrigin>,
@@ -369,6 +376,8 @@ impl TeamRuntime {
             goal_turns: HashMap::new(),
             models: ModelDirectory::default(),
             protocol_stale: HashSet::new(),
+            models_path: state_paths::models_path(),
+            session_protocols: HashMap::new(),
             closing: HashMap::new(),
         };
         let mut runtime = runtime;
@@ -1482,6 +1491,41 @@ impl TeamRuntime {
         }
     }
 
+    /// For a backend that fixes its instructions when a native session starts
+    /// (Codex), `prompt` with the current team instructions in front of it
+    /// when it resumes a session that has not been given them in this app run
+    /// (the first prompt after launch) or was given different ones (the model
+    /// list or roster changed since). A new session starts with the current
+    /// instructions and needs no note.
+    fn prompt_with_protocol_note(
+        &mut self,
+        member: &MemberId,
+        resuming: bool,
+        prompt: String,
+    ) -> String {
+        if !backend_fixes_protocol_at_start(self.member_backend(member)) {
+            self.session_protocols.remove(member);
+            return prompt;
+        }
+        let Some(protocol) = self
+            .config
+            .member(member)
+            .and_then(|entry| entry.system_prompt.as_deref())
+            .and_then(team_protocol_text)
+            .map(str::to_string)
+        else {
+            return prompt;
+        };
+        let known = self.session_protocols.get(member) == Some(&protocol);
+        self.session_protocols
+            .insert(member.clone(), protocol.clone());
+        if resuming && !known {
+            context_recap::with_protocol_note(&protocol, &prompt)
+        } else {
+            prompt
+        }
+    }
+
     fn report_store_error(&self, context: &str, err: rusqlite::Error, step: &mut RuntimeStep) {
         step.events
             .push(RuntimeEvent::Notice(format!("could not {context}: {err}")));
@@ -1524,6 +1568,7 @@ impl TeamRuntime {
             return;
         }
         self.models = models;
+        self.write_models_file(step);
         let mut next = self.config.clone();
         inject_team_protocol_with(&mut next, &self.models);
         let changed: Vec<MemberId> = next
@@ -1553,6 +1598,20 @@ impl TeamRuntime {
             } else {
                 self.push_runner_upsert(&id, step);
             }
+        }
+    }
+
+    /// Rewrite the model list file for the current directory. Nothing is
+    /// written while no catalog is known, and an unchanged list is left alone.
+    fn write_models_file(&self, step: &mut RuntimeStep) {
+        let Some(text) = self.models.models_file() else {
+            return;
+        };
+        match state_paths::write_state_file(&self.models_path, "model list", &text) {
+            Ok(_) => state_paths::remove_legacy_models_file(),
+            Err(err) => step.events.push(RuntimeEvent::Notice(format!(
+                "could not update the model list: {err}"
+            ))),
         }
     }
 
@@ -3540,6 +3599,7 @@ impl TeamRuntime {
         }
         let prompt = normalize_backend_command(self.member_backend(member), prompt);
         let prompt = self.prompt_with_recap(member, turn, prompt, step);
+        let prompt = self.prompt_with_protocol_note(member, session.is_some(), prompt);
         step.actions.push(RunAction {
             member: member.clone(),
             prompt,
@@ -3917,6 +3977,16 @@ fn strip_routing_prefix(prompt: &str) -> String {
 /// Do not rewrite a member's text based only on its first character. Native
 /// controls and skills have different grammars; the TUI inserts an exact skill
 /// invocation (for example `$review` for Codex) when it knows one.
+/// Whether the backend gives its instructions to a native session only when
+/// the session starts, so a resumed session keeps the old text. Codex's app
+/// server sends `developerInstructions` at `thread/start`, and a thread it
+/// resumes (or already has open) keeps its original ones. Claude passes
+/// `--append-system-prompt` on every run, Agy puts the instructions in every
+/// prompt, and Grok sends its rules with every `session/load`.
+fn backend_fixes_protocol_at_start(backend: BackendKind) -> bool {
+    matches!(backend, BackendKind::Codex)
+}
+
 fn normalize_backend_command(_backend: BackendKind, prompt: String) -> String {
     prompt
 }

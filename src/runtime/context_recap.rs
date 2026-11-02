@@ -49,8 +49,33 @@ impl Recap {
     }
 }
 
-/// The message a prompt carries, without a recap in front of it.
+/// First lines of the note that gives a resumed native session the current
+/// team instructions.
+pub const PROTOCOL_NOTE_HEADER: &str =
+    "[system message from Asterline]\nCurrent Asterline team instructions for this session:";
+/// Last line of that note; the message follows it.
+pub const PROTOCOL_NOTE_FOOTER: &str =
+    "--- End of the current instructions. The message follows. ---";
+
+/// `prompt` with the team-instructions note in front of it.
+pub fn with_protocol_note(protocol: &str, prompt: &str) -> String {
+    format!("{PROTOCOL_NOTE_HEADER}\n{protocol}\n{PROTOCOL_NOTE_FOOTER}\n\n{prompt}")
+}
+
+/// The prompt without the team-instructions note in front of it.
+pub fn without_protocol_note(prompt: &str) -> &str {
+    if prompt.starts_with(PROTOCOL_NOTE_HEADER)
+        && let Some((_, rest)) = prompt.split_once(PROTOCOL_NOTE_FOOTER)
+    {
+        return rest.trim_start_matches('\n');
+    }
+    prompt
+}
+
+/// The message a prompt carries, without an instructions note or a
+/// recap in front of it.
 pub fn without_recap(prompt: &str) -> &str {
+    let prompt = without_protocol_note(prompt);
     if prompt.starts_with(RECAP_HEADER)
         && let Some((_, message)) = prompt.split_once(RECAP_FOOTER)
     {

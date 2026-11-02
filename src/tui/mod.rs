@@ -156,6 +156,7 @@ pub fn run(
     mut state: AppState,
 ) -> io::Result<()> {
     enable_tui_colors();
+    state.use_model_cache(crate::state_paths::models_cache_path());
     let _paste_cleanup = clipboard_image::PasteCleanup::enter();
     let mut restore = TerminalRestore::default();
     let term_program = std::env::var("TERM_PROGRAM").ok();
@@ -292,6 +293,7 @@ fn run_loop(
                 }
             }
         }
+        state.persist_model_cache();
         if let Some(member) = state.take_attach_release_pending()
             && !handle.finish_attach(member, Vec::new())
         {

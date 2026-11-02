@@ -140,7 +140,8 @@ Asterline 不代替各提供商的认证、计费、模型授权或用量限制�
 
 ```text
 ~/.asterline/
-├── skills/                      共享的 Asterline skill
+├── skills/                      共享的 Asterline skill + models.md（agent 可读的模型列表）
+├── models.json                  模型列表（启动缓存）
 └── projects/<工作区 key>/
     ├── team.json
     ├── roster.md

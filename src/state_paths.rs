@@ -7,6 +7,8 @@
 //! ~/.asterline/
 //!   skills/asterline-team/SKILL.md        shared by every project
 //!   skills/asterline-brainstorm/SKILL.md
+//!   skills/models.md                      models @@spawn accepts, kept current
+//!   models.json                           model list cache, loaded first at launch
 //!   projects/<key>/                       one directory per workspace
 //!     asterline.sqlite3 (+ .lock, -wal, -shm)
 //!     team.json  roster.md  agy/
@@ -36,6 +38,8 @@ const MAX_KEY_LEN: usize = 200;
 pub const DB_FILE: &str = "asterline.sqlite3";
 pub const TEAM_FILE: &str = "team.json";
 pub const ROSTER_FILE: &str = "roster.md";
+pub const MODELS_FILE: &str = "models.md";
+pub const MODELS_CACHE_FILE: &str = "models.json";
 
 /// The Asterline home directory. Not created here.
 ///
@@ -65,6 +69,28 @@ fn home_from_values(override_home: Option<OsString>, user_home: Option<PathBuf>)
 /// `<home>/skills`, where the shared Asterline skills are installed.
 pub fn skills_dir() -> PathBuf {
     asterline_home().join("skills")
+}
+
+/// `<home>/skills/models.md`: the models each installed backend offers,
+/// rewritten whenever Asterline learns a new list. It sits in the skills
+/// directory because every backend is already allowed to read that.
+pub fn models_path() -> PathBuf {
+    skills_dir().join(MODELS_FILE)
+}
+
+/// Remove the `<home>/models.md` that earlier versions wrote (only that exact
+/// regular file; a symlink or directory of that name is left alone).
+pub fn remove_legacy_models_file() {
+    let legacy = asterline_home().join(MODELS_FILE);
+    if fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.file_type().is_file()) {
+        let _ = fs::remove_file(legacy);
+    }
+}
+
+/// `<home>/models.json`: the model list as of the last discovery, read first
+/// at launch so the model pickers need not wait for the CLIs.
+pub fn models_cache_path() -> PathBuf {
+    asterline_home().join(MODELS_CACHE_FILE)
 }
 
 /// `<home>/projects/<key>` for `workspace`. Not created here.
@@ -108,6 +134,30 @@ pub fn ensure_project_dir(workspace: &Path) -> io::Result<PathBuf> {
 pub fn ensure_skills_root() -> io::Result<PathBuf> {
     let home = ensure_home()?;
     fs_safety::ensure_workspace_directory(&home, &["skills"], true)
+}
+
+/// Replace the file at `path` (a direct child of the home or of its skills
+/// directory, such as [`models_path`]) with `contents`, atomically: a reader sees the old or the
+/// new file, never half of one. Returns whether the file changed; identical
+/// contents are left untouched.
+pub fn write_state_file(path: &Path, label: &str, contents: &str) -> io::Result<bool> {
+    if let Ok(existing) = fs_safety::read_regular_to_string(path, label)
+        && existing == contents
+    {
+        return Ok(false);
+    }
+    match path.parent() {
+        Some(parent) if parent == asterline_home() => {
+            ensure_home()?;
+        }
+        Some(parent) if parent == skills_dir() => {
+            ensure_skills_root()?;
+        }
+        Some(parent) => fs::create_dir_all(parent)?,
+        None => {}
+    }
+    fs_safety::write_regular_file_atomic(path, label, contents)?;
+    Ok(true)
 }
 
 /// Create the home directory with mode 0700 when it does not exist yet. An
@@ -280,7 +330,21 @@ mod tests {
         assert_eq!(team_config_path(workspace), dir.join("team.json"));
         assert_eq!(roster_path(workspace), dir.join("roster.md"));
         assert_eq!(agy_log_dir(workspace), dir.join("agy"));
+        assert_eq!(models_path(), skills_dir().join("models.md"));
+        assert_eq!(models_path().parent().unwrap(), skills_dir());
         assert!(!dir.starts_with(workspace));
+    }
+
+    #[test]
+    fn model_list_is_written_into_the_skills_dir_and_the_old_file_is_removed() {
+        let home = ensure_home().unwrap();
+        let legacy = home.join("models.md");
+        fs::write(&legacy, "old").unwrap();
+        assert!(write_state_file(&models_path(), "model list", "new").unwrap());
+        assert_eq!(fs::read_to_string(models_path()).unwrap(), "new");
+        remove_legacy_models_file();
+        assert!(!legacy.exists());
+        assert!(models_path().is_file());
     }
 
     #[cfg(unix)]

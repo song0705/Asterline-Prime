@@ -347,7 +347,9 @@ Asterline 不会往项目目录里写任何东西。它的文件都放在 Asterl
 ~/.asterline/
 ├── skills/
 │   ├── asterline-team/SKILL.md
-│   └── asterline-brainstorm/SKILL.md
+│   ├── asterline-brainstorm/SKILL.md
+│   └── models.md            @@spawn 可用的模型，供 agent 阅读
+├── models.json              同一份模型列表的缓存，启动时最先读取
 └── projects/<工作区 key>/
     ├── team.json
     ├── roster.md
@@ -362,6 +364,12 @@ SHA-256 的前 8 位十六进制，因此不同目录不会共用同一个 key�
 
 Claude、Grok 和 Agy 启动时会带上 `--add-dir`，指向 `~/.asterline/skills` 和该项目的状态
 目录，以便读取 team skill 和 roster。
+
+`models.json` 是上一次探测到的模型列表（带版本号，原子写入）。Asterline 启动时最先读它，
+因此模型选择器、`/team` 编辑器和交给 agent 的列表无需等待任何 CLI 就能使用；随后在后台重新
+探测，只有结果不同才重写该文件。文件缺失、损坏或版本过旧时会被忽略。`skills/models.md` 是同一份
+列表的 agent 可读版本：每个已安装后端的精确模型 id、显示名和允许的 effort。每位主 agent 的
+指令里都写有它的路径，列表变化时 Asterline 会重写它。
 
 **迁移旧状态。** 旧版本把这些数据放在 `<workspace>/.asterline/`，并在项目里生成
 `.agents/skills/asterline-team/` 与 `.agents/skills/asterline-brainstorm/`。在某个 workspace

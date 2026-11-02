@@ -2068,3 +2068,197 @@ fn the_protocol_text_documents_close_for_parents_only() {
         .unwrap();
     assert!(!child_prompt.contains("@@close"));
 }
+
+// ---- model list file and the instructions a resumed session is given ----
+
+fn models_test_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("asterline-models-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir.join("models.md")
+}
+
+fn leftover_temp_files(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        })
+        .count()
+}
+
+#[test]
+fn the_model_list_file_follows_the_directory() {
+    let mut rt = spawn_runtime();
+    let path = models_test_path("follows");
+    rt.models_path = path.clone();
+
+    // Nothing is known yet: nothing is written.
+    rt.on_ui_command(UiCommand::SetModelDirectory(
+        crate::domain::model_directory::ModelDirectory::default(),
+    ));
+    assert!(!path.exists());
+
+    let step = rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Notice(_)))
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text, model_directory().models_file().unwrap());
+    assert!(text.starts_with("# Models Asterline can open with @@spawn"));
+    assert!(
+        text.contains("`gpt-6-astra` — GPT-6-Astra; efforts: low, medium, high, xhigh, max, ultra")
+    );
+    assert!(text.contains(
+        "\"backend\", \"model\", and \"effort\" are optional and default to the parent's"
+    ));
+    // Backends in a fixed order, models in catalog order.
+    let codex = text.find("## codex").unwrap();
+    let claude = text.find("## claude").unwrap();
+    assert!(codex < claude);
+    assert!(text.find("`gpt-6.1-sol`").unwrap() < text.find("`gpt-6-astra`").unwrap());
+    assert!(!text.contains("## grok"), "not installed");
+    assert_eq!(leftover_temp_files(&path), 0);
+
+    // The same list again leaves the file untouched.
+    std::fs::write(&path, "sentinel").unwrap();
+    rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
+
+    // A changed list rewrites it in full, again without stray files.
+    let mut changed = model_directory();
+    changed.catalogs[1].1.push(model("haiku", "Haiku", &TO_MAX));
+    rt.on_ui_command(UiCommand::SetModelDirectory(changed.clone()));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text, changed.models_file().unwrap());
+    assert!(text.contains("`haiku` — Haiku"));
+    assert_eq!(leftover_temp_files(&path), 0);
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+#[test]
+fn the_protocol_points_top_level_members_to_the_model_list() {
+    let mut rt = spawn_runtime();
+    rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    let main_prompt = rt
+        .config
+        .member(&main_id())
+        .unwrap()
+        .system_prompt
+        .clone()
+        .unwrap();
+    let line = format!(
+        "The current model list is kept in {}; read it when you need a model not listed here.",
+        crate::state_paths::models_path().display()
+    );
+    assert!(main_prompt.contains(&line), "{main_prompt}");
+    assert!(
+        main_prompt.contains("Do not use your CLI's own built-in sub-agent or multi-agent tool")
+    );
+    assert!(
+        main_prompt.contains("Models you can use in @@spawn"),
+        "inline list stays"
+    );
+
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let child = rt.config.member(&id("reviewer")).unwrap();
+    assert!(
+        !child
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("model list")
+    );
+}
+
+/// A Codex `main` carrying the team instructions, as in the app.
+fn codex_runtime() -> TeamRuntime {
+    let mut config = TeamConfig::new("codex", "/tmp/ws").with_member(TeamMember::new(
+        "main",
+        "Main",
+        BackendKind::Codex,
+        "general",
+    ));
+    config.default_target = Some(DefaultTarget::Member(main_id()));
+    crate::domain::config::inject_team_protocol(&mut config);
+    TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false)
+}
+
+fn send(rt: &mut TeamRuntime, text: &str) -> String {
+    let step = rt.on_ui_command(user(text));
+    step.actions[0].prompt.clone()
+}
+
+fn finish(rt: &mut TeamRuntime, session: Option<&str>) {
+    if let Some(session) = session {
+        rt.on_agent_event(
+            &main_id(),
+            AgentEvent::SessionDiscovered(AgentSessionId(session.to_string())),
+        );
+    }
+    complete_ok(rt, &main_id(), "ok");
+}
+
+fn has_note(prompt: &str) -> bool {
+    prompt.starts_with(crate::runtime::context_recap::PROTOCOL_NOTE_HEADER)
+}
+
+#[test]
+fn a_resumed_codex_session_is_given_the_instructions_once() {
+    let mut rt = codex_runtime();
+    // A thread saved by an earlier run of Asterline.
+    rt.sessions
+        .set_external(main_id(), AgentSessionId("old-thread".to_string()), 0);
+
+    let first = send(&mut rt, "hello");
+    assert!(has_note(&first), "{first}");
+    assert!(first.starts_with(
+        "[system message from Asterline]\nCurrent Asterline team instructions for this session:\nYou are \"main\""
+    ));
+    assert!(first.contains("@@spawn"));
+    assert!(first.ends_with("hello"));
+    finish(&mut rt, None);
+
+    let second = send(&mut rt, "again");
+    assert_eq!(second, "again", "already told in this app run");
+}
+
+#[test]
+fn a_new_codex_session_starts_with_the_instructions_and_gets_no_note() {
+    let mut rt = codex_runtime();
+    let first = send(&mut rt, "hello");
+    assert_eq!(first, "hello");
+    finish(&mut rt, Some("new-thread"));
+    assert_eq!(send(&mut rt, "again"), "again");
+}
+
+#[test]
+fn changed_instructions_reach_a_codex_session_on_its_next_prompt() {
+    let mut rt = codex_runtime();
+    assert_eq!(send(&mut rt, "one"), "one");
+    finish(&mut rt, Some("thread"));
+
+    rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    let next = send(&mut rt, "two");
+    assert!(has_note(&next), "{next}");
+    assert!(next.contains("gpt-6-astra (GPT-6-Astra; low…ultra)"));
+    finish(&mut rt, None);
+    assert_eq!(send(&mut rt, "three"), "three", "told once");
+}
+
+#[test]
+fn backends_that_resend_their_instructions_every_run_get_no_note() {
+    let mut rt = spawn_runtime();
+    rt.on_ui_command(UiCommand::SetModelDirectory(model_directory()));
+    // `main` runs on Claude, which passes --append-system-prompt every time.
+    rt.sessions
+        .set_external(main_id(), AgentSessionId("claude-session".to_string()), 0);
+    assert_eq!(send(&mut rt, "hello"), "hello");
+}

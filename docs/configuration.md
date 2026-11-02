@@ -445,7 +445,9 @@ directory named by the `ASTERLINE_HOME` environment variable:
 ~/.asterline/
 ├── skills/
 │   ├── asterline-team/SKILL.md
-│   └── asterline-brainstorm/SKILL.md
+│   ├── asterline-brainstorm/SKILL.md
+│   └── models.md            models `@@spawn` accepts, for agents to read
+├── models.json              the same model list as a cache, loaded first at launch
 └── projects/<workspace key>/
     ├── team.json
     ├── roster.md
@@ -463,6 +465,15 @@ created with mode `0700`.
 
 Claude, Grok, and Agy are started with `--add-dir` for `~/.asterline/skills`
 and the project's state directory so they can read the team skill and roster.
+
+`models.json` is the model list from the last discovery (a versioned file,
+written atomically). Asterline loads it first at launch, so the model picker,
+the `/team` editor, and the list given to the agents are usable before any CLI
+answers; discovery then runs in the background, and the file is rewritten only
+when its result differs. A missing, damaged, or old-version file is ignored.
+`skills/models.md` is the same list in a form agents read: every installed backend's
+exact model ids, display names, and allowed efforts. Each main agent's
+instructions give its path, and Asterline rewrites it whenever the list changes.
 
 **Moving old state.** Earlier versions kept this data in
 `<workspace>/.asterline/` and generated `.agents/skills/asterline-team/` and

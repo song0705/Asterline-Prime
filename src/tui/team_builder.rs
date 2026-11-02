@@ -3,7 +3,7 @@
 //! member field helpers. (Asterline no longer has a startup builder; it begins
 //! with one default `main` member.)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -34,6 +34,15 @@ enum ModelLoad {
 pub(crate) struct ModelCatalog {
     loads: HashMap<(BackendKind, PathBuf), ModelLoad>,
     frozen: bool,
+    /// Catalogs loaded from the model cache file that no discovery has
+    /// confirmed yet. The first request for one starts that discovery.
+    from_cache: HashSet<(BackendKind, PathBuf)>,
+    /// Discoveries confirming a cached catalog. Until one lands, the cached
+    /// catalog in `loads` is what everything shows.
+    confirming: HashMap<(BackendKind, PathBuf), Receiver<Result<DiscoveredCatalog, String>>>,
+    /// Counts every change to what the catalogs hold, so a caller can tell
+    /// when there is something new to save.
+    generation: u64,
 }
 
 /// The model and effort a member effectively runs; see
@@ -89,6 +98,8 @@ impl ModelCatalog {
             )),
             Some(ModelLoad::Ready(_)) => {
                 self.loads.remove(&key);
+                self.from_cache.remove(&key);
+                self.confirming.remove(&key);
                 self.request(backend, cwd);
                 Ok(())
             }
@@ -120,17 +131,50 @@ impl ModelCatalog {
     fn request(&mut self, backend: BackendKind, cwd: &Path) {
         let key = (backend, cwd.to_path_buf());
         if self.loads.contains_key(&key) {
+            if self.from_cache.remove(&key) {
+                self.confirming.insert(key, spawn_discovery(backend, cwd));
+            }
             return;
         }
-        let worker_cwd = cwd.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = tx.send(crate::adapter::models::discover_catalog(
-                backend,
-                &worker_cwd,
-            ));
-        });
-        self.loads.insert(key, ModelLoad::Loading(rx));
+        self.loads
+            .insert(key, ModelLoad::Loading(spawn_discovery(backend, cwd)));
+    }
+
+    /// Show `catalog`, read from the model cache file, as `backend`'s models
+    /// for `cwd` right away. A backend already loaded is left alone. The next
+    /// request for it runs the real discovery and replaces the cached list if
+    /// the result differs.
+    pub(crate) fn seed_cached(
+        &mut self,
+        backend: BackendKind,
+        cwd: &Path,
+        catalog: DiscoveredCatalog,
+    ) {
+        let key = (backend, cwd.to_path_buf());
+        if self.loads.contains_key(&key) {
+            return;
+        }
+        self.loads
+            .insert(key.clone(), ModelLoad::Ready(Ok(catalog)));
+        self.from_cache.insert(key);
+        self.generation += 1;
+    }
+
+    /// Every finished catalog for `cwd`, for saving to the model cache file.
+    pub(crate) fn ready_catalogs(&self, cwd: &Path) -> Vec<(BackendKind, DiscoveredCatalog)> {
+        self.loads
+            .iter()
+            .filter(|((_, key_cwd), _)| key_cwd == cwd)
+            .filter_map(|((backend, _), load)| match load {
+                ModelLoad::Ready(Ok(catalog)) => Some((*backend, catalog.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Changes whenever a catalog is added or replaced.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Move finished lookups into the cache. Returns whether any landed, so
@@ -151,10 +195,57 @@ impl ModelCatalog {
             };
             if let Some(result) = result {
                 self.loads.insert(key, ModelLoad::Ready(result));
+                self.generation += 1;
+                changed = true;
+            }
+        }
+        changed |= self.poll_confirmations();
+        changed
+    }
+
+    /// Take finished discoveries that were confirming a cached catalog. A
+    /// different result replaces the cached one; the same result changes
+    /// nothing, and a failed discovery keeps what the cache had.
+    fn poll_confirmations(&mut self) -> bool {
+        let mut changed = false;
+        let keys = self.confirming.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let result = match self.confirming.get(&key).map(Receiver::try_recv) {
+                Some(Ok(result)) => result,
+                Some(Err(TryRecvError::Empty)) | None => continue,
+                Some(Err(TryRecvError::Disconnected)) => Err(String::new()),
+            };
+            self.confirming.remove(&key);
+            let Ok(fresh) = result else { continue };
+            let same = matches!(
+                self.loads.get(&key),
+                Some(ModelLoad::Ready(Ok(cached))) if *cached == fresh
+            );
+            if !same {
+                self.loads.insert(key, ModelLoad::Ready(Ok(fresh)));
+                self.generation += 1;
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Stand in for the discovery of a cached catalog; send its result
+    /// through the returned handle.
+    #[cfg(test)]
+    pub(crate) fn seed_confirming(
+        &mut self,
+        backend: BackendKind,
+        cwd: &Path,
+    ) -> mpsc::Sender<Result<DiscoveredCatalog, String>> {
+        let (tx, rx) = mpsc::channel();
+        self.confirming.insert((backend, cwd.to_path_buf()), rx);
+        tx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_unconfirmed(&self, backend: BackendKind, cwd: &Path) -> bool {
+        self.from_cache.contains(&(backend, cwd.to_path_buf()))
     }
 
     pub(crate) fn models(&mut self, backend: BackendKind, cwd: &Path) -> ModelChoices {
@@ -179,6 +270,7 @@ impl ModelCatalog {
         };
         let choices = model_choices(&result);
         *load = ModelLoad::Ready(result);
+        self.generation += 1;
         choices
     }
 
@@ -491,6 +583,21 @@ fn one_line(value: &str, max: usize) -> String {
                 .collect::<String>()
         )
     }
+}
+
+fn spawn_discovery(
+    backend: BackendKind,
+    cwd: &Path,
+) -> Receiver<Result<DiscoveredCatalog, String>> {
+    let worker_cwd = cwd.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(crate::adapter::models::discover_catalog(
+            backend,
+            &worker_cwd,
+        ));
+    });
+    rx
 }
 
 fn model_choices(result: &Result<DiscoveredCatalog, String>) -> ModelChoices {
@@ -2506,5 +2613,76 @@ mod tests {
         family.apply_key(KeyCode::Home, KeyModifiers::NONE);
         family.apply_key(KeyCode::Delete, KeyModifiers::NONE);
         assert!(family.buffer.is_empty());
+    }
+
+    fn catalog_of(ids: &[&str]) -> DiscoveredCatalog {
+        DiscoveredCatalog {
+            models: ids.iter().map(|id| DiscoveredModel::simple(*id)).collect(),
+            ..DiscoveredCatalog::default()
+        }
+    }
+
+    fn ids(catalog: &ModelCatalog, cwd: &Path) -> Vec<String> {
+        match catalog.view(BackendKind::Codex, cwd) {
+            CatalogView::Ready(found) => found.models.iter().map(|m| m.id.clone()).collect(),
+            _ => panic!("catalog is not ready"),
+        }
+    }
+
+    #[test]
+    fn a_cached_catalog_is_ready_before_any_discovery() {
+        let cwd = Path::new("/tmp/ws");
+        let mut catalog = ModelCatalog::default();
+        catalog.seed_cached(BackendKind::Codex, cwd, catalog_of(&["gpt-6.1-sol"]));
+
+        assert_eq!(ids(&catalog, cwd), ["gpt-6.1-sol"]);
+        assert!(catalog.is_unconfirmed(BackendKind::Codex, cwd));
+        let generation = catalog.generation();
+        // Seeding never replaces a catalog that is already there.
+        catalog.seed_cached(BackendKind::Codex, cwd, catalog_of(&["other"]));
+        assert_eq!(ids(&catalog, cwd), ["gpt-6.1-sol"]);
+        assert_eq!(catalog.generation(), generation);
+    }
+
+    #[test]
+    fn a_differing_discovery_replaces_the_cached_catalog() {
+        let cwd = Path::new("/tmp/ws");
+        let mut catalog = ModelCatalog::default();
+        catalog.seed_cached(BackendKind::Codex, cwd, catalog_of(&["old"]));
+        let discovery = catalog.seed_confirming(BackendKind::Codex, cwd);
+        let before = catalog.generation();
+
+        assert!(!catalog.poll(), "nothing has landed yet");
+        discovery.send(Ok(catalog_of(&["old", "new"]))).unwrap();
+        assert!(catalog.poll());
+
+        assert_eq!(ids(&catalog, cwd), ["old", "new"]);
+        assert!(catalog.generation() > before);
+    }
+
+    #[test]
+    fn an_identical_discovery_changes_nothing() {
+        let cwd = Path::new("/tmp/ws");
+        let mut catalog = ModelCatalog::default();
+        catalog.seed_cached(BackendKind::Codex, cwd, catalog_of(&["same"]));
+        let discovery = catalog.seed_confirming(BackendKind::Codex, cwd);
+        let before = catalog.generation();
+
+        discovery.send(Ok(catalog_of(&["same"]))).unwrap();
+        assert!(!catalog.poll(), "no redraw, nothing to save");
+        assert_eq!(catalog.generation(), before);
+        assert_eq!(ids(&catalog, cwd), ["same"]);
+    }
+
+    #[test]
+    fn a_failed_discovery_keeps_the_cached_catalog() {
+        let cwd = Path::new("/tmp/ws");
+        let mut catalog = ModelCatalog::default();
+        catalog.seed_cached(BackendKind::Codex, cwd, catalog_of(&["kept"]));
+        let discovery = catalog.seed_confirming(BackendKind::Codex, cwd);
+
+        discovery.send(Err("offline".to_string())).unwrap();
+        assert!(!catalog.poll());
+        assert_eq!(ids(&catalog, cwd), ["kept"]);
     }
 }

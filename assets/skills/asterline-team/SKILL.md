@@ -2,7 +2,7 @@
 name: asterline-team
 description: Use when acting as an Asterline team member who actually needs to message teammates, open a sub-agent for a side task, coordinate explicitly collaborative work, update run steps, or request that Asterline add a teammate to the live roster.
 metadata:
-  version: 27
+  version: 28
 ---
 <!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->
 
@@ -50,7 +50,7 @@ When the messaging policy above permits it, send necessary work or questions to 
 
 ## Open A Sub-Agent
 
-A top-level member can open sub-agents for side work. They belong to the current chat only: they are not saved in `team.json`, `/resume` brings them back, `/new` removes them all, and you or the user can close one at a time.
+A top-level member can open sub-agents for side work. Always do it with `@@spawn` below, never with your CLI's own built-in sub-agent or multi-agent tool: Asterline cannot see or manage those, and the models they offer are not the ones listed here. They belong to the current chat only: they are not saved in `team.json`, `/resume` brings them back, `/new` removes them all, and you or the user can close one at a time.
 
 ```text
 @@spawn {"name":"reviewer","task":"Review the diff in src/router and list real bugs only.","backend":"claude","model":"opus","effort":"high","role":"review"}
@@ -60,7 +60,7 @@ Name a sub-agent after its job, short: `reviewer`, `test-writer`, `researcher`. 
 
 Required fields: `name` and `task`. Optional fields: `backend` (`codex`, `claude`, `grok`, or `agy`), `model`, `effort`, `role` (a short job description, never required). Omitted `backend`, `model`, and `effort` follow you; a different backend gets that backend's default permissions, and the same backend keeps yours.
 
-Your protocol text lists, per installed backend, the exact `model` ids with their display names and supported efforts (`gpt-6-astra (GPT-6-Astra; low…ultra)`). Use those exact ids, and map the user's shorthand ("astra", "gpt-astra") to the listed id yourself instead of guessing; do not read files or run commands to find model names. Asterline refuses an unknown model, an effort the model does not offer, or a backend that is not installed, and the refusal message lists the valid choices. A close but inexact name (for example the display name) is resolved for you and you are told which id was used.
+Your protocol text lists, per installed backend, the exact `model` ids with their display names and supported efforts (`gpt-6-astra (GPT-6-Astra; low…ultra)`). Use those exact ids, and map the user's shorthand ("astra", "gpt-astra") to the listed id yourself instead of guessing; do not run `<cli> models` or read other tools' settings files to find model names. If the list in your protocol text looks old or lacks a model, read `models.md` (your protocol text gives its full path; it sits in the Asterline skills directory): Asterline rewrites it whenever the installed models change, with every installed backend's exact ids, display names, and allowed efforts. Asterline refuses an unknown model, an effort the model does not offer, or a backend that is not installed, and the refusal message lists the valid choices. A close but inexact name (for example the display name) is resolved for you and you are told which id was used.
 
 When it is worth it:
 - Independent pieces of work can run in parallel.

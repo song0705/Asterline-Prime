@@ -119,6 +119,67 @@ impl ModelDirectory {
     }
 }
 
+impl ModelDirectory {
+    /// The contents of `<asterline home>/skills/models.md`: every installed
+    /// backend's models with the exact id to pass as `model`, the display
+    /// name, and the efforts allowed. Backends come in a fixed order and
+    /// models in catalog order, so the same directory always gives the same
+    /// text. `None` when no catalog is known.
+    pub fn models_file(&self) -> Option<String> {
+        let sections: Vec<String> = BACKEND_ORDER
+            .into_iter()
+            .filter(|backend| !self.lacks(*backend))
+            .filter_map(|backend| {
+                let models = self.models(backend).filter(|models| !models.is_empty())?;
+                let lines: Vec<String> = models.iter().map(file_entry).collect();
+                Some(format!("## {backend}\n\n{}\n", lines.join("\n")))
+            })
+            .collect();
+        if sections.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "# Models Asterline can open with @@spawn\n\n\
+             Kept up to date by Asterline; it is rewritten whenever the installed models change.\n\n\
+             Pass the exact id (the part in backticks) as \"model\", and the section heading as \"backend\". \
+             \"backend\", \"model\", and \"effort\" are optional and default to the parent's. Asterline refuses an unknown model or an effort the model does not offer.\n\n{}",
+            sections.join("\n")
+        ))
+    }
+}
+
+/// The order backends appear in the model list file.
+const BACKEND_ORDER: [BackendKind; 4] = [
+    BackendKind::Codex,
+    BackendKind::Claude,
+    BackendKind::Grok,
+    BackendKind::Agy,
+];
+
+/// `- `id` — Display Name; efforts: low, medium (default: low)`.
+fn file_entry(model: &DiscoveredModel) -> String {
+    let mut details = Vec::new();
+    if !model.name.is_empty() && model.name != model.id {
+        details.push(model.name.clone());
+    }
+    if model.is_default {
+        details.push("backend default".to_string());
+    }
+    let efforts = effort_list(&model.supported_efforts);
+    if !efforts.is_empty() {
+        let mut text = format!("efforts: {efforts}");
+        if let Some(default) = model.default_effort {
+            text.push_str(&format!(" (default: {})", default.as_str()));
+        }
+        details.push(text);
+    }
+    if details.is_empty() {
+        format!("- `{}`", model.id)
+    } else {
+        format!("- `{}` — {}", model.id, details.join("; "))
+    }
+}
+
 /// `id (Display Name; low…max)`, leaving out what is unknown or the same as
 /// the id.
 fn model_entry(model: &DiscoveredModel) -> String {
@@ -458,5 +519,49 @@ mod tests {
         });
         assert!(directory.lacks(BackendKind::Codex));
         assert!(directory.protocol_block().is_none());
+    }
+
+    #[test]
+    fn the_models_file_lists_installed_backends_in_a_fixed_order() {
+        let mut luna = model("luna", "luna", &[Effort::Low, Effort::High]);
+        luna.default_effort = Some(Effort::High);
+        luna.is_default = true;
+        let directory = ModelDirectory {
+            installed: Some(DetectedBackends {
+                codex: true,
+                claude: true,
+                grok: false,
+                agy: true,
+            }),
+            // Arrival order differs from the file's order; grok is not installed.
+            catalogs: vec![
+                (BackendKind::Agy, vec![model("flash", "Flash", &[])]),
+                (BackendKind::Grok, vec![model("grok-4", "Grok 4", &[])]),
+                (BackendKind::Claude, vec![model("opus", "Opus", &ALL)]),
+                (
+                    BackendKind::Codex,
+                    vec![model("gpt-6-astra", "GPT-6-Astra", &ALL), luna],
+                ),
+            ],
+        };
+        let text = directory.models_file().unwrap();
+        assert_eq!(
+            text,
+            "# Models Asterline can open with @@spawn\n\n\
+             Kept up to date by Asterline; it is rewritten whenever the installed models change.\n\n\
+             Pass the exact id (the part in backticks) as \"model\", and the section heading as \"backend\". \
+             \"backend\", \"model\", and \"effort\" are optional and default to the parent's. \
+             Asterline refuses an unknown model or an effort the model does not offer.\n\n\
+             ## codex\n\n\
+             - `gpt-6-astra` — GPT-6-Astra; efforts: low, medium, high, xhigh, max\n\
+             - `luna` — backend default; efforts: low, high (default: high)\n\n\
+             ## claude\n\n\
+             - `opus` — Opus; efforts: low, medium, high, xhigh, max\n\n\
+             ## agy\n\n\
+             - `flash` — Flash\n"
+        );
+        // Deterministic, and nothing to say without a catalog.
+        assert_eq!(directory.models_file(), Some(text));
+        assert_eq!(ModelDirectory::default().models_file(), None);
     }
 }

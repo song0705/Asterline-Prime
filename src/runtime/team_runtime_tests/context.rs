@@ -3,8 +3,16 @@
 
 use super::*;
 use crate::runtime::context_recap::{
-    NOT_CARRIED_OVER, RECAP_FOOTER, RECAP_HEADER, RECAP_MAX_CHARS,
+    NOT_CARRIED_OVER, PROTOCOL_NOTE_HEADER, RECAP_FOOTER, RECAP_HEADER, RECAP_MAX_CHARS,
+    without_protocol_note,
 };
+
+/// A runtime whose members carry the team instructions, as in the app.
+fn runtime() -> TeamRuntime {
+    let mut rt = super::runtime();
+    crate::domain::config::inject_team_protocol_with(&mut rt.config, &rt.models);
+    rt
+}
 
 fn builder() -> MemberId {
     MemberId::new("builder")
@@ -125,7 +133,10 @@ fn switching_back_recaps_only_what_the_old_session_missed() {
 
     // The first codex session is resumed: it already knows q-one and a-one.
     assert_eq!(action.session, Some(AgentSessionId("codex-1".to_string())));
-    let prompt = &action.prompt;
+    // That thread may predate the current instructions (Claude ran in
+    // between), so it gets them once in front of the recap.
+    assert!(action.prompt.starts_with(PROTOCOL_NOTE_HEADER));
+    let prompt = without_protocol_note(&action.prompt);
     assert!(prompt.starts_with(RECAP_HEADER), "{prompt}");
     assert!(prompt.contains("User: q-two"), "{prompt}");
     assert!(prompt.contains("Assistant (Builder): a-two"), "{prompt}");

@@ -1320,3 +1320,153 @@ fn the_runtime_is_given_the_discovered_models_once_and_again_when_they_change() 
     assert!(next.models(BackendKind::Grok).is_some());
     assert!(next.models(BackendKind::Codex).is_some());
 }
+
+fn cache_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("asterline-cache-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn cached(ids: &[&str]) -> crate::adapter::model_cache::ModelCache {
+    crate::adapter::model_cache::ModelCache::new(
+        Some(all_detected()),
+        vec![(
+            BackendKind::Codex,
+            DiscoveredCatalog {
+                models: ids.iter().map(|id| DiscoveredModel::simple(*id)).collect(),
+                ..Default::default()
+            },
+        )],
+    )
+}
+
+fn cache_state(path: &Path) -> AppState {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready_with(None, two_members()));
+    state.use_model_cache(path.to_path_buf());
+    state
+}
+
+#[test]
+fn startup_uses_the_cached_models_before_any_discovery() {
+    let dir = cache_dir("startup");
+    let path = dir.join("models.json");
+    cached(&["gpt-cached"]).save(&path).unwrap();
+    let mut state = cache_state(&path);
+
+    assert!(state.pending_model_directory().is_none(), "nothing yet");
+    assert!(state.seed_model_cache_once());
+
+    // The cached list is the model catalog and goes to the runtime at once,
+    // with the installed CLIs the cache recorded.
+    let directory = state.pending_model_directory().expect("cached models");
+    assert_eq!(directory.installed, Some(all_detected()));
+    let codex: Vec<&str> = directory
+        .models(BackendKind::Codex)
+        .unwrap()
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(codex, ["gpt-cached"]);
+    // Seeding twice does nothing.
+    assert!(!state.seed_model_cache_once());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_differing_discovery_updates_the_directory_and_the_cache_file() {
+    let dir = cache_dir("differs");
+    let path = dir.join("models.json");
+    cached(&["old"]).save(&path).unwrap();
+    let mut state = cache_state(&path);
+    state.seed_model_cache_once();
+    let first = state.pending_model_directory().unwrap();
+    state.mark_model_directory_sent(first);
+    state.persist_model_cache();
+    let cwd = PathBuf::from("/tmp/ws");
+    let discovery = state
+        .model_catalog
+        .seed_confirming(BackendKind::Codex, &cwd);
+
+    discovery
+        .send(Ok(DiscoveredCatalog {
+            models: vec![
+                DiscoveredModel::simple("old"),
+                DiscoveredModel::simple("new"),
+            ],
+            ..Default::default()
+        }))
+        .unwrap();
+    state.model_catalog.poll();
+
+    let next = state.pending_model_directory().expect("the list changed");
+    assert_eq!(next.models(BackendKind::Codex).unwrap().len(), 2);
+    state.persist_model_cache();
+    let saved = crate::adapter::model_cache::ModelCache::load(&path).unwrap();
+    assert_eq!(saved.catalogs[0].1.models.len(), 2);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn an_identical_discovery_does_not_rewrite_the_cache_file() {
+    let dir = cache_dir("same");
+    let path = dir.join("models.json");
+    cached(&["same"]).save(&path).unwrap();
+    let mut state = cache_state(&path);
+    state.seed_model_cache_once();
+    state.persist_model_cache();
+    // Make any rewrite visible: change the file behind the app's back.
+    std::fs::write(&path, "sentinel").unwrap();
+    let cwd = PathBuf::from("/tmp/ws");
+    let discovery = state
+        .model_catalog
+        .seed_confirming(BackendKind::Codex, &cwd);
+
+    discovery
+        .send(Ok(DiscoveredCatalog {
+            models: vec![DiscoveredModel::simple("same")],
+            ..Default::default()
+        }))
+        .unwrap();
+    state.model_catalog.poll();
+    state.persist_model_cache();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_bad_cache_is_ignored_and_discovery_result_is_saved() {
+    let dir = cache_dir("bad");
+    let path = dir.join("models.json");
+    for text in [
+        "{broken",
+        "",
+        "{\"version\": 99, \"installed\": null, \"catalogs\": {}}",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let mut state = cache_state(&path);
+        assert!(!state.seed_model_cache_once(), "{text}");
+        assert!(state.pending_model_directory().is_none(), "{text}");
+        assert!(
+            !state
+                .model_catalog
+                .contains(BackendKind::Codex, Path::new("/tmp/ws"))
+        );
+    }
+    // The next discovery that lands overwrites the bad file.
+    let mut state = cache_state(&path);
+    state.seed_model_cache_once();
+    state.seed_installed_catalog(
+        BackendKind::Codex,
+        DiscoveredCatalog {
+            models: vec![DiscoveredModel::simple("fresh")],
+            ..Default::default()
+        },
+    );
+    state.persist_model_cache();
+    let saved = crate::adapter::model_cache::ModelCache::load(&path).expect("rewritten");
+    assert_eq!(saved.catalogs[0].1.models[0].id, "fresh");
+    std::fs::remove_dir_all(dir).ok();
+}

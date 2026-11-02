@@ -8,6 +8,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn ensure_workspace_directory(
     workspace: &Path,
@@ -140,8 +141,15 @@ pub fn write_regular_file(path: &Path, label: &str, contents: &str) -> io::Resul
 /// never a half-written file. A symlinked target is refused.
 pub fn write_regular_file_atomic(path: &Path, label: &str, contents: &str) -> io::Result<()> {
     reject_symlink(path, label)?;
+    // Unique per call, not just per process: two threads replacing the same
+    // file must not share a temporary file.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let mut name = path.as_os_str().to_os_string();
-    name.push(format!(".tmp-{}", std::process::id()));
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
     let temp = PathBuf::from(name);
     let _ = fs::remove_file(&temp);
     let result = (|| {

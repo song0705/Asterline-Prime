@@ -142,7 +142,8 @@ Reopening Asterline resumes the last conversation by default. `/new` (optionally
 
 ```text
 ~/.asterline/
-├── skills/                      shared Asterline skills
+├── skills/                      shared Asterline skills + models.md (model list for agents)
+├── models.json                  model list launch cache
 └── projects/<workspace key>/
     ├── team.json
     ├── roster.md

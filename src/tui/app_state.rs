@@ -12,6 +12,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyModifiers};
 use sha2::{Digest, Sha256};
 
+use crate::adapter::model_cache::ModelCache;
 use crate::adapter::parser::{append_bounded_text, bounded_text, summarize};
 use crate::adapter::prompt_images::{
     MAX_IMAGE_BYTES, MAX_PROMPT_IMAGES, PromptImage, image_placeholder, mime_from_bytes,
@@ -432,6 +433,17 @@ pub struct AppState {
     model_catalog_warmed: bool,
     /// The model list the runtime was last given.
     model_directory_sent: Option<ModelDirectory>,
+    /// Where the model list is cached between runs (`models.json`); `None`
+    /// keeps the cache off.
+    model_cache_path: Option<PathBuf>,
+    /// The cache as last read or written.
+    model_cache_saved: Option<ModelCache>,
+    /// Which CLIs the cache said were installed, until detection answers.
+    cached_installed: Option<DetectedBackends>,
+    model_cache_seeded: bool,
+    /// What the cache was last compared against: the catalogs' change counter
+    /// and the installed CLIs.
+    model_cache_checked: Option<(u64, Option<DetectedBackends>)>,
     skills: Vec<SkillInfo>,
     /// Saved (not live) chats, newest first: the Agents list's Inactive rows.
     /// Refreshed by the runtime each time the list opens.
@@ -547,6 +559,11 @@ impl AppState {
             model_switch_pending: false,
             model_catalog_detection: None,
             model_catalog_warmed: false,
+            model_cache_path: None,
+            model_cache_saved: None,
+            cached_installed: None,
+            model_cache_seeded: false,
+            model_cache_checked: None,
             model_directory_sent: None,
             skills: Vec::new(),
             saved_chats: Vec::new(),
@@ -3780,13 +3797,14 @@ impl AppState {
         if self.model_catalog_warmed || self.workspace.trim().is_empty() {
             return false;
         }
+        let seeded = self.seed_model_cache_once();
         if self.model_catalog_detection.is_none() {
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 let _ = tx.send(detect_backends());
             });
             self.model_catalog_detection = Some(rx);
-            return false;
+            return seeded;
         }
         let detected = match self
             .model_catalog_detection
@@ -3825,6 +3843,71 @@ impl AppState {
         self.model_picker.is_some() || self.chat.is_empty()
     }
 
+    /// Keep the model list in `path` between runs. The cache is read at the
+    /// first warm-up, once the workspace is known.
+    pub fn use_model_cache(&mut self, path: PathBuf) {
+        self.model_cache_path = Some(path);
+    }
+
+    /// Show the cached model lists right away, without waiting for any CLI.
+    /// The background discovery that follows replaces a list that differs.
+    /// Returns whether something was loaded.
+    fn seed_model_cache_once(&mut self) -> bool {
+        if std::mem::replace(&mut self.model_cache_seeded, true) {
+            return false;
+        }
+        let Some(cache) = self.model_cache_path.as_deref().and_then(ModelCache::load) else {
+            return false;
+        };
+        let workspace = PathBuf::from(&self.workspace);
+        for (backend, catalog) in &cache.catalogs {
+            self.model_catalog
+                .seed_cached(*backend, &workspace, catalog.clone());
+        }
+        self.cached_installed = cache.installed;
+        let loaded = !cache.is_empty();
+        self.model_cache_saved = Some(cache);
+        loaded
+    }
+
+    /// Write the model cache when what was discovered differs from it. An
+    /// identical result leaves the file alone. Failing to write is not worth
+    /// interrupting the user for: the cache is only a head start.
+    pub fn persist_model_cache(&mut self) {
+        let Some(path) = self.model_cache_path.clone() else {
+            return;
+        };
+        if self.workspace.trim().is_empty() {
+            return;
+        }
+        let installed = self.detected_backends.or(self.cached_installed);
+        let checked = (self.display_model_catalog().generation(), installed);
+        if self.model_cache_checked == Some(checked) {
+            return;
+        }
+        self.model_cache_checked = Some(checked);
+        // A backend whose list is not finished right now keeps its saved one.
+        let mut catalogs = self
+            .model_cache_saved
+            .as_ref()
+            .map(|saved| saved.catalogs.clone())
+            .unwrap_or_default();
+        for (backend, catalog) in self
+            .display_model_catalog()
+            .ready_catalogs(Path::new(&self.workspace))
+        {
+            catalogs.retain(|(kept, _)| *kept != backend);
+            catalogs.push((backend, catalog));
+        }
+        let cache = ModelCache::new(installed, catalogs);
+        if cache.is_empty() || self.model_cache_saved.as_ref() == Some(&cache) {
+            return;
+        }
+        if cache.save(&path).is_ok() {
+            self.model_cache_saved = Some(cache);
+        }
+    }
+
     /// The installed backends and model lists found so far, when they differ
     /// from what the runtime was last given. A list that is being reloaded
     /// keeps its previous contents. Call [`Self::mark_model_directory_sent`] once
@@ -3832,7 +3915,10 @@ impl AppState {
     pub(crate) fn pending_model_directory(&self) -> Option<ModelDirectory> {
         let workspace = Path::new(&self.workspace);
         let mut next = self.model_directory_sent.clone().unwrap_or_default();
-        next.installed = self.detected_backends.or(next.installed);
+        next.installed = self
+            .detected_backends
+            .or(self.cached_installed)
+            .or(next.installed);
         for backend in [
             BackendKind::Codex,
             BackendKind::Claude,

@@ -20,7 +20,7 @@ const TEAM_PROTOCOL_BEGIN: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_BEGIN -->";
 const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 27;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 28;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../assets/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 const ASTERLINE_BRAINSTORM_SKILL: &str =
@@ -48,6 +48,11 @@ pub fn brainstorm_skill_path() -> PathBuf {
 /// or a status changes.
 pub fn roster_path(workspace: &Path) -> PathBuf {
     state_paths::roster_path(workspace)
+}
+
+/// The live list of models `@@spawn` accepts: `<asterline home>/skills/models.md`.
+pub fn models_path() -> PathBuf {
+    state_paths::models_path()
 }
 
 fn skill_file(skills_dir: &Path, name: &str) -> PathBuf {
@@ -697,6 +702,7 @@ pub fn inject_team_protocol(team: &mut TeamConfig) {
 pub fn inject_team_protocol_with(team: &mut TeamConfig, models: &ModelDirectory) {
     let model_block = models.protocol_block();
     let roster = roster_path(&team.workspace);
+    let models_file = models_path();
     let protocols: Vec<String> = team
         .members
         .iter()
@@ -719,6 +725,7 @@ pub fn inject_team_protocol_with(team: &mut TeamConfig, models: &ModelDirectory)
                     &sub_agents,
                     model_block.as_deref(),
                     &roster,
+                    &models_file,
                 )
             }
         })
@@ -753,6 +760,13 @@ pub fn strip_team_protocols(mut team: TeamConfig) -> TeamConfig {
     team
 }
 
+/// The Asterline team protocol inside a system prompt, without its markers.
+pub fn team_protocol_text(prompt: &str) -> Option<&str> {
+    let begin = prompt.find(TEAM_PROTOCOL_BEGIN)? + TEAM_PROTOCOL_BEGIN.len();
+    let end = begin + prompt[begin..].find(TEAM_PROTOCOL_END)?;
+    Some(prompt[begin..end].trim())
+}
+
 pub fn strip_team_protocol(prompt: &str) -> String {
     let Some(begin) = prompt.find(TEAM_PROTOCOL_BEGIN) else {
         return prompt.to_string();
@@ -777,6 +791,7 @@ fn build_protocol(
     sub_agents: &[String],
     model_block: Option<&str>,
     roster: &Path,
+    models_file: &Path,
 ) -> String {
     let mut protocol = format!(
         "You are \"{me}\", a member of an Asterline multi-agent team.\n\
@@ -794,7 +809,9 @@ fn build_protocol(
     }
     protocol.push_str(&format!(
         "Sub-agents: when work can run in parallel, or a second model's view or a review is worth it, \
-         open one with a control line (up to {MAX_SUB_AGENTS} per chat):\n\
+         open one with Asterline's @@spawn control line (up to {MAX_SUB_AGENTS} per chat). Do not use \
+         your CLI's own built-in sub-agent or multi-agent tool for this: Asterline cannot see or manage \
+         those, and the models they offer are not the ones listed here:\n\
          @@spawn {{\"name\":\"reviewer\",\"task\":\"what to do\",\"backend\":\"claude\",\"model\":\"opus\",\"effort\":\"high\"}}\n\
          backend, model, and effort are optional and default to yours. Name it after its job (reviewer, \
          test-writer, researcher; helper if none), never a model or CLI, since the list shows the model. \
@@ -805,6 +822,10 @@ fn build_protocol(
     if let Some(block) = model_block {
         protocol.push_str(block);
     }
+    protocol.push_str(&format!(
+        "The current model list is kept in {}; read it when you need a model not listed here.\n",
+        models_file.display()
+    ));
     protocol.push_str("All other text you write is shown to the user.");
     protocol
 }
@@ -1215,7 +1236,7 @@ mod tests {
 
         ensure_team_skill_in(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 27"));
+        assert!(text.contains("version: 28"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -1288,12 +1309,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v26() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 27);
+    fn embedded_team_skill_is_protocol_v28() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 28);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 27")
+                .any(|line| line.trim() == "version: 28")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1319,8 +1340,10 @@ mod tests {
         );
         assert!(ASTERLINE_TEAM_SKILL.contains("`roster.md`"));
         assert!(!ASTERLINE_TEAM_SKILL.contains(".asterline/"));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 27);
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 28);
         assert!(ASTERLINE_TEAM_SKILL.contains("@@spawn"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("`models.md`"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("never with your CLI's own built-in sub-agent"));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@close"));
         assert!(ASTERLINE_TEAM_SKILL.contains("exact `model` ids"));
         assert!(ASTERLINE_TEAM_SKILL.contains("[hand-back from"));
@@ -1542,7 +1565,14 @@ mod tests {
 
     #[test]
     fn protocol_tells_agents_to_name_sub_agents_after_their_job() {
-        let protocol = build_protocol("main", &[], &[], None, Path::new("/tmp/ws/roster.md"));
+        let protocol = build_protocol(
+            "main",
+            &[],
+            &[],
+            None,
+            Path::new("/tmp/ws/roster.md"),
+            Path::new("/tmp/home/models.md"),
+        );
         assert!(protocol.contains("Name it after its job"));
         assert!(protocol.contains("never a model or CLI"));
         assert!(protocol.contains(r#"{"name":"reviewer""#));

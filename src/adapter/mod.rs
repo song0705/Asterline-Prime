@@ -13,6 +13,7 @@ pub mod cli_pty;
 pub mod codex_app_server;
 pub mod fake;
 pub mod grok_stream;
+pub(crate) mod model_cache;
 pub mod models;
 pub mod parser;
 pub mod process;
