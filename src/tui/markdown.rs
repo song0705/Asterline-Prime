@@ -940,9 +940,9 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
     let col_w = table_column_widths(table, cols, width);
 
     let header_style = Style::default()
-        .fg(theme::accent_color())
+        .fg(theme::emphasis_color())
         .add_modifier(Modifier::BOLD);
-    let body_style = theme::muted();
+    let body_style = Style::default();
     let rule_style = theme::dim();
     let mut out = vec![Line::from(Span::styled(
         table_rule(&col_w, '┌', '┬', '┐'),
@@ -1859,6 +1859,15 @@ mod tests {
             let m = find_span(&lines, text).style.add_modifier;
             assert!(m.contains(Modifier::BOLD) && !m.contains(Modifier::UNDERLINED));
         }
+    }
+
+    #[test]
+    fn table_body_uses_default_fg_and_header_is_emphasised() {
+        let lines = render("| hdr |\n|---|\n| body |", 40);
+        assert_eq!(find_span(&lines, "body").style.fg, None);
+        let header = find_span(&lines, "hdr").style;
+        assert_eq!(header.fg, Some(theme::emphasis_color()));
+        assert!(header.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
