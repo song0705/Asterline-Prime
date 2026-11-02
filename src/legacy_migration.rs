@@ -220,27 +220,6 @@ fn old_state_in_use(old: &Path) -> bool {
     }
 }
 
-/// True for a checkout of Asterline itself, whose `.agents/skills` are source
-/// files that must never be removed.
-fn is_asterline_source_tree(workspace: &Path) -> bool {
-    let Ok(manifest) = fs::read_to_string(workspace.join("Cargo.toml")) else {
-        return false;
-    };
-    let mut in_package = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-        } else if in_package
-            && let Some(rest) = line.strip_prefix("name")
-            && let Some(value) = rest.trim_start().strip_prefix('=')
-        {
-            return value.trim().trim_matches(['"', '\'']) == "asterline";
-        }
-    }
-    false
-}
-
 /// The `name:` value in a skill file's frontmatter.
 fn frontmatter_name(text: &str) -> Option<&str> {
     let mut lines = text.lines();
@@ -270,9 +249,6 @@ fn is_plain_dir(path: &Path) -> bool {
 /// `shared_skills` is where the shared copies live; a customized brainstorm
 /// skill is carried over there instead of being lost.
 fn remove_generated_skills(workspace: &Path, shared_skills: &Path) -> io::Result<Option<String>> {
-    if is_asterline_source_tree(workspace) {
-        return Ok(None);
-    }
     let agents = workspace.join(".agents");
     let skills = agents.join("skills");
     if !is_plain_dir(&agents) || !is_plain_dir(&skills) {
@@ -669,36 +645,6 @@ mod tests {
         assert!(notice.unwrap().contains("edited"));
         assert!(skills.join("SKILL.md").is_file());
         fs::remove_dir_all(&shared_root).ok();
-        fs::remove_dir_all(&workspace).ok();
-    }
-
-    #[test]
-    fn the_asterline_source_tree_keeps_its_skills() {
-        let workspace = scratch("repo");
-        fs::write(
-            workspace.join("Cargo.toml"),
-            "[package]\nname = \"asterline\"\nversion = \"1.0.0\"\n",
-        )
-        .unwrap();
-        let skills = workspace.join(".agents/skills");
-        fs::create_dir_all(skills.join("asterline-team")).unwrap();
-        fs::write(
-            skills.join("asterline-team/SKILL.md"),
-            generated_team_skill(),
-        )
-        .unwrap();
-
-        clean_skills(&workspace);
-        assert!(skills.join("asterline-team/SKILL.md").is_file());
-
-        // Another package with generated skills is cleaned.
-        fs::write(
-            workspace.join("Cargo.toml"),
-            "[package]\nname = \"other\"\n",
-        )
-        .unwrap();
-        clean_skills(&workspace);
-        assert!(!workspace.join(".agents").exists());
         fs::remove_dir_all(&workspace).ok();
     }
 

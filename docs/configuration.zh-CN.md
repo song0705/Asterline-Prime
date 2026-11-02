@@ -367,8 +367,7 @@ Claude、Grok 和 Agy 启动时会带上 `--add-dir`，指向 `~/.asterline/skil
 `.agents/skills/asterline-team/` 与 `.agents/skills/asterline-brainstorm/`。在某个 workspace
 首次启动时，Asterline 会把 `<workspace>/.asterline/`（数据库及其 `-wal`/`-shm`、
 `team.json`、`roster.md`）移到项目状态目录，删除它当初生成的 skill 文件，再删除因此变空的
-`.agents/skills/…`、`.agents/skills` 和 `.agents`。内容不同的文件绝不会删；Asterline 自己的
-源码仓库（`Cargo.toml` 的包名为 `asterline`）会保留 `.agents/skills`。若新的状态目录里已有数据库，
+`.agents/skills/…`、`.agents/skills` 和 `.agents`。内容不同的文件绝不会删。若新的状态目录里已有数据库，
 则以新的为准：旧目录原样保留，并只提示一次。迁移无法完成时（例如另一个 Asterline 仍在使用旧目录）
 会给出提示，下次启动再试。
 

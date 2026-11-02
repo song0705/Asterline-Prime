@@ -149,7 +149,7 @@ pub fn muted_italic() -> Style {
 }
 
 pub fn notice() -> Style {
-    Style::default().fg(accent_color())
+    Style::default().fg(muted_color())
 }
 
 pub fn emphasis() -> Style {

@@ -471,10 +471,8 @@ workspace, Asterline moves `<workspace>/.asterline/` to the project state
 directory (the database, its `-wal`/`-shm` files, `team.json`, `roster.md`)
 and removes the skill files it generated, then any of `.agents/skills/…`,
 `.agents/skills`, and `.agents` that are left empty. Files with other content
-are never deleted, and a checkout of Asterline itself (a `Cargo.toml` whose
-package is `asterline`) keeps its `.agents/skills`. If the new state directory
-already has a database, it wins: the old folder is left untouched and a notice
-says so once. A migration that cannot finish (for example another Asterline is
+are never deleted. If the new state directory already has a database, it wins:
+the old folder is left untouched and a notice says so once. A migration that cannot finish (for example another Asterline is
 still using the old folder) is reported and retried on the next launch.
 
 SQLite stores conversations, tool events, teammate routes, raw backend events,

@@ -21,10 +21,10 @@ const TEAM_PROTOCOL_END: &str = "<!-- ASTERLINE_TEAM_PROTOCOL_END -->";
 pub const ASTERLINE_TEAM_SKILL_NAME: &str = "asterline-team";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
 pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 27;
-const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
+const ASTERLINE_TEAM_SKILL: &str = include_str!("../../assets/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 const ASTERLINE_BRAINSTORM_SKILL: &str =
-    include_str!("../../.agents/skills/asterline-brainstorm/SKILL.md");
+    include_str!("../../assets/skills/asterline-brainstorm/SKILL.md");
 const MANAGED_SKILL_MARKER: &str =
     "<!-- managed-by: asterline (auto-upgraded; local edits will be overwritten) -->";
 const MIN_AGY_VERSION: (u64, u64, u64) = (1, 1, 12);
