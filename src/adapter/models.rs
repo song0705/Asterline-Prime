@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1209,6 +1210,42 @@ pub(crate) fn run_with_timeout(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<Output, String> {
+    run_command(program, args, cwd, Some(timeout), None).map_err(|failure| match failure {
+        RunFailure::Failed(message) => message,
+        RunFailure::Cancelled => unreachable!("no cancel flag was supplied"),
+    })
+}
+
+/// Why [`run_command`] did not return output.
+#[derive(Debug)]
+pub(crate) enum RunFailure {
+    /// The caller's cancel flag fired; the child and its tree were terminated.
+    Cancelled,
+    Failed(String),
+}
+
+/// Run a short helper command with no timer, stopping only when `cancel` is
+/// set. For agent run paths, where nothing may give up on a fixed deadline.
+pub(crate) fn run_until_cancelled(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    cancel: &AtomicBool,
+) -> Result<Output, RunFailure> {
+    run_command(program, args, cwd, None, Some(cancel))
+}
+
+fn run_command(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Option<Duration>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Output, RunFailure> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let timed_out = |started: Instant| timeout.is_some_and(|limit| started.elapsed() >= limit);
+    let timeout_ms = timeout.map_or(0, |limit| limit.as_millis());
+    let fail = |message: String| RunFailure::Failed(message);
     let label = command_label(program, args);
     let resolved_program =
         resolve_binary_on_path(program).unwrap_or_else(|| PathBuf::from(program));
@@ -1222,13 +1259,15 @@ pub(crate) fn run_with_timeout(
     configure_process_tree(&mut builder);
     let mut child = builder
         .spawn()
-        .map_err(|err| format!("could not run `{label}`: {err}"))?;
+        .map_err(|err| fail(format!("could not run `{label}`: {err}")))?;
     let process_tree = match ChildProcessTree::attach(&mut child) {
         Ok(tree) => Arc::new(tree),
         Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("could not isolate `{label}` process tree: {err}"));
+            return Err(fail(format!(
+                "could not isolate `{label}` process tree: {err}"
+            )));
         }
     };
     let stdout = child
@@ -1256,7 +1295,14 @@ pub(crate) fn run_with_timeout(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => {
+            Ok(None) if cancelled() => {
+                let _ = process_tree.terminate_with_fallback(&mut child);
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(RunFailure::Cancelled);
+            }
+            Ok(None) if !timed_out(started) => {
                 thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
@@ -1264,40 +1310,42 @@ pub(crate) fn run_with_timeout(
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                return Err(format!(
-                    "`{label}` timed out after {}ms",
-                    timeout.as_millis()
-                ));
+                return Err(fail(format!("`{label}` timed out after {timeout_ms}ms")));
             }
             Err(err) => {
                 let _ = process_tree.terminate_with_fallback(&mut child);
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                return Err(format!("could not wait for `{label}`: {err}"));
+                return Err(fail(format!("could not wait for `{label}`: {err}")));
             }
         }
     };
     while !stdout_thread.is_finished() || !stderr_thread.is_finished() {
-        if started.elapsed() >= timeout {
+        if cancelled() {
             let _ = process_tree.terminate();
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
-            return Err(format!(
-                "`{label}` timed out after {}ms while draining output",
-                timeout.as_millis()
-            ));
+            return Err(RunFailure::Cancelled);
+        }
+        if timed_out(started) {
+            let _ = process_tree.terminate();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(fail(format!(
+                "`{label}` timed out after {timeout_ms}ms while draining output"
+            )));
         }
         thread::sleep(Duration::from_millis(25));
     }
     let stdout = stdout_thread
         .join()
-        .map_err(|_| format!("failed to collect `{label}` stdout"))?
-        .map_err(|err| format!("failed to read `{label}` stdout: {err}"))?;
+        .map_err(|_| fail(format!("failed to collect `{label}` stdout")))?
+        .map_err(|err| fail(format!("failed to read `{label}` stdout: {err}")))?;
     let stderr = stderr_thread
         .join()
-        .map_err(|_| format!("failed to collect `{label}` stderr"))?
-        .map_err(|err| format!("failed to read `{label}` stderr: {err}"))?;
+        .map_err(|_| fail(format!("failed to collect `{label}` stderr")))?
+        .map_err(|err| fail(format!("failed to read `{label}` stderr: {err}")))?;
     let output = Output {
         status,
         stdout,
@@ -1308,7 +1356,7 @@ pub(crate) fn run_with_timeout(
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = stderr.trim();
-    Err(if detail.is_empty() {
+    Err(fail(if detail.is_empty() {
         format!(
             "`{}` exited with {}",
             command_label(program, args),
@@ -1316,7 +1364,7 @@ pub(crate) fn run_with_timeout(
         )
     } else {
         format!("`{}` failed: {detail}", command_label(program, args))
-    })
+    }))
 }
 
 fn read_bounded_pipe(

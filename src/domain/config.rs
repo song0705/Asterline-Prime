@@ -3,10 +3,13 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::{env, fs, io};
 
-use crate::adapter::models::{model_family_words, run_with_timeout};
+use crate::adapter::models::{
+    RunFailure, model_family_words, run_until_cancelled, run_with_timeout,
+};
 use crate::domain::event::SpawnRequest;
 use crate::domain::model_directory::ModelDirectory;
 use crate::domain::team::{
@@ -246,11 +249,26 @@ fn supported_agy_in_dirs(dirs: &[PathBuf], path_ext: Option<&OsStr>, windows: bo
         .is_some_and(|binary| check_agy_version_path(&binary).is_ok())
 }
 
-pub(crate) fn check_agy_version(binary: &str) -> Result<(), String> {
+/// Run-path version check: no timer, stops only when `cancel` is set.
+/// `None` means the check was cancelled and says nothing about the binary.
+pub(crate) fn check_agy_version_cancelable(
+    binary: &str,
+    cancel: &AtomicBool,
+) -> Option<Result<(), String>> {
     let resolved = resolve_binary_on_path(binary).unwrap_or_else(|| PathBuf::from(binary));
-    check_agy_version_path(&resolved)
+    let program = resolved.to_string_lossy();
+    match run_until_cancelled(&program, &["--version"], Path::new("."), cancel) {
+        Ok(output) => Some(validate_agy_version(&String::from_utf8_lossy(
+            &output.stdout,
+        ))),
+        Err(RunFailure::Cancelled) => None,
+        Err(RunFailure::Failed(error)) => {
+            Some(Err(format!("Agy 1.1.12 or newer is required; {error}")))
+        }
+    }
 }
 
+/// Startup detection keeps a short bound because it blocks app launch.
 fn check_agy_version_path(binary: &Path) -> Result<(), String> {
     let program = binary.to_string_lossy();
     let output = run_with_timeout(

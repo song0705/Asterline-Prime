@@ -340,8 +340,11 @@ pub struct AdapterCommand {
 /// Builds backend commands and stateful per-run line parsers.
 pub trait StreamAdapter: Send + Sync {
     fn backend(&self) -> BackendKind;
-    /// Validate backend capabilities before starting a member turn.
-    fn preflight(&self) -> Result<(), String> {
+    /// Validate backend capabilities before starting a member turn. Runs on
+    /// the agent run path, so it must have no timer; it stops only when
+    /// `cancel` is set, in which case the returned error is ignored.
+    fn preflight(&self, cancel: &AtomicBool) -> Result<(), String> {
+        let _ = cancel;
         Ok(())
     }
     fn build_command(
@@ -395,8 +398,12 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
     }
 
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
-        if let Err(message) = self.adapter.preflight() {
-            let _ = events.send(AgentEvent::Fatal(message));
+        if let Err(message) = self.adapter.preflight(&req.cancel) {
+            // A cancelled preflight says nothing about the backend; the user
+            // already stopped the run, so report no failure.
+            if !req.cancel.load(Ordering::Relaxed) {
+                let _ = events.send(AgentEvent::Fatal(message));
+            }
             let _ = events.send(AgentEvent::Exited {
                 code: None,
                 ok: false,
@@ -763,7 +770,7 @@ mod tests {
             BackendKind::Agy
         }
 
-        fn preflight(&self) -> Result<(), String> {
+        fn preflight(&self, _cancel: &AtomicBool) -> Result<(), String> {
             Err("Agy 1.1.12 or newer is required".to_string())
         }
 

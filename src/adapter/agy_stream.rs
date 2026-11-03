@@ -17,7 +17,7 @@ use crate::adapter::parser::{
     is_permission_denied_tool, str_field, summarize, tool_detail, tool_value,
 };
 use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
-use crate::domain::config::check_agy_version;
+use crate::domain::config::check_agy_version_cancelable;
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
 
@@ -65,10 +65,20 @@ impl AgyStreamAdapter {
         self
     }
 
-    fn ensure_supported_version(&self) -> Result<(), String> {
-        self.version_check
-            .get_or_init(|| check_agy_version(&self.binary))
-            .clone()
+    /// Check the installed agy version once per adapter. The check has no
+    /// timer (a slow cold start must not fail a run) and is cancel-aware; a
+    /// cancelled check is not cached, so the next run checks again.
+    fn ensure_supported_version(&self, cancel: &AtomicBool) -> Result<(), String> {
+        if let Some(cached) = self.version_check.get() {
+            return cached.clone();
+        }
+        match check_agy_version_cancelable(&self.binary, cancel) {
+            Some(result) => {
+                let _ = self.version_check.set(result.clone());
+                result
+            }
+            None => Err("Agy version check cancelled".to_string()),
+        }
     }
 
     fn log_path(&self) -> PathBuf {
@@ -111,8 +121,8 @@ impl StreamAdapter for AgyStreamAdapter {
         BackendKind::Agy
     }
 
-    fn preflight(&self) -> Result<(), String> {
-        self.ensure_supported_version()
+    fn preflight(&self, cancel: &AtomicBool) -> Result<(), String> {
+        self.ensure_supported_version(cancel)
     }
 
     fn build_command(
@@ -254,7 +264,8 @@ fn mark_agy_process_exit() {
 }
 
 pub(crate) fn agy_quota_retry_delay(fatal: &str, attempt: u32) -> Option<Duration> {
-    if attempt >= 3 || !is_agy_quota_error(fatal) {
+    // Rate limits can last minutes; keep retrying until success or cancel.
+    if !is_agy_quota_error(fatal) {
         return None;
     }
     Some(agy_quota_retry_backoff(attempt))
@@ -274,10 +285,18 @@ fn agy_quota_retry_backoff(attempt: u32) -> Duration {
         let _ = attempt;
         return Duration::from_millis(25);
     }
+    agy_quota_backoff_schedule(attempt)
+}
+
+/// 2, 5, 10, 30, 60 seconds, then every 120 seconds without end.
+fn agy_quota_backoff_schedule(attempt: u32) -> Duration {
     Duration::from_secs(match attempt {
         0 => 2,
         1 => 5,
-        _ => 10,
+        2 => 10,
+        3 => 30,
+        4 => 60,
+        _ => 120,
     })
 }
 
@@ -542,11 +561,85 @@ mod tests {
         let member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
         let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"))
             .with_binary(binary.display().to_string());
-        let error = adapter.preflight().unwrap_err();
+        let error = adapter.preflight(&AtomicBool::new(false)).unwrap_err();
 
         assert!(error.contains("found 1.1.11"), "{error}");
         assert!(error.contains("--mode"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn fake_agy(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = dir.join("agy");
+        std::fs::create_dir_all(dir).unwrap();
+        let _ = std::fs::remove_file(&binary);
+        std::fs::write(&binary, script).unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+        binary
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_hanging_version_check_returns_promptly_and_is_not_cached() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-agy-hanging-version-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let binary = fake_agy(&dir, "#!/bin/sh\nsleep 60\n");
+        let member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"))
+            .with_binary(binary.display().to_string());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let result = adapter.preflight(&cancel);
+        canceller.join().unwrap();
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel must not wait for the hung --version: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            adapter.version_check.get().is_none(),
+            "a cancelled check must not be cached as a failure"
+        );
+
+        // The same adapter now sees a healthy binary and passes.
+        fake_agy(&dir, "#!/bin/sh\nprintf '1.1.12\\n'\n");
+        adapter.preflight(&AtomicBool::new(false)).unwrap();
+        assert!(matches!(adapter.version_check.get(), Some(Ok(()))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_version_check_is_not_cut_off_by_a_timer_and_success_is_cached() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-agy-slow-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let binary = fake_agy(&dir, "#!/bin/sh\nsleep 1\nprintf '1.1.12\\n'\n");
+        let member = TeamMember::new("a", "Agy", BackendKind::Agy, "research");
+        let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"))
+            .with_binary(binary.display().to_string());
+        let cancel = AtomicBool::new(false);
+
+        adapter.preflight(&cancel).unwrap();
+        // Remove the binary: a second call can only succeed from the cache.
+        std::fs::remove_dir_all(&dir).unwrap();
+        adapter.preflight(&cancel).unwrap();
+        assert!(matches!(adapter.version_check.get(), Some(Ok(()))));
     }
 
     #[test]
@@ -847,7 +940,28 @@ mod tests {
             0
         )
         .is_some());
-        assert!(agy_quota_retry_delay("RESOURCE_EXHAUSTED", 3).is_none());
+        assert!(agy_quota_retry_delay("model not found", 0).is_none());
+        assert!(agy_quota_retry_delay("model not found", 50).is_none());
+    }
+
+    #[test]
+    fn quota_retries_never_give_up_and_back_off_to_two_minutes() {
+        let secs = [2, 5, 10, 30, 60, 120, 120, 120];
+        for (attempt, expected) in secs.into_iter().enumerate() {
+            assert_eq!(
+                agy_quota_backoff_schedule(attempt as u32),
+                Duration::from_secs(expected),
+                "attempt {attempt}"
+            );
+            assert!(agy_quota_retry_delay("RESOURCE_EXHAUSTED", attempt as u32).is_some());
+        }
+        for attempt in [1_000, u32::MAX - 1, u32::MAX] {
+            assert_eq!(
+                agy_quota_backoff_schedule(attempt),
+                Duration::from_secs(120)
+            );
+            assert!(agy_quota_retry_delay("RESOURCE_EXHAUSTED", attempt).is_some());
+        }
     }
 
     #[test]
