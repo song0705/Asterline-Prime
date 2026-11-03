@@ -429,25 +429,28 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
     }
 
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
+        let inbox = req.steer.clone();
+        // Every `Exited` below goes through here, so the steer inbox is closed
+        // (and leftovers handed back) ahead of it on every path.
+        let finish = |code: Option<i32>, ok: bool| {
+            if let Some(inbox) = &inbox {
+                reject_steers(&events, inbox.close());
+            }
+            let _ = events.send(AgentEvent::Exited { code, ok });
+        };
         if let Err(message) = self.adapter.preflight(&req.cancel) {
             // A cancelled preflight says nothing about the backend; the user
             // already stopped the run, so report no failure.
             if !req.cancel.load(Ordering::Relaxed) {
                 let _ = events.send(AgentEvent::Fatal(message));
             }
-            let _ = events.send(AgentEvent::Exited {
-                code: None,
-                ok: false,
-            });
+            finish(None, false);
             return;
         }
         let mut attempt = 0u32;
         loop {
             if req.cancel.load(Ordering::Relaxed) || !self.adapter.prepare_run(&req.cancel) {
-                let _ = events.send(AgentEvent::Exited {
-                    code: None,
-                    ok: false,
-                });
+                finish(None, false);
                 return;
             }
             let command = self
@@ -513,15 +516,8 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
                 let _ = events.send(AgentEvent::Fatal(message));
             }
             match exit {
-                Some((code, ok)) => {
-                    let _ = events.send(AgentEvent::Exited { code, ok });
-                }
-                None => {
-                    let _ = events.send(AgentEvent::Exited {
-                        code: None,
-                        ok: false,
-                    });
-                }
+                Some((code, ok)) => finish(code, ok),
+                None => finish(None, false),
             }
             return;
         }
@@ -663,6 +659,17 @@ fn reject_steers(events: &SyncSender<AgentEvent>, prompts: impl IntoIterator<Ite
     }
 }
 
+/// Close the run's steer inbox and give back what never reached the backend.
+/// Called right before an `Exited` event so no steer is accepted after it.
+fn reject_waiting_steers(
+    events: &SyncSender<AgentEvent>,
+    steer: &Option<(SteerReceiver, SteerEncoder)>,
+) {
+    if let Some((inbox, _)) = steer {
+        reject_steers(events, inbox.close());
+    }
+}
+
 /// [`run_streaming`] with an optional steer channel. With one, messages the
 /// runtime sends are encoded by the paired function and written to the live
 /// process's stdin, and each is reported as `SteerDelivered` when the backend
@@ -714,6 +721,7 @@ fn run_streaming_inner(
                 command.program
             )));
             // Always end a run with Exited so the runtime can finalize it.
+            reject_waiting_steers(&events, &steer);
             let _ = events.send(AgentEvent::Exited {
                 code: None,
                 ok: false,
@@ -731,6 +739,7 @@ fn run_streaming_inner(
                 "failed to isolate {} process tree: {err}",
                 command.program
             )));
+            reject_waiting_steers(&events, &steer);
             let _ = events.send(AgentEvent::Exited {
                 code: None,
                 ok: false,
@@ -754,6 +763,7 @@ fn run_streaming_inner(
                 "{} did not expose stdin for the prompt",
                 command.program
             )));
+            reject_waiting_steers(&events, &steer);
             let _ = events.send(AgentEvent::Exited {
                 code: None,
                 ok: false,

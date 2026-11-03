@@ -1018,9 +1018,18 @@ mod tests {
             /// Run one turn with `steer_messages` already waiting in the
             /// run's steer channel; return every event the runner emitted.
             fn run(&self, steer_messages: &[&str]) -> Vec<AgentEvent> {
+                self.run_binary(&self.dir.join("fake-claude"), steer_messages)
+            }
+
+            /// [`Self::run`] against an arbitrary Claude binary path.
+            fn run_binary(
+                &self,
+                binary: &std::path::Path,
+                steer_messages: &[&str],
+            ) -> Vec<AgentEvent> {
                 let member = TeamMember::new("rev", "Rev", BackendKind::Claude, "review");
                 let adapter = ClaudeStreamAdapter::from_member(&member, &self.dir)
-                    .with_binary(self.dir.join("fake-claude").display().to_string());
+                    .with_binary(binary.display().to_string());
                 let runner = ProcessRunner::new(adapter);
                 assert!(runner.supports_steer());
                 let (tx, rx) = steer_channel();
@@ -1052,6 +1061,29 @@ mod tests {
 
         fn count(events: &[AgentEvent], wanted: &AgentEvent) -> usize {
             events.iter().filter(|event| *event == wanted).count()
+        }
+
+        #[test]
+        fn claude_that_cannot_start_rejects_waiting_steers_before_the_exit() {
+            let fixture = Fixture::new("missing-binary", "#!/bin/sh\n");
+            let missing = fixture.dir.join("no-such-claude");
+            // `run` itself asserts that a steer sent after the run is refused.
+            let events = fixture.run_binary(&missing, &["never delivered"]);
+            let rejected = events
+                .iter()
+                .position(|event| {
+                    *event
+                        == AgentEvent::SteerRejected {
+                            prompt: "never delivered".to_string(),
+                        }
+                })
+                .unwrap_or_else(|| panic!("no SteerRejected in {events:?}"));
+            let exited = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::Exited { ok: false, .. }))
+                .unwrap_or_else(|| panic!("no Exited in {events:?}"));
+            assert!(rejected < exited, "{events:?}");
+            assert!(!events.contains(&AgentEvent::SteerDelivered));
         }
 
         #[test]

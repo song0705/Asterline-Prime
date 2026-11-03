@@ -280,16 +280,10 @@ fn parse_model_page(response: &Value) -> Result<Vec<DiscoveredModel>, String> {
         .collect())
 }
 
-impl MemberRunner for CodexAppServerRunner {
-    fn backend(&self) -> BackendKind {
-        BackendKind::Codex
-    }
-
-    fn supports_steer(&self) -> bool {
-        true
-    }
-
-    fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
+impl CodexAppServerRunner {
+    /// Start the server if needed and run one turn. Returns whether the turn
+    /// succeeded; the caller closes the steer inbox and sends `Exited`.
+    fn run_to_outcome(&self, req: RunRequest, events: &SyncSender<AgentEvent>) -> bool {
         let mut guard = match self.client.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -302,15 +296,11 @@ impl MemberRunner for CodexAppServerRunner {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
         if guard.is_none() {
-            match AppServerClient::start(&self.config, &events, Some(&req.cancel)) {
+            match AppServerClient::start(&self.config, events, Some(&req.cancel)) {
                 Ok(None) => {
                     // Cancelled while the server was starting: a normal
                     // cancelled outcome, not an error.
-                    let _ = events.send(AgentEvent::Exited {
-                        code: None,
-                        ok: false,
-                    });
-                    return;
+                    return false;
                 }
                 Ok(Some((client, native_approval_tx))) => {
                     *self
@@ -322,11 +312,7 @@ impl MemberRunner for CodexAppServerRunner {
                 }
                 Err(error) => {
                     let _ = events.send(AgentEvent::Fatal(error));
-                    let _ = events.send(AgentEvent::Exited {
-                        code: None,
-                        ok: false,
-                    });
-                    return;
+                    return false;
                 }
             }
         }
@@ -334,10 +320,9 @@ impl MemberRunner for CodexAppServerRunner {
         let result = guard
             .as_mut()
             .expect("App Server client is initialized above")
-            .run_turn(&self.config, req, &events);
+            .run_turn(&self.config, req, events);
         match result {
             Ok(ok) => {
-                let _ = events.send(AgentEvent::Exited { code: None, ok });
                 if guard.as_ref().is_some_and(|client| client.abandoned) {
                     *guard = None;
                     *self
@@ -345,23 +330,42 @@ impl MemberRunner for CodexAppServerRunner {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 }
+                ok
             }
             Err(error) => {
                 // Reset only on a transport/protocol failure. A normal failed
                 // Codex turn returns Ok(false) and leaves the server ready for
                 // a later turn in the same native thread.
                 let _ = events.send(AgentEvent::Fatal(error));
-                let _ = events.send(AgentEvent::Exited {
-                    code: None,
-                    ok: false,
-                });
                 *guard = None;
                 *self
                     .native_approval_tx
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                false
             }
         }
+    }
+}
+
+impl MemberRunner for CodexAppServerRunner {
+    fn backend(&self) -> BackendKind {
+        BackendKind::Codex
+    }
+
+    fn supports_steer(&self) -> bool {
+        true
+    }
+
+    fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
+        let steer = req.steer.clone();
+        let ok = self.run_to_outcome(req, &events);
+        // Every way out of a run passes through here: refuse further steers and
+        // give back any that never reached the server, ahead of the exit event.
+        if let Some(steer) = steer {
+            reject_steers(&events, steer.close());
+        }
+        let _ = events.send(AgentEvent::Exited { code: None, ok });
     }
 
     fn resolve_native_approval(&self, request_id: u64, decision: ApprovalDecision) -> bool {
@@ -491,22 +495,6 @@ impl AppServerClient {
     }
 
     fn run_turn(
-        &mut self,
-        config: &CodexAppServerConfig,
-        req: RunRequest,
-        events: &SyncSender<AgentEvent>,
-    ) -> Result<bool, String> {
-        let steer = req.steer.clone();
-        let result = self.run_turn_inner(config, req, events);
-        // The turn is over, one way or another: refuse further steers and give
-        // back any that never reached the server, ahead of the exit event.
-        if let Some(steer) = steer {
-            reject_steers(events, steer.close());
-        }
-        result
-    }
-
-    fn run_turn_inner(
         &mut self,
         config: &CodexAppServerConfig,
         req: RunRequest,
@@ -2839,6 +2827,55 @@ printf '%s\n' '{"id":5,"error":{"code":-32600,"message":"expected turn id does n
             .unwrap();
         assert!(rejected < exited);
         assert!(!events.contains(&AgentEvent::SteerDelivered));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steer_waiting_when_the_server_cannot_start_is_rejected_before_the_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-codex-steer-nostart-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+        let runner = CodexAppServerRunner::from_member(&member, &dir)
+            .with_binary(dir.join("no-such-codex").display().to_string());
+        let (steer_tx, steer_rx) = crate::adapter::steer_channel();
+        steer_tx.send("queued".to_string()).unwrap();
+        let (events, received) = mpsc::sync_channel(64);
+        runner.run(
+            RunRequest {
+                steer: Some(steer_rx),
+                prompt: "work".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            events,
+        );
+        assert!(steer_tx.send("late".to_string()).is_err());
+        let seen = received.try_iter().collect::<Vec<_>>();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_))),
+            "{seen:?}"
+        );
+        let rejected = seen
+            .iter()
+            .position(|event| {
+                *event
+                    == AgentEvent::SteerRejected {
+                        prompt: "queued".to_string(),
+                    }
+            })
+            .unwrap_or_else(|| panic!("no SteerRejected in {seen:?}"));
+        let exited = seen
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Exited { ok: false, .. }))
+            .unwrap_or_else(|| panic!("no Exited in {seen:?}"));
+        assert!(rejected < exited, "{seen:?}");
     }
 
     #[test]
