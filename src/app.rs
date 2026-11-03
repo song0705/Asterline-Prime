@@ -10,12 +10,14 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
+use crate::domain::TerminalMode;
 use crate::domain::config::{
     DetectedBackends, default_team, detect_backends, ensure_brainstorm_skill, ensure_team_skill,
-    inject_team_protocol, load_team_config,
+    inject_team_protocol, load_team_config, strip_team_protocols,
 };
 use crate::domain::event::{ChatItem, RuntimeEvent};
-use crate::domain::team::TeamConfig;
+use crate::domain::mode::ModesConfig;
+use crate::domain::team::{SessionPolicy, TeamConfig};
 use crate::fs_safety;
 use crate::legacy_migration;
 use crate::runtime::{self, Runners, RuntimeHandle};
@@ -222,31 +224,22 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
             .restore_active_team_config(&team)
             .map_err(|err| io::Error::other(err.to_string()))?;
     }
+    if !config.no_restore {
+        // Every launch opens a new, empty chat; earlier chats are reached
+        // through `/resume`.
+        team = start_fresh_chat(&store, team, restore_saved_roster)?;
+    }
     inject_team_protocol(&mut team);
 
     let runners = build_runners(&team, config.fake);
-    let (chat, logs) = if config.no_restore {
-        (Vec::new(), Vec::new())
+    // The chat starts empty: nothing from the previous chat is replayed. Logs
+    // are global rather than per chat, so the recent tail still fills the logs
+    // drawer.
+    let mut chat = Vec::new();
+    let logs = if config.no_restore {
+        Vec::new()
     } else {
-        // Replay only the current conversation (the latest, or a fresh one).
-        if let Ok(conversation) = store.current_conversation() {
-            store
-                .set_conversation(conversation)
-                .map_err(|err| io::Error::other(err.to_string()))?;
-        }
-        // A replay failure must be visible, not a silently-blank transcript:
-        // surface it as the first chat item so a schema/store problem is
-        // obvious in-app instead of looking like "history was lost".
-        let mut chat = match store.replay_chat() {
-            Ok(chat) => chat,
-            Err(err) => vec![ChatItem::Notice {
-                member: None,
-                text: format!("could not replay history: {err}"),
-            }],
-        };
-        // Logs are persisted too; replay the recent tail so the logs drawer
-        // isn't empty after a restart.
-        let logs = match store.recent_logs(4000) {
+        match store.recent_logs(4000) {
             Ok(logs) => logs,
             Err(err) => {
                 chat.push(ChatItem::Notice {
@@ -255,10 +248,8 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
                 });
                 Vec::new()
             }
-        };
-        (chat, logs)
+        }
     };
-    let mut chat = chat;
     chat.extend(
         startup_notices
             .into_iter()
@@ -266,10 +257,6 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
     );
     let mut state = AppState::new(chat);
     state.seed_logs(logs);
-    if !config.no_restore {
-        // Sub-agents removed earlier in this chat keep their message labels.
-        state.seed_departed(store.departed_members().unwrap_or_default());
-    }
 
     // Bound the runtime-to-TUI stream so a fast or malformed backend cannot
     // turn a slow terminal renderer into an unbounded in-memory queue.
@@ -297,6 +284,55 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         state,
         instance_lock,
     }))
+}
+
+/// Open a new chat unless the active one is still blank.
+///
+/// The previous chat keeps its own snapshot (roster, sessions, mode), so
+/// `/resume` can bring it back. Like `/new`, the new chat starts with the
+/// top-level members only, in the previous chat's mode overrides. When the
+/// roster came from the saved team or an earlier chat (`clear_sessions`), its
+/// backend sessions belong to the previous chat and are dropped; an explicit
+/// `--team` file keeps the sessions it configures. A blank active chat is
+/// reused so repeated launches do not pile up empty rows. Returns the roster
+/// to start the runtime with.
+fn start_fresh_chat(
+    store: &SqliteStore,
+    team: TeamConfig,
+    clear_sessions: bool,
+) -> io::Result<TeamConfig> {
+    let to_io = |err: rusqlite::Error| io::Error::other(err.to_string());
+    let previous = store.current_conversation().map_err(to_io)?;
+    if !store.conversation_has_content(previous).map_err(to_io)? {
+        return Ok(team);
+    }
+    let mode_overrides = match store.conversation_snapshot(previous).map_err(to_io)? {
+        Some(snapshot) => snapshot.mode_overrides,
+        None => {
+            // A chat from before snapshots existed would otherwise vanish from
+            // `/resume` once it stops being the active one.
+            store
+                .save_conversation_snapshot(
+                    &strip_team_protocols(team.clone()),
+                    &[],
+                    TerminalMode::Normal,
+                    &ModesConfig::default(),
+                )
+                .map_err(to_io)?;
+            ModesConfig::default()
+        }
+    };
+    let mut fresh = strip_team_protocols(team.without_sub_agents());
+    if clear_sessions {
+        for member in &mut fresh.members {
+            member.session_id = None;
+            member.session_policy = SessionPolicy::Fresh;
+        }
+    }
+    store
+        .create_fresh_conversation(&fresh, TerminalMode::Normal, &mode_overrides)
+        .map_err(to_io)?;
+    Ok(fresh)
 }
 
 fn ensure_workspace_exists(workspace: &Path) -> io::Result<()> {
@@ -792,7 +828,8 @@ mod tests {
         ])
         .unwrap();
         let prepared = prepare(&config, &dir).unwrap().expect("prepared");
-        assert!(prepared.state.chat().iter().any(|item| matches!(
+        // A launch opens a new, empty chat: the old message is not replayed.
+        assert!(!prepared.state.chat().iter().any(|item| matches!(
             item,
             ChatItem::User { body, .. } if body == "restore this chat after reopening"
         )));
@@ -809,6 +846,134 @@ mod tests {
 
         prepared.handle.send(UiCommand::Shutdown);
         prepared.join.join().unwrap();
+
+        // The old chat is still reachable through `/resume`.
+        let store = SqliteStore::open(&db_path).unwrap();
+        let resumable = store.resumable_conversations().unwrap();
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].preview, "restore this chat after reopening");
+        assert_eq!(
+            resumable[0].main_effort,
+            Some(crate::domain::team::Effort::High)
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn launch_prepared(dir: &Path, db_path: &Path) -> Prepared {
+        let config = AppConfig::parse([
+            "--workspace",
+            dir.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+            "--fake",
+        ])
+        .unwrap();
+        prepare(&config, dir).unwrap().expect("prepared")
+    }
+
+    fn codex_only_team(dir: &Path) -> TeamConfig {
+        crate::domain::config::default_team(
+            dir,
+            crate::domain::config::DetectedBackends {
+                codex: true,
+                claude: false,
+                grok: false,
+                agy: false,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn launching_twice_without_messages_reuses_the_blank_chat() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-app-blank-relaunch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite3");
+
+        let mut active = Vec::new();
+        for _ in 0..2 {
+            let prepared = launch_prepared(&dir, &db_path);
+            assert!(prepared.state.chat().is_empty());
+            prepared.handle.send(UiCommand::Shutdown);
+            prepared.join.join().unwrap();
+            let store = SqliteStore::open(&db_path).unwrap();
+            active.push(store.current_conversation().unwrap());
+        }
+        assert_eq!(active[0], active[1]);
+        let count: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_chat_drops_sub_agents_and_sessions_of_the_previous_chat() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-app-fresh-roster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = codex_only_team(&dir);
+        let team_path = state_paths::team_config_path(&dir);
+        std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
+        runtime::save_team_config(&team_path, &launch).unwrap();
+
+        let db_path = dir.join("db.sqlite3");
+        let store = SqliteStore::open(&db_path).unwrap();
+        let old = store.current_conversation().unwrap();
+        let mut saved = launch.clone();
+        saved.members[0].session_id = Some("old-native-session".to_string());
+        saved.members[0].session_policy = crate::domain::team::SessionPolicy::Resume;
+        let mut child =
+            crate::domain::team::TeamMember::new("kid", "Kid", saved.members[0].backend, "helper");
+        child.parent = Some(saved.members[0].id.clone());
+        saved.members.push(child);
+        store
+            .save_conversation_snapshot(
+                &saved,
+                &[],
+                crate::domain::TerminalMode::Normal,
+                &crate::domain::mode::ModesConfig::default(),
+            )
+            .unwrap();
+        let turn = store.create_turn().unwrap();
+        store
+            .record_user(turn, std::slice::from_ref(&launch.members[0].id), "hello")
+            .unwrap();
+        drop(store);
+
+        let prepared = launch_prepared(&dir, &db_path);
+        let ready = prepared
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        match ready {
+            RuntimeEvent::Ready { members, .. } => {
+                assert!(members.iter().all(|member| member.id.as_str() != "kid"));
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        prepared.handle.send(UiCommand::Shutdown);
+        prepared.join.join().unwrap();
+
+        let store = SqliteStore::open(&db_path).unwrap();
+        let fresh = store.current_conversation().unwrap();
+        assert_ne!(fresh, old);
+        let snapshot = store.conversation_snapshot(fresh).unwrap().unwrap();
+        assert!(snapshot.team.members.iter().all(|m| m.parent.is_none()));
+        assert!(snapshot.team.members.iter().all(|m| m.session_id.is_none()
+            && m.session_policy == crate::domain::team::SessionPolicy::Fresh));
+        assert!(snapshot.sessions.is_empty());
+        // The old chat keeps its own roster for `/resume`.
+        let previous = store.conversation_snapshot(old).unwrap().unwrap();
+        assert!(previous.team.members.iter().any(|m| m.parent.is_some()));
+        drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1074,7 +1239,8 @@ mod tests {
             AppConfig::parse(["--workspace", workspace.to_str().unwrap(), "--fake"]).unwrap();
         let prepared = prepare(&config, &root).unwrap().expect("prepared");
 
-        assert!(prepared.state.chat().iter().any(|item| matches!(
+        // The migrated chat is no longer replayed on launch; `/resume` lists it.
+        assert!(!prepared.state.chat().iter().any(|item| matches!(
             item,
             ChatItem::User { body, .. } if body == "chat from the old layout"
         )));
@@ -1092,6 +1258,15 @@ mod tests {
 
         prepared.handle.send(UiCommand::Shutdown);
         prepared.join.join().unwrap();
+        let store = SqliteStore::open(state_paths::db_path(&workspace)).unwrap();
+        assert!(
+            store
+                .resumable_conversations()
+                .unwrap()
+                .iter()
+                .any(|chat| chat.preview == "chat from the old layout")
+        );
+        drop(store);
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(state_paths::project_dir(&workspace)).ok();
     }

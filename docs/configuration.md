@@ -493,7 +493,8 @@ verification outcomes.
 Protect this directory like any other development transcript. It is outside
 your repositories, so there is nothing to add to `.gitignore`.
 
-Reopening Asterline restores the selected conversation by default. `/new` and
+Every launch opens a new, empty conversation (an existing blank one is reused);
+earlier conversations are reached with `/resume`. `/new` and
 `/clear` both create a clean conversation in normal mode and new backend
 sessions while retaining older database records. They are rejected while
 members, runs, or verification are active; press `Esc` and wait for

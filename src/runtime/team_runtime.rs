@@ -2091,6 +2091,8 @@ impl TeamRuntime {
         let _ = self
             .store
             .set_native_import_cursor(&member_id, &agent_session, count);
+        // Refresh the chat snapshot so /resume restores the attached session.
+        self.persist_snapshot_or_notice("save the chat session", step);
 
         self.handle_import_transcript(member_id.clone(), native, step);
         step.events.push(RuntimeEvent::SessionUpdated {

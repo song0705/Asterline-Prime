@@ -87,6 +87,22 @@ pub struct ConversationSnapshot {
     pub mode_overrides: ModesConfig,
 }
 
+/// SQL for the first real user message of conversation `c.id`: the text of
+/// the earliest non-blank `user` message. Older Codex attach imports could
+/// persist the native `<recommended_plugins>` bootstrap block as a user
+/// message; it is not a useful title or a sign of real content, so it is
+/// skipped. Shared by the resume list and `conversation_has_content`.
+macro_rules! first_user_message_sql {
+    () => {
+        "SELECT text FROM messages
+                         WHERE conversation_id = c.id
+                           AND kind = 'user'
+                           AND TRIM(text) != ''
+                           AND LOWER(LTRIM(text)) NOT LIKE '<recommended_plugins>%'
+                         ORDER BY id ASC LIMIT 1"
+    };
+}
+
 #[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
@@ -1093,7 +1109,7 @@ impl SqliteStore {
     /// an imported plugin inventory) is skipped unless it has a name, so
     /// starting `/new` and leaving does not leave an unnamed entry behind.
     pub fn resumable_conversations(&self) -> Result<Vec<ConversationSummary>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(concat!(
             "SELECT c.id,
                     c.created_at,
                     COALESCE(
@@ -1101,19 +1117,9 @@ impl SqliteStore {
                          WHERE conversation_id = c.id),
                         c.created_at
                     ) AS updated_at,
-                    COALESCE(
-                        (SELECT text FROM messages
-                         WHERE conversation_id = c.id
-                           AND kind = 'user'
-                           AND TRIM(text) != ''
-                           -- Older Codex attach imports could persist this
-                           -- native bootstrap block as a user message. It is
-                           -- not a useful conversation title; pick the first
-                           -- actual user request instead.
-                           AND LOWER(LTRIM(text)) NOT LIKE '<recommended_plugins>%'
-                         ORDER BY id ASC LIMIT 1),
-                        ''
-                    ) AS preview,
+                    COALESCE((",
+            first_user_message_sql!(),
+            "), '') AS preview,
                     (SELECT COUNT(*) FROM messages
                      WHERE conversation_id = c.id AND kind != 'agent_control'),
                     s.team_json,
@@ -1121,8 +1127,8 @@ impl SqliteStore {
              FROM conversations c
              JOIN conversation_snapshots s ON s.conversation_id = c.id
              WHERE c.id != ?1 AND (preview != '' OR c.name IS NOT NULL)
-             ORDER BY updated_at DESC, c.id DESC",
-        )?;
+             ORDER BY updated_at DESC, c.id DESC"
+        ))?;
         let rows = stmt.query_map(params![self.conversation.get()], |row| {
             let team_json: String = row.get(5)?;
             let team = serde_json::from_str::<TeamConfig>(&team_json).map_err(|err| {
@@ -1143,6 +1149,25 @@ impl SqliteStore {
             })
         })?;
         rows.collect()
+    }
+
+    /// Whether a chat is worth keeping: it holds a real user message or has a
+    /// name. This is the same test `resumable_conversations` applies, so a
+    /// chat that fails it never shows up in `/resume` and can be reused
+    /// instead of leaving another blank row behind.
+    pub fn conversation_has_content(&self, conversation: i64) -> Result<bool> {
+        self.conn.query_row(
+            concat!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversations c
+                    WHERE c.id = ?1
+                      AND (EXISTS(",
+                first_user_message_sql!(),
+                ") OR c.name IS NOT NULL))"
+            ),
+            params![conversation],
+            |row| row.get(0),
+        )
     }
 
     /// The name given to a conversation, if it has one.

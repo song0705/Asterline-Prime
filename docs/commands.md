@@ -72,7 +72,7 @@ asterline --db /path/to/asterline.sqlite3
 
 ### `--no-restore`
 
-Start without replaying the most recently persisted conversation. This does
+Start without replaying persisted logs or opening a new conversation. This does
 not delete saved conversations; use `/resume` to select one later.
 
 ```bash
@@ -242,8 +242,8 @@ is untouched.
 
 `/clear` takes no argument and does the same full new-conversation operation
 as a bare `/new` rather than merely hiding history (`/clear text` answers
-`Usage: /clear`). A normal restart reopens the currently selected conversation
-instead of clearing it. `/new` also removes the chat's sub-agents (see
+`Usage: /clear`). A normal restart opens a new conversation and leaves the earlier
+one available in `/resume`. `/new` also removes the chat's sub-agents (see
 [Sub-agents](configuration.md#sub-agents); one at a time, `Ctrl+X` in the Agents list removes a single sub-agent). The old chat stays in the Agents
 list's **Inactive** section (see [Agents list](#agents-list-)). `Ctrl+N` in
 that list is the same as `/new`.
