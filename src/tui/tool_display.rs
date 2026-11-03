@@ -153,8 +153,11 @@ fn skill_tool_target(name: &str, summary: &str, detail: &str) -> Option<String> 
         .trim();
     for prefix in ["skill:", "skill-", "skill_", "skill "] {
         if cleaned_name.len() > prefix.len()
-            && cleaned_name[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && cleaned_name
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
         {
+            // The head matched the ASCII prefix, so `prefix.len()` is a char boundary.
             let skill_name = cleaned_name[prefix.len()..].trim();
             if !skill_name.is_empty() {
                 let action = friendly_tool_text(summary);
@@ -304,7 +307,9 @@ fn strip_leading_label(headline: &str, label: &str) -> Option<String> {
     }
     let label_len = label.len();
     if headline.len() > label_len
-        && headline[..label_len].eq_ignore_ascii_case(label)
+        && headline
+            .get(..label_len)
+            .is_some_and(|head| head.eq_ignore_ascii_case(label))
         && headline
             .as_bytes()
             .get(label_len)
@@ -1284,6 +1289,108 @@ mod tests {
         assert_eq!(
             display_shell_command("/bin/zsh -lc 'git add .\ngit commit'", true),
             "git add . …"
+        );
+    }
+
+    /// Every label `strip_path_label` knows, so a regression covers each one.
+    const PATH_LABELS: [&str; 7] = [
+        "TargetFile",
+        "target_file",
+        "FilePath",
+        "file_path",
+        "FileName",
+        "filename",
+        "Path",
+    ];
+
+    #[test]
+    fn cjk_headlines_never_split_a_char_when_matching_a_label() {
+        let heads = [
+            "调研/多域图基础模型_文献.md",
+            "域图基础模型_文献.md",
+            "a域图基础模型_文献.md",
+            "ab域图基础模型_文献.md",
+            "abc域图基础模型_文献.md",
+            "文献调研报告综述汇总资料.md",
+            "调研/多域图基础模型_文献.md 第二列",
+        ];
+        for head in heads {
+            // Any label length from 1 to 12 bytes can fall inside a char.
+            assert_eq!(strip_path_label(head), head);
+            for label in PATH_LABELS {
+                assert_eq!(strip_leading_label(head, label), None, "{head} / {label}");
+            }
+            for label in ["a", "ab", "abcd", "abcdefgh", "abcdefghij", "abcdefghijk"] {
+                assert_eq!(strip_leading_label(head, label), None, "{head} / {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn labels_are_still_stripped_in_front_of_cjk_paths() {
+        for label in PATH_LABELS {
+            let line = format!("{label} 调研/多域图基础模型_文献.md");
+            assert_eq!(strip_path_label(&line), "调研/多域图基础模型_文献.md");
+            let upper = format!("{} 域图.md", label.to_ascii_uppercase());
+            assert_eq!(strip_path_label(&upper), "域图.md");
+        }
+        assert_eq!(strip_leading_label("Path", "path"), Some(String::new()));
+        // A label directly followed by CJK text has no whitespace gap.
+        assert_eq!(strip_leading_label("Path域图.md", "Path"), None);
+    }
+
+    #[test]
+    fn cjk_tool_text_survives_the_label_paths() {
+        let path = "调研/多域图基础模型_文献.md";
+        for name in [
+            "read_file",
+            "Read",
+            "view_file",
+            "Bash",
+            "技能分析",
+            "skill技能",
+        ] {
+            for summary in [path, "域图.md", "a域图.md", "文献"] {
+                let target = tool_target(name, summary, "");
+                assert!(target.contains(summary.trim()), "{name}: {target}");
+            }
+        }
+        let json = r#"{"target_file":"调研/多域图基础模型_文献.md"}"#;
+        let target = tool_target("read_file", json, "");
+        assert!(target.contains("多域图基础模型_文献.md"), "{target}");
+    }
+
+    #[test]
+    fn cjk_skill_names_do_not_panic_on_the_prefix_check() {
+        // "skill:" / "skill " are 6 bytes, so a leading ASCII byte puts the
+        // boundary check in the middle of a 3-byte char.
+        for name in [
+            "技能分析",
+            "skill技能",
+            "a技能分析",
+            "ab技能分析",
+            "abcde技能",
+            "abcd技能",
+            "mcp_技能分析",
+            "mcp_a技能分析",
+            "技能",
+        ] {
+            let _ = skill_tool_target(name, "", "");
+            let _ = skill_tool_target(name, "域图.md", "");
+            let _ = tool_target(name, "域图.md", "");
+        }
+        assert_eq!(
+            skill_tool_target("技能分析", "", ""),
+            None,
+            "a non-prefixed name is not a skill target"
+        );
+        assert_eq!(
+            skill_tool_target("skill_技能分析", "", "").as_deref(),
+            Some("技能分析")
+        );
+        assert_eq!(
+            skill_tool_target("Skill: 技能分析", "域图.md", "").as_deref(),
+            Some("技能分析  域图.md")
         );
     }
 }
