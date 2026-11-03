@@ -640,8 +640,8 @@ sends the parent one short explanation; hand-backs and refusals count against
 
 Sub-agents belong to the current chat only. They are never written to
 the saved `team.json` (not even after `/model` or `/team` changes), they are
-saved with the chat so `/resume` and a normal restart bring them back with
-their sessions, and `/new` removes them all (a new chat starts with only the
+saved with the chat so `/resume` brings them back with their sessions, and a
+new chat (a launch, `/new`, or `/clear`) does not have them (it starts with only the
 default `main`, so the top-level members of the old chat are not carried over
 either). A single sub-agent can be removed
 with `Ctrl+X` (twice) on its row in the Agents list, or by its parent with
@@ -707,9 +707,12 @@ Press `e` to enter a model name manually.
 
 ### The wrong roster opens
 
-Edit the project's `team.json` (under `~/.asterline/projects/`), use `/model` to change the model, or use `/team`
-and press `s` to apply roster changes. Deleting `team.json` makes the next
-launch start from the default `main` agent again.
+Every new chat opens with one default `main` agent on the first installed CLI
+(see [How Asterline resolves a team](#how-asterline-resolves-a-team)); the
+members of `team.json` are not used for it. Change the current chat's roster
+with `/model`, or with `/team` and `s`. To return to an older chat's roster,
+`/resume` that chat. To start every new chat with a fixed roster, launch with
+`--team <PATH>`.
 
 ### Start without the previous transcript
 

@@ -19,6 +19,13 @@
 没有设置界面。用 `/model` 修改当前查看的 Agent 的模型，选择会被保存。隐藏的 `--pick-team`
 参数会忽略已保存的 roster，从第 3 步重新开始。
 
+第 1、2 步只决定项目带着走的设置（`name`、`workspace`、`max_auto_relays`、`modes`、`approvals`）。
+**新对话**的成员不从上一个对话继承：每个新对话（启动时打开的、`/new`、`/clear` 和 `Ctrl+N`）都只有一个
+默认的 `main` Agent，和第 3 步一样用第一个已安装的 CLI（依次是 Codex、Claude、Grok、Agy），模型和权限
+用该 CLI 自己的默认值。在 `/team` 里加的成员、用 `/model` 改的模型或 effort 属于当时那个对话；`/resume`
+回到那个对话时它们会一起回来，新对话不会继承。例外是显式的 `--team <PATH>` 文件：第一个对话和该次运行里
+每次 `/new` 都用它的成员。如果一个受支持的 CLI 都没装，新对话保留当前的顶层成员。
+
 用 `/team` 修改正在运行的 roster。Asterline 在启动时一次性加载已安装 Agent CLI 与它们的
 模型目录；之后打开 `/team` 会复用缓存。同一次查询也会读取非 Codex CLI 的本地权限默认值
 用于显示，但不会将它们复制进 `team.json`。Codex 则会在 thread start/resume 时接收
@@ -121,7 +128,7 @@ Homebrew Formula 的安装：先执行 `brew update`，再只升级目标 Formul
 | `workspace` | 是 | 默认工作目录 |
 | `members` | 是 | 非空成员列表 |
 | `default_target` | 否 | `{"member":"id"}`、`"all"` 或第一位成员 |
-| `max_auto_relays` | 否 | 自动队友转交上限；默认 `6` |
+| `max_auto_relays` | 否 | 中间没有工具调用时连续转交的上限；默认 `6` |
 | `modes` | 否 | 协作模式的角色绑定与预算 |
 | `approvals` | 否 | 审批门类别和界面 |
 
@@ -384,12 +391,14 @@ checklist、timeline 和验证结果。
 
 像保护其他开发 transcript 一样保护此目录。它在你的仓库之外，无需改 `.gitignore`。
 
-重新打开 Asterline 默认恢复当前选中的对话。`/new` 与 `/clear` 都会在普通模式创建干净会话和
-新的后端 session，同时保留旧数据库记录。成员、Runs 或验证处于活动状态时它们会被拒绝；先按
+每次启动都会打开一个新的空对话（如果当前对话还是空的就复用它，并换成新对话的成员）；之前的对话用
+`/resume` 找回。`/new` 与 `/clear` 都会在普通模式创建干净会话和新的后端 session，同时保留旧数据库记录。
+每个新对话都只有一个默认的 `main` Agent（见 [Asterline 如何解析团队](#asterline-如何解析团队)）。
+成员、Runs 或验证处于活动状态时它们会被拒绝；先按
 `Esc` 并等待取消。`--no-restore` 跳过启动 replay，不删除数据。`--db <PATH>` 将数据库放到别处。
 
 `/resume` 打开 Agents 列表并停在已保存的聊天（**Inactive** 分组）上；`/new <prompt>` 开新对话并发送该提示。恢复聊天也会恢复该聊天所属的 roster、完整成员配置和
-每位成员的原生后端 session ID。
+每位成员的原生后端 session ID，包括在该对话里用 `/team` 加的成员和做过的模型修改；离开的对话会保留这些。
 
 ## 终端颜色主题
 
@@ -438,7 +447,9 @@ Asterline 缺失时会创建 `~/.asterline/skills/asterline-team/SKILL.md`（并
 ```
 
 Asterline 会从可见响应移除有效 envelope、渲染 handoff、持久化并把正文发给目标成员。自动
-handoff 由 `max_auto_relays` 限制；`/retry` 恢复暂停路由。
+handoff 由 `max_auto_relays` 限制：同一发送方连续发出的消息，只要中间没有任何成员调用工具或改文件，
+就会累计；一次工具调用或文件改动就会把计数清零，所以长时间的协作不会被打断，只有纯聊天的来回循环会暂停。
+`/retry` 恢复暂停路由。
 
 ### Roster 请求
 
@@ -483,8 +494,8 @@ name 转小写（空格变 `-`），显示名是 name 中每个以 `-`/`_` 分�
 计入 `max_auto_relays`。
 
 子 Agent 只属于当前对话：不会写入已保存的 `team.json`（`/model` 或 `/team` 修改
-之后也一样），随对话一起保存，所以 `/resume` 和正常重启都会连同会话一起恢复，
-`/new` 会全部移除。也可以逐个移除：在 Agents 列表的子 Agent 行上连按两次 `Ctrl+X`，或由父成员发
+之后也一样），随对话一起保存，所以 `/resume` 会连同会话一起恢复；新对话（启动、`/new` 或 `/clear`）
+里没有它们（新对话只有默认的 `main`，旧对话的顶层成员也不会带过来）。也可以逐个移除：在 Agents 列表的子 Agent 行上连按两次 `Ctrl+X`，或由父成员发
 `@@close {"name":"reviewer"}`（也接受 `"id"`）；正在工作的会先被中断，它以往的消息仍留在聊天里，父成员会收到
 一行说明。占着进行中 review、plan 或 brainstorm 席位的子 Agent 两种方式都会被拒绝。对正在查看的子 Agent 用 `/model` 只会改它自己。`/team` 编辑器
 只列顶层成员；删掉某个父成员时，它的子 Agent 一并删除。成员字段 `parent` 标记子
@@ -540,12 +551,12 @@ asterline --fake --no-restore
 
 ### 打开了错误 roster
 
-编辑该项目的 `team.json`（在 `~/.asterline/projects/` 下），用 `/model` 修改模型，或使用 `/team` 后按 `s` 应用 roster 更改。删除 `team.json` 后下次启动会重新从默认的 `main` Agent 开始。
+每个新对话都只有一个默认的 `main` Agent，用第一个已安装的 CLI（见 [Asterline 如何解析团队](#asterline-如何解析团队)），不会用 `team.json` 里的成员。当前对话的 roster 用 `/model` 修改，或在 `/team` 里改完按 `s`。想回到某个旧对话的 roster，就 `/resume` 那个对话。想让每个新对话都用固定的 roster，启动时加 `--team <PATH>`。
 
 ### 不加载之前的 transcript 启动
 
 使用 `asterline --no-restore`。它只跳过 replay，不会删除 SQLite 数据。使用 `/new` 或 `/clear`
-可创建具有新后端 session 的干净 conversation。
+可创建具有新后端 session、只有一个默认 `main` Agent 的干净 conversation。
 
 ### 测试但不调用后端 CLI
 
