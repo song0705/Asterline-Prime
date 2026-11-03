@@ -123,9 +123,12 @@ impl StreamAdapter for AgyStreamAdapter {
     ) -> AdapterCommand {
         let _ = crate::state_paths::ensure_project_dir(&self.workspace);
         let _ = std::fs::create_dir_all(&self.log_dir);
+        // `0s` makes print mode wait until the turn completes. Pass it
+        // explicitly so a future agy default can't cut long tasks short with
+        // partial output; users cancel with Esc like on the other backends.
         let mut args = vec![
             "--print-timeout".to_string(),
-            "5m0s".to_string(),
+            "0s".to_string(),
             "--log-file".to_string(),
             self.log_path().display().to_string(),
             "--output-format".to_string(),
