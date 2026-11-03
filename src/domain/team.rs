@@ -41,6 +41,13 @@ impl BackendKind {
             Self::Agy => "agy",
         }
     }
+
+    /// Whether the backend can take a new message into a turn that is already
+    /// running (Codex `turn/steer`, Claude stream-json stdin). The others have
+    /// no mid-turn input path, so such messages wait in the member's queue.
+    pub fn supports_steer(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
 }
 
 impl fmt::Display for BackendKind {

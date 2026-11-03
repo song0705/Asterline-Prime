@@ -6,6 +6,7 @@
 //! emitted as [`AgentEvent::Raw`] for persistence), forward stderr, support
 //! cancellation, and report the exit status.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::adapter::steer::{SteerReceiver, SteerRecv};
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::config::resolve_binary_on_path;
 use crate::domain::event::{AgentEvent, AgentSessionId};
@@ -327,6 +329,9 @@ fn resume_suspended_process(process_id: u32) -> std::io::Result<()> {
     result
 }
 
+/// Encodes one injected message as `(stdin line, text the backend echoes back)`.
+pub type SteerEncoder = fn(&str) -> (String, String);
+
 /// A command line for a backend run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterCommand {
@@ -335,6 +340,11 @@ pub struct AdapterCommand {
     pub cwd: PathBuf,
     /// Optional stdin payload; `None` means stdin is closed (the prompt is an arg).
     pub stdin: Option<String>,
+    /// Keep stdin open after writing `stdin` so further messages can be sent
+    /// into the live process (see [`StreamAdapter::steer_encoder`]). The
+    /// runner closes it once the backend's turn is over and nothing it was
+    /// sent is still unconsumed, so the process can exit.
+    pub keep_stdin_open: bool,
 }
 
 /// Builds backend commands and stateful per-run line parsers.
@@ -354,6 +364,13 @@ pub trait StreamAdapter: Send + Sync {
         effort: Option<Effort>,
     ) -> AdapterCommand;
     fn parser(&self) -> Box<dyn LineParser>;
+    /// How to encode a message injected into a live process. Returns the stdin
+    /// line to write and the text the backend will echo back when it consumes
+    /// the message. `None` (the default) means the backend cannot be steered.
+    /// Only meaningful together with [`AdapterCommand::keep_stdin_open`].
+    fn steer_encoder(&self) -> Option<SteerEncoder> {
+        None
+    }
     /// Wait before spawning the child. Return `false` if `cancel` fires.
     fn prepare_run(&self, cancel: &AtomicBool) -> bool {
         let _ = cancel;
@@ -379,6 +396,16 @@ pub trait LineParser: Send {
     fn finish_after_exit(&mut self, _ok: bool) -> Vec<AgentEvent> {
         Vec::new()
     }
+    /// Text of the user messages the backend echoed back (consumed from stdin)
+    /// since the last call. Echoes are not chat content: `parse_line` yields no
+    /// events for them.
+    fn take_replayed_user_messages(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// True once if a turn-ending line was parsed since the last call.
+    fn take_turn_finished(&mut self) -> bool {
+        false
+    }
 }
 
 /// A [`MemberRunner`] that drives a real CLI through a [`StreamAdapter`].
@@ -395,6 +422,10 @@ impl<A: StreamAdapter> ProcessRunner<A> {
 impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
     fn backend(&self) -> BackendKind {
         self.adapter.backend()
+    }
+
+    fn supports_steer(&self) -> bool {
+        self.adapter.steer_encoder().is_some()
     }
 
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
@@ -425,7 +456,14 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
             let parser = self.adapter.parser();
             let (tx, rx) = std::sync::mpsc::sync_channel(1_024);
             let cancel = Arc::clone(&req.cancel);
-            let worker = thread::spawn(move || run_streaming(command, parser, cancel, tx));
+            let steer = req
+                .steer
+                .clone()
+                .zip(self.adapter.steer_encoder())
+                .filter(|_| command.keep_stdin_open);
+            let worker = thread::spawn(move || {
+                run_streaming_steerable(command, parser, cancel, tx, steer);
+            });
             let mut quota_hint = false;
             let mut retryable_fatal = None;
             let mut exit = None;
@@ -506,9 +544,152 @@ fn sleep_cancelable(duration: Duration, cancel: &AtomicBool) -> bool {
 /// Spawn `command`, stream its output through `parser`, and report completion.
 pub fn run_streaming(
     command: AdapterCommand,
+    parser: Box<dyn LineParser>,
+    cancel: Arc<AtomicBool>,
+    events: SyncSender<AgentEvent>,
+) {
+    run_streaming_steerable(command, parser, cancel, events, None);
+}
+
+/// How long the steer writer waits for a message before re-checking whether
+/// the run is over. Only bounds how quickly an idle writer notices the end;
+/// a message wakes it at once.
+const STEER_IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// The live process's stdin, shared between the thread that writes injected
+/// messages and the thread that reads stdout and decides when to close it.
+///
+/// Closing and writing take the same lock, so a message is either written
+/// before stdin closes (and then tracked as pending) or refused afterwards;
+/// it can never be written into a pipe that has already been closed.
+struct StdinLink {
+    state: Mutex<LinkState>,
+}
+
+struct LinkState {
+    stdin: Option<Box<dyn Write + Send>>,
+    /// Injected messages written to stdin that the backend has not yet echoed
+    /// back as consumed: `(prompt, text as sent)`.
+    pending: VecDeque<(String, String)>,
+}
+
+impl StdinLink {
+    fn new(stdin: Box<dyn Write + Send>) -> Self {
+        Self {
+            state: Mutex::new(LinkState {
+                stdin: Some(stdin),
+                pending: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LinkState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Write one stdin line. `injected` is `(prompt, echoed text)` for a
+    /// steered message, which then stays pending until it is echoed back.
+    /// Fails when stdin is already closed or the write fails (which closes it).
+    fn write_line(&self, line: &str, injected: Option<(String, String)>) -> Result<(), String> {
+        let mut state = self.lock();
+        let Some(stdin) = state.stdin.as_mut() else {
+            return Err("stdin is closed".to_string());
+        };
+        if let Err(err) = stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
+            state.stdin = None;
+            return Err(err.to_string());
+        }
+        if let Some(entry) = injected {
+            state.pending.push_back(entry);
+        }
+        Ok(())
+    }
+
+    /// The backend echoed a user message back. Returns true when it was one of
+    /// the injected messages (the initial prompt's echo is not).
+    fn note_replayed(&self, text: &str) -> bool {
+        let mut state = self.lock();
+        let text = text.trim();
+        match state
+            .pending
+            .iter()
+            .position(|(_, sent)| sent.trim() == text)
+        {
+            Some(index) => {
+                state.pending.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A turn just ended. Close stdin (letting the process exit) only when
+    /// every injected message has been consumed; otherwise the backend runs
+    /// another turn for the unconsumed one and this is called again after it.
+    fn finish_turn(&self) -> bool {
+        let mut state = self.lock();
+        if stdin_may_close(state.pending.len()) {
+            state.stdin = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Close stdin for good and return the prompts that were written but never
+    /// echoed back, oldest first.
+    fn close(&self) -> Vec<String> {
+        let mut state = self.lock();
+        state.stdin = None;
+        state.pending.drain(..).map(|(prompt, _)| prompt).collect()
+    }
+}
+
+/// Whether stdin may be closed when a turn ends: only when no injected message
+/// is still waiting to be consumed. A message written but not yet echoed back
+/// will start another turn, so closing now would cut it off.
+fn stdin_may_close(unconsumed_injected: usize) -> bool {
+    unconsumed_injected == 0
+}
+
+fn reject_steers(events: &SyncSender<AgentEvent>, prompts: impl IntoIterator<Item = String>) {
+    for prompt in prompts {
+        let _ = events.send(AgentEvent::SteerRejected { prompt });
+    }
+}
+
+/// [`run_streaming`] with an optional steer channel. With one, messages the
+/// runtime sends are encoded by the paired function and written to the live
+/// process's stdin, and each is reported as `SteerDelivered` when the backend
+/// echoes it back or `SteerRejected` when it cannot be delivered.
+pub fn run_streaming_steerable(
+    command: AdapterCommand,
+    parser: Box<dyn LineParser>,
+    cancel: Arc<AtomicBool>,
+    events: SyncSender<AgentEvent>,
+    steer: Option<(SteerReceiver, SteerEncoder)>,
+) {
+    let inbox = steer.as_ref().map(|(rx, _)| rx.clone());
+    run_streaming_inner(command, parser, cancel, events, steer);
+    // Whatever path ended the run, nothing may be pushed into it afterwards.
+    // Messages still waiting are not reported here (the run's final event has
+    // gone out); the runtime re-queues anything it never saw confirmed.
+    if let Some(inbox) = inbox {
+        inbox.close();
+    }
+}
+
+fn run_streaming_inner(
+    command: AdapterCommand,
     mut parser: Box<dyn LineParser>,
     cancel: Arc<AtomicBool>,
     events: SyncSender<AgentEvent>,
+    steer: Option<(SteerReceiver, SteerEncoder)>,
 ) {
     let resolved_program =
         resolve_binary_on_path(&command.program).unwrap_or_else(|| PathBuf::from(&command.program));
@@ -562,6 +743,9 @@ pub fn run_streaming(
     let stderr = child.stderr.take();
     let transport_ok = Arc::new(AtomicBool::new(true));
 
+    let keep_stdin_open = command.keep_stdin_open && command.stdin.is_some();
+    let steer_stop = Arc::new(AtomicBool::new(false));
+    let mut link: Option<Arc<StdinLink>> = None;
     let stdin_thread = if let Some(input) = command.stdin {
         let Some(mut stdin) = child.stdin.take() else {
             let _ = process_tree.terminate_with_fallback(&mut child);
@@ -580,16 +764,58 @@ pub fn run_streaming(
         let process_tree = Arc::clone(&process_tree);
         let transport_ok = Arc::clone(&transport_ok);
         let program = command.program.clone();
-        Some(thread::spawn(move || {
-            if let Err(err) = stdin.write_all(input.as_bytes()) {
-                transport_ok.store(false, Ordering::Relaxed);
-                let _ = events.send(AgentEvent::Fatal(format!(
-                    "failed to write {program} prompt to stdin: {err}"
-                )));
-                let _ = process_tree.terminate();
-            }
-            // Dropping `stdin` closes the pipe so the child sees EOF.
-        }))
+        if keep_stdin_open {
+            let stdin_link = Arc::new(StdinLink::new(Box::new(stdin)));
+            link = Some(Arc::clone(&stdin_link));
+            let steer = steer.clone();
+            let steer_stop = Arc::clone(&steer_stop);
+            Some(thread::spawn(move || {
+                if let Err(err) = stdin_link.write_line(&input, None) {
+                    transport_ok.store(false, Ordering::Relaxed);
+                    let _ = events.send(AgentEvent::Fatal(format!(
+                        "failed to write {program} prompt to stdin: {err}"
+                    )));
+                    let _ = process_tree.terminate();
+                    return;
+                }
+                let Some((inbox, encode)) = steer else {
+                    return;
+                };
+                loop {
+                    match inbox.recv_timeout(STEER_IDLE_POLL) {
+                        SteerRecv::Message(prompt) => {
+                            let (line, echoed) = encode(&prompt);
+                            if stdin_link
+                                .write_line(&line, Some((prompt.clone(), echoed)))
+                                .is_err()
+                            {
+                                // Stdin is gone: nothing more can be delivered.
+                                reject_steers(&events, std::iter::once(prompt));
+                                reject_steers(&events, inbox.close());
+                                break;
+                            }
+                        }
+                        SteerRecv::Closed => break,
+                        SteerRecv::Timeout => {
+                            if steer_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }))
+        } else {
+            Some(thread::spawn(move || {
+                if let Err(err) = stdin.write_all(input.as_bytes()) {
+                    transport_ok.store(false, Ordering::Relaxed);
+                    let _ = events.send(AgentEvent::Fatal(format!(
+                        "failed to write {program} prompt to stdin: {err}"
+                    )));
+                    let _ = process_tree.terminate();
+                }
+                // Dropping `stdin` closes the pipe so the child sees EOF.
+            }))
+        }
     } else {
         None
     };
@@ -693,6 +919,21 @@ pub fn run_streaming(
                     for event in parser.parse_line(&line) {
                         let _ = events.send(event);
                     }
+                    if let Some(link) = &link {
+                        for text in parser.take_replayed_user_messages() {
+                            if link.note_replayed(&text) {
+                                let _ = events.send(AgentEvent::SteerDelivered);
+                            }
+                        }
+                        if parser.take_turn_finished() && link.finish_turn() {
+                            // The turn is over and stdin is closed: refuse
+                            // anything that arrives from now on, and hand back
+                            // what was waiting.
+                            if let Some((inbox, _)) = &steer {
+                                reject_steers(&events, inbox.close());
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     transport_ok.store(false, Ordering::Relaxed);
@@ -708,6 +949,16 @@ pub fn run_streaming(
     }
     for event in parser.finish() {
         let _ = events.send(event);
+    }
+    // Output is over. Anything handed to the process that it never confirmed,
+    // and anything still waiting in the inbox, goes back to the runtime now,
+    // ahead of the exit event.
+    steer_stop.store(true, Ordering::Relaxed);
+    if let Some(link) = &link {
+        reject_steers(&events, link.close());
+    }
+    if let Some((inbox, _)) = &steer {
+        reject_steers(&events, inbox.close());
     }
 
     let status = child.lock().ok().and_then(|mut child| child.wait().ok());
@@ -803,6 +1054,7 @@ mod tests {
                 args: vec!["-c".to_string(), self.script.clone()],
                 cwd: PathBuf::from("/tmp"),
                 stdin: None,
+                keep_stdin_open: false,
             }
         }
         fn parser(&self) -> Box<dyn LineParser> {
@@ -842,6 +1094,7 @@ mod tests {
                 args: vec!["-c".to_string(), self.script.clone()],
                 cwd: PathBuf::from("/tmp"),
                 stdin: None,
+                keep_stdin_open: false,
             }
         }
 
@@ -878,6 +1131,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -922,6 +1176,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -949,6 +1204,7 @@ mod tests {
 
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -976,6 +1232,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "hi".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1012,6 +1269,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1044,6 +1302,7 @@ mod tests {
                 args: vec![],
                 cwd: PathBuf::from("/tmp"),
                 stdin: None,
+                keep_stdin_open: false,
             },
             runner.adapter.parser(),
             Arc::new(AtomicBool::new(false)),
@@ -1069,6 +1328,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1100,6 +1360,7 @@ mod tests {
         let handle = thread::spawn(move || {
             runner.run(
                 RunRequest {
+                    steer: None,
                     prompt: "x".to_string(),
                     session: None,
                     cancel: cancel_for_thread,
@@ -1148,6 +1409,7 @@ mod tests {
         let handle = thread::spawn(move || {
             runner.run(
                 RunRequest {
+                    steer: None,
                     prompt: "x".to_string(),
                     session: None,
                     cancel: cancel_for_thread,
@@ -1191,6 +1453,7 @@ mod tests {
                     args: vec!["-c".to_string(), "yes x | tr -d '\\n'".to_string()],
                     cwd: PathBuf::from("/tmp"),
                     stdin: None,
+                    keep_stdin_open: false,
                 },
                 Box::new(LineToDelta),
                 Arc::new(AtomicBool::new(false)),
@@ -1230,6 +1493,7 @@ mod tests {
                 ],
                 cwd: PathBuf::from("/tmp"),
                 stdin: Some("x".repeat(16 * 1024 * 1024)),
+                keep_stdin_open: false,
             },
             Box::new(LineToDelta),
             Arc::new(AtomicBool::new(false)),
@@ -1269,6 +1533,7 @@ mod tests {
                     ],
                     cwd: PathBuf::from("/tmp"),
                     stdin: Some("y".repeat(262144)),
+                    keep_stdin_open: false,
                 },
                 Box::new(LineToDelta),
                 Arc::new(AtomicBool::new(false)),
@@ -1305,6 +1570,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1339,6 +1605,7 @@ mod tests {
 
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "x".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -1492,6 +1759,7 @@ mod windows_tests {
                 args: Vec::new(),
                 cwd: dir.clone(),
                 stdin: None,
+                keep_stdin_open: false,
             },
             Box::new(LineToLog),
             Arc::new(AtomicBool::new(false)),
@@ -1564,5 +1832,83 @@ mod windows_tests {
         drop(tree);
         wait_for_file(&sentinel, Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A stdin stand-in that records what was written and whether it was closed.
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stdin_closes_only_when_every_injected_message_was_consumed() {
+        assert!(stdin_may_close(0));
+        assert!(!stdin_may_close(1));
+        assert!(!stdin_may_close(3));
+    }
+
+    #[test]
+    fn link_waits_for_the_next_result_while_an_injected_message_is_unconsumed() {
+        let writer = SharedWriter::default();
+        let link = StdinLink::new(Box::new(writer.clone()));
+        link.write_line("first\n", None).unwrap();
+        link.write_line("second\n", Some(("steer".into(), "steer text".into())))
+            .unwrap();
+
+        // Turn one ends before the injected message was echoed back.
+        assert!(!link.finish_turn());
+        link.write_line("still open\n", None).unwrap();
+
+        // The echo arrives (the initial prompt's echo is not an injected one).
+        assert!(!link.note_replayed("first"));
+        assert!(link.note_replayed("  steer text "));
+        // The second turn ends with nothing pending: stdin closes.
+        assert!(link.finish_turn());
+        assert!(link.write_line("late\n", None).is_err());
+        assert_eq!(
+            String::from_utf8(writer.0.lock().unwrap().clone()).unwrap(),
+            "first\nsecond\nstill open\n"
+        );
+    }
+
+    #[test]
+    fn link_hands_back_prompts_that_were_written_but_never_echoed() {
+        let link = StdinLink::new(Box::new(SharedWriter::default()));
+        link.write_line("a\n", Some(("one".into(), "one".into())))
+            .unwrap();
+        link.write_line("b\n", Some(("two".into(), "two".into())))
+            .unwrap();
+        assert!(link.note_replayed("one"));
+        assert_eq!(link.close(), vec!["two".to_string()]);
+        assert!(link.write_line("c\n", None).is_err());
+    }
+
+    #[test]
+    fn link_write_failure_closes_it() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let link = StdinLink::new(Box::new(Broken));
+        assert!(
+            link.write_line("x\n", Some(("p".into(), "p".into())))
+                .is_err()
+        );
+        // The failed message was not recorded as pending.
+        assert!(link.close().is_empty());
     }
 }

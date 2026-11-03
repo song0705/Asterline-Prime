@@ -487,6 +487,13 @@ pub enum AgentEvent {
         files: Vec<FileChangeItem>,
         ok: bool,
     },
+    /// A message handed to the live run through its steer channel reached the
+    /// model mid-turn. Reported once per delivered message, in send order.
+    SteerDelivered,
+    /// A steered message could not be delivered to the live run (the turn was
+    /// ending, the backend refused it, or its input was already closed). The
+    /// runtime queues `prompt` so it still runs after the current turn.
+    SteerRejected { prompt: String },
     /// The backend process exited.
     Exited { code: Option<i32>, ok: bool },
     /// An unrecoverable error running the backend.

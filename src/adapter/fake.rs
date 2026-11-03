@@ -370,6 +370,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(65_536);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: prompt.to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),

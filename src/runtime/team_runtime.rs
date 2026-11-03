@@ -18,6 +18,7 @@ use crate::adapter::parser::{
     MAX_MESSAGE_TEXT_BYTES, MAX_TOOL_DETAIL_BYTES, append_bounded_text, bounded_text,
     format_permission_denial, is_permission_denied_tool,
 };
+use crate::adapter::steer::{SteerReceiver, SteerSender, steer_channel};
 use crate::domain::config::{
     ASTERLINE_BRAINSTORM_SKILL_NAME, MAIN_MEMBER_ID, brainstorm_skill_text,
     inject_team_protocol_with, replace_model_style_name, strip_team_protocol, strip_team_protocols,
@@ -104,6 +105,9 @@ pub struct RunAction {
     pub session: Option<AgentSessionId>,
     pub cancel: Arc<AtomicBool>,
     pub effort: Option<Effort>,
+    /// The run's end of its steer channel; `None` when the member's backend
+    /// cannot take a message mid-turn.
+    pub steer: Option<SteerReceiver>,
 }
 
 /// A verification command the transport layer should run outside the core loop.
@@ -147,6 +151,14 @@ struct RunningState {
     last_reply: String,
     /// What went wrong, when the backend reported a failure.
     error: Option<String>,
+    /// Where to hand other agents' messages to this live run (see
+    /// [`TeamRuntime::try_steer`]); `None` when the backend cannot take them.
+    steer: Option<SteerSender>,
+    /// Messages sent into the run through `steer` that the backend has not yet
+    /// confirmed. Confirmed ones leave in send order; rejected ones move to the
+    /// member's queue; any left when the run ends are queued too, so a message
+    /// is never lost.
+    steered: VecDeque<QueuedPrompt>,
 }
 
 struct QueuedPrompt {
@@ -2639,6 +2651,8 @@ impl TeamRuntime {
                     });
                 }
             }
+            AgentEvent::SteerDelivered => self.steer_delivered(member, &mut step),
+            AgentEvent::SteerRejected { prompt } => self.steer_rejected(member, &prompt, &mut step),
             AgentEvent::Exited { code, ok } => {
                 self.finalize_run(member, code, ok, &mut step);
                 self.finish_pending_close(member, &mut step);
@@ -3253,6 +3267,7 @@ impl TeamRuntime {
         }
 
         let handback: SubAgentOutcome;
+        let mut unconfirmed_steers: VecDeque<QueuedPrompt> = VecDeque::new();
         let (
             turn,
             cancelled,
@@ -3262,8 +3277,14 @@ impl TeamRuntime {
             permission_noticed,
             run_error,
         ) = match self.members.get_mut(member).and_then(|s| s.running.take()) {
-            Some(running) => {
+            Some(mut running) => {
                 handback = SubAgentOutcome::new(&running);
+                // Keep any steered
+                // message the backend never confirmed: it runs after this one
+                // (a member being removed drops it, like the rest of its queue).
+                if !self.closing.contains_key(member) {
+                    unconfirmed_steers = std::mem::take(&mut running.steered);
+                }
                 (
                     running.turn,
                     running.cancel.load(Ordering::Relaxed),
@@ -3336,9 +3357,15 @@ impl TeamRuntime {
             true
         };
 
+        let mut requeued_steers = false;
         if let Some(state) = self.members.get_mut(member) {
             state.tools.clear();
             state.status = MemberStatus::Idle;
+            requeued_steers = !unconfirmed_steers.is_empty();
+            state.queue.extend(unconfirmed_steers);
+        }
+        if requeued_steers {
+            self.emit_queue_updated(member, step);
         }
         // The native session took the prompt (with any recap) and answered it.
         // A run that failed outright may not have, so its turn stays unseen.
@@ -3534,6 +3561,14 @@ impl TeamRuntime {
             .map(|s| s.running.is_some())
             .unwrap_or(false);
         if busy {
+            // Another agent's message reaches a live run of the same turn as
+            // soon as its current tool call ends; the user's own messages
+            // always wait their turn in the queue.
+            if let Some(from) = &origin
+                && self.try_steer(member, turn, &stripped_prompt, from, step)
+            {
+                return;
+            }
             if let Some(state) = self.members.get_mut(member) {
                 state.queue.push_back(QueuedPrompt {
                     turn,
@@ -3546,6 +3581,114 @@ impl TeamRuntime {
         } else {
             self.start_run(member, turn, stripped_prompt, origin, step);
         }
+    }
+
+    /// Hand `prompt` from agent `from` to the live run of `member` when that
+    /// run is part of the same turn and its backend takes mid-turn input.
+    /// Returns false (nothing sent) so the caller queues it instead. The run
+    /// keeps its own origin: an injected message never changes who the final
+    /// reply is handed back to, and the relay was already counted when the
+    /// message was routed.
+    fn try_steer(
+        &mut self,
+        member: &MemberId,
+        turn: TurnId,
+        prompt: &str,
+        from: &MemberId,
+        step: &mut RuntimeStep,
+    ) -> bool {
+        if !self.member_backend(member).supports_steer() {
+            return false;
+        }
+        let Some(running) = self
+            .members
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+        else {
+            return false;
+        };
+        if running.turn != turn || running.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(steer) = &running.steer else {
+            return false;
+        };
+        if steer.send(prompt.to_string()).is_err() {
+            // The run already closed its input: it is ending.
+            return false;
+        }
+        running.steered.push_back(QueuedPrompt {
+            turn,
+            prompt: prompt.to_string(),
+            origin: Some(from.clone()),
+        });
+        self.log(
+            member,
+            LogEntry::info(
+                member.as_str(),
+                format!("message from {from} sent to the running turn"),
+            ),
+            step,
+        );
+        true
+    }
+
+    /// The backend took the oldest steered message into the live turn.
+    fn steer_delivered(&mut self, member: &MemberId, step: &mut RuntimeStep) {
+        let Some(delivered) = self
+            .members
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+            .and_then(|running| running.steered.pop_front())
+        else {
+            return;
+        };
+        let from = delivered
+            .origin
+            .as_ref()
+            .map_or_else(|| "another agent".to_string(), ToString::to_string);
+        self.log(
+            member,
+            LogEntry::info(
+                member.as_str(),
+                format!("message from {from} delivered mid-turn"),
+            ),
+            step,
+        );
+    }
+
+    /// The backend could not take a steered message; queue it for after this
+    /// run, exactly as if the member had been busy and it never tried.
+    fn steer_rejected(&mut self, member: &MemberId, prompt: &str, step: &mut RuntimeStep) {
+        let Some(state) = self.members.get_mut(member) else {
+            return;
+        };
+        let Some(index) = state.running.as_ref().and_then(|running| {
+            running
+                .steered
+                .iter()
+                .position(|steered| steered.prompt == prompt)
+        }) else {
+            return;
+        };
+        let Some(rejected) = state
+            .running
+            .as_mut()
+            .and_then(|running| running.steered.remove(index))
+        else {
+            return;
+        };
+        state.queue.push_back(rejected);
+        self.log(
+            member,
+            LogEntry::info(
+                member.as_str(),
+                "message could not join the running turn; queued for after it".to_string(),
+            ),
+            step,
+        );
+        self.emit_queue_updated(member, step);
+        self.note_roster_write(step);
     }
 
     fn start_run(
@@ -3582,6 +3725,12 @@ impl TeamRuntime {
         let session = self.sessions.get(member);
         let cancel = Arc::new(AtomicBool::new(false));
         let effort = self.members.get(member).and_then(|s| s.effort);
+        let (steer_tx, steer_rx) = if self.member_backend(member).supports_steer() {
+            let (tx, rx) = steer_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         if let Some(state) = self.members.get_mut(member) {
             state.running = Some(RunningState {
                 cancel: cancel.clone(),
@@ -3599,6 +3748,8 @@ impl TeamRuntime {
                 messaged_origin: false,
                 last_reply: String::new(),
                 error: None,
+                steer: steer_tx,
+                steered: VecDeque::new(),
             });
             state.status = MemberStatus::Running;
             state.tools.clear();
@@ -3620,6 +3771,7 @@ impl TeamRuntime {
             session,
             cancel,
             effort,
+            steer: steer_rx,
         });
     }
 

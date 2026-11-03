@@ -194,6 +194,7 @@ impl StreamAdapter for AgyStreamAdapter {
             args,
             cwd: self.cwd.clone(),
             stdin: None,
+            keep_stdin_open: false,
         }
     }
 

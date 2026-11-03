@@ -233,6 +233,7 @@ fn fake_acp_server_completes_graceful_cancellation() {
     let handle = thread::spawn(move || {
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "wait".to_string(),
                 session: None,
                 cancel: cancel_for_run,
@@ -297,6 +298,7 @@ fn fake_acp_server_is_killed_after_cancel_timeout() {
     let handle = thread::spawn(move || {
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "wait".to_string(),
                 session: None,
                 cancel: cancel_for_run,
@@ -351,6 +353,7 @@ fn cancel_timeout_still_kills_after_cancelled_response_if_server_ignores_eof() {
     let handle = thread::spawn(move || {
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "wait".to_string(),
                 session: None,
                 cancel: cancel_for_run,
@@ -404,6 +407,7 @@ fn oversized_acp_frame_is_fatal_and_kills_the_server() {
     let handle = thread::spawn(move || {
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "wait".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),

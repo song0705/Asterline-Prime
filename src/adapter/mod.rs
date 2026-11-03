@@ -18,6 +18,7 @@ pub mod models;
 pub mod parser;
 pub mod process;
 pub mod prompt_images;
+pub mod steer;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,7 +35,11 @@ pub use fake::FakeRunner;
 pub use grok_stream::GrokAcpRunner;
 pub(crate) use models::DiscoveredCatalog;
 pub use models::{DiscoveredModel, discover_models};
-pub use process::{AdapterCommand, LineParser, ProcessRunner, StreamAdapter, run_streaming};
+pub use process::{
+    AdapterCommand, LineParser, ProcessRunner, SteerEncoder, StreamAdapter, run_streaming,
+    run_streaming_steerable,
+};
+pub use steer::{SteerReceiver, SteerRecv, SteerSender, steer_channel};
 
 /// Inputs for one member turn.
 pub struct RunRequest {
@@ -45,6 +50,12 @@ pub struct RunRequest {
     pub cancel: Arc<AtomicBool>,
     /// Reasoning effort for this run, if set.
     pub effort: Option<Effort>,
+    /// Messages the runtime wants delivered into this run while it is in
+    /// progress. A runner that supports steering polls it and reports each
+    /// message's fate with [`AgentEvent::SteerDelivered`] or
+    /// [`AgentEvent::SteerRejected`]; a runner that does not support
+    /// steering ignores it.
+    pub steer: Option<SteerReceiver>,
 }
 
 /// Runs one member turn, streaming [`AgentEvent`]s to `events` until the run
@@ -54,6 +65,13 @@ pub struct RunRequest {
 pub trait MemberRunner: Send + Sync {
     fn backend(&self) -> BackendKind;
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>);
+
+    /// Whether a message can be injected into a run that is already in
+    /// progress (see [`RunRequest::steer`]). Backends without a mid-turn input
+    /// path keep the default and have such messages queued instead.
+    fn supports_steer(&self) -> bool {
+        false
+    }
 
     /// Resolve a live, backend-originated approval request. Most transports
     /// have no such control plane; they deliberately report `false` instead

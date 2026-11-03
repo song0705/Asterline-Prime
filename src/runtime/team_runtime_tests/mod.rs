@@ -190,5 +190,6 @@ mod mode_overrides;
 mod plan;
 mod review;
 mod roster;
+mod steer;
 mod sub_agents;
 mod turns;

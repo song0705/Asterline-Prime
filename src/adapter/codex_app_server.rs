@@ -25,6 +25,7 @@ use crate::adapter::parser::{
 use crate::adapter::process::{
     ChildProcessTree, MAX_STDERR_LINE_BYTES, bounded_lines, configure_process_tree,
 };
+use crate::adapter::steer::SteerReceiver;
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::config::resolve_binary_on_path;
 use crate::domain::event::{AgentEvent, AgentSessionId, ApprovalDecision, FileChangeItem};
@@ -127,6 +128,22 @@ impl CodexAppServerConfig {
             // UI still bounds and persists every received summary chunk.
             "summary": "auto",
         })
+    }
+}
+
+/// `turn/steer` parameters: add `prompt` to the turn that is running now.
+/// The server refuses it when `turn_id` is no longer the active turn.
+fn steer_params(thread_id: &str, turn_id: &str, prompt: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": crate::adapter::prompt_images::codex_user_input(prompt),
+    })
+}
+
+fn reject_steers(events: &SyncSender<AgentEvent>, prompts: impl IntoIterator<Item = String>) {
+    for prompt in prompts {
+        let _ = events.send(AgentEvent::SteerRejected { prompt });
     }
 }
 
@@ -266,6 +283,10 @@ fn parse_model_page(response: &Value) -> Result<Vec<DiscoveredModel>, String> {
 impl MemberRunner for CodexAppServerRunner {
     fn backend(&self) -> BackendKind {
         BackendKind::Codex
+    }
+
+    fn supports_steer(&self) -> bool {
+        true
     }
 
     fn run(&self, req: RunRequest, events: SyncSender<AgentEvent>) {
@@ -475,6 +496,22 @@ impl AppServerClient {
         req: RunRequest,
         events: &SyncSender<AgentEvent>,
     ) -> Result<bool, String> {
+        let steer = req.steer.clone();
+        let result = self.run_turn_inner(config, req, events);
+        // The turn is over, one way or another: refuse further steers and give
+        // back any that never reached the server, ahead of the exit event.
+        if let Some(steer) = steer {
+            reject_steers(events, steer.close());
+        }
+        result
+    }
+
+    fn run_turn_inner(
+        &mut self,
+        config: &CodexAppServerConfig,
+        req: RunRequest,
+        events: &SyncSender<AgentEvent>,
+    ) -> Result<bool, String> {
         let mut mapper = AppServerEventMapper::default();
         let cancel = Some(&*req.cancel);
         let Some(thread_id) =
@@ -501,7 +538,14 @@ impl AppServerClient {
             })?
             .to_string();
         mapper.turn_id = Some(turn_id.clone());
-        self.wait_for_turn(&thread_id, &turn_id, &req.cancel, events, &mut mapper)
+        self.wait_for_turn(
+            &thread_id,
+            &turn_id,
+            &req.cancel,
+            req.steer.as_ref(),
+            events,
+            &mut mapper,
+        )
     }
 
     fn resolve_thread(
@@ -603,8 +647,36 @@ impl AppServerClient {
         thread_id: &str,
         turn_id: &str,
         cancel: &Arc<AtomicBool>,
+        steer: Option<&SteerReceiver>,
         events: &SyncSender<AgentEvent>,
         mapper: &mut AppServerEventMapper,
+    ) -> Result<bool, String> {
+        // `turn/steer` requests sent and not yet answered: (request id, prompt).
+        let mut pending_steers: Vec<(Value, String)> = Vec::new();
+        let result = self.wait_for_turn_loop(
+            thread_id,
+            turn_id,
+            cancel,
+            steer,
+            events,
+            mapper,
+            &mut pending_steers,
+        );
+        // A steer the server never answered before the turn ended did not land.
+        reject_steers(events, pending_steers.into_iter().map(|(_, prompt)| prompt));
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_turn_loop(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        cancel: &Arc<AtomicBool>,
+        steer: Option<&SteerReceiver>,
+        events: &SyncSender<AgentEvent>,
+        mapper: &mut AppServerEventMapper,
+        pending_steers: &mut Vec<(Value, String)>,
     ) -> Result<bool, String> {
         let mut interrupt_id = None;
         let mut cancel_deadline = None;
@@ -622,6 +694,24 @@ impl AppServerClient {
                     "timed out waiting for Codex App Server to interrupt the turn".to_string(),
                 );
             }
+            // Messages other agents sent to this running turn. Each becomes a
+            // `turn/steer` request; the answer arrives as an ordinary response
+            // below, so a slow server never stalls the rest of the turn. Once
+            // cancelling, leave them in the inbox to be handed back.
+            if interrupt_id.is_none()
+                && let Some(steer) = steer
+            {
+                while let Some(prompt) = steer.try_recv() {
+                    match self.send_request("turn/steer", steer_params(thread_id, turn_id, &prompt))
+                    {
+                        Ok(id) => pending_steers.push((id, prompt)),
+                        Err(error) => {
+                            reject_steers(events, std::iter::once(prompt));
+                            return Err(error);
+                        }
+                    }
+                }
+            }
 
             let Some(message) = self.next_message(RPC_POLL_INTERVAL, events)? else {
                 continue;
@@ -636,6 +726,26 @@ impl AppServerClient {
                     let _ = events.send(AgentEvent::ParseWarning(format!(
                         "codex App Server turn/interrupt failed: {error}"
                     )));
+                }
+                continue;
+            }
+            if message.get("method").is_none()
+                && let Some(index) = pending_steers
+                    .iter()
+                    .position(|(id, _)| message.get("id") == Some(id))
+            {
+                let (_, prompt) = pending_steers.remove(index);
+                match rpc_error_message(&message) {
+                    None if message.get("result").is_some() => {
+                        let _ = events.send(AgentEvent::SteerDelivered);
+                    }
+                    error => {
+                        let _ = events.send(AgentEvent::Log(format!(
+                            "codex App Server turn/steer refused: {}",
+                            error.unwrap_or_else(|| "no result".to_string())
+                        )));
+                        reject_steers(events, std::iter::once(prompt));
+                    }
                 }
                 continue;
             }
@@ -2361,6 +2471,7 @@ done
         let (events, received) = mpsc::sync_channel(64);
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "first prompt".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2382,6 +2493,7 @@ done
 
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "second prompt".to_string(),
                 session: Some(AgentSessionId("thread-1".to_string())),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2477,6 +2589,7 @@ while IFS= read -r line; do :; done
         let started = Instant::now();
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "hello".to_string(),
                 session: None,
                 cancel,
@@ -2536,6 +2649,7 @@ exit 0
         let started = Instant::now();
         runner.run(
             RunRequest {
+                steer: None,
                 prompt: "hello".to_string(),
                 session: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -2551,5 +2665,187 @@ exit 0
             "{seen:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Run one turn against a fake app-server. `steer_script` is the shell the
+    /// server runs after answering `turn/start` (it can read the `turn/steer`
+    /// request and answer it). Returns the events and the requests the server
+    /// received.
+    #[cfg(unix)]
+    fn run_steered_turn(
+        name: &str,
+        steer_script: &str,
+        steer_messages: &[&str],
+    ) -> (Vec<AgentEvent>, Vec<Value>) {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-codex-steer-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("fake-codex-app-server");
+        let input_log = dir.join("input.jsonl");
+        let script = format!(
+            r#"#!/bin/sh
+log='{log}'
+read_line() {{
+  IFS= read -r line || exit 0
+  printf '%s\n' "$line" >> "$log"
+}}
+read_line
+printf '%s\n' '{{"id":1,"result":{{"userAgent":"fake-codex"}}}}'
+read_line
+read_line
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-1"}}}}}}'
+read_line
+printf '%s\n' '{{"id":3,"result":{{}}}}'
+read_line
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+{steer_script}
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-1","turnId":"turn-1","turn":{{"id":"turn-1","status":"completed"}}}}}}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$log"
+done
+"#,
+            log = input_log.display(),
+        );
+        std::fs::write(&server, script).unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+        let runner = CodexAppServerRunner::from_member(&member, &dir)
+            .with_binary(server.display().to_string());
+        assert!(runner.supports_steer());
+        let (steer_tx, steer_rx) = crate::adapter::steer_channel();
+        for message in steer_messages {
+            steer_tx.send((*message).to_string()).unwrap();
+        }
+        let (events, received) = mpsc::sync_channel(64);
+        runner.run(
+            RunRequest {
+                steer: Some(steer_rx),
+                prompt: "work".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            events,
+        );
+        // A finished turn refuses later steers.
+        assert!(steer_tx.send("late".to_string()).is_err());
+        let seen = received.try_iter().collect::<Vec<_>>();
+        drop(runner);
+        let input = std::fs::read_to_string(&input_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_dir_all(dir);
+        (seen, input)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steer_during_a_turn_sends_turn_steer_and_reports_delivery() {
+        let (events, input) = run_steered_turn(
+            "delivered",
+            r#"read_line
+printf '%s\n' '{"id":5,"result":{"turnId":"turn-1"}}'"#,
+            &["also check the tests"],
+        );
+        let steer = input
+            .iter()
+            .find(|message| message["method"] == "turn/steer")
+            .expect("a turn/steer request");
+        assert_eq!(steer["params"]["threadId"], "thread-1");
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-1");
+        assert_eq!(
+            steer["params"]["input"],
+            json!(crate::adapter::prompt_images::codex_user_input(
+                "also check the tests"
+            ))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == AgentEvent::SteerDelivered)
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::SteerRejected { .. })),
+            "{events:?}"
+        );
+        assert!(events.contains(&AgentEvent::Exited {
+            code: None,
+            ok: true
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_steer_is_rejected_and_the_turn_carries_on() {
+        let (events, input) = run_steered_turn(
+            "refused",
+            r#"read_line
+printf '%s\n' '{"id":5,"error":{"code":-32600,"message":"expected turn id does not match the active turn"}}'"#,
+            &["too late"],
+        );
+        assert!(
+            input
+                .iter()
+                .any(|message| message["method"] == "turn/steer")
+        );
+        assert!(
+            events.contains(&AgentEvent::SteerRejected {
+                prompt: "too late".to_string()
+            }),
+            "{events:?}"
+        );
+        assert!(!events.contains(&AgentEvent::SteerDelivered));
+        // A refused steer is not a failure of the turn itself.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_)))
+        );
+        assert!(events.contains(&AgentEvent::Exited {
+            code: None,
+            ok: true
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steer_still_unanswered_when_the_turn_ends_is_rejected_before_the_exit() {
+        let (events, _) = run_steered_turn("unanswered", "", &["never answered"]);
+        let rejected = events
+            .iter()
+            .position(|event| {
+                *event
+                    == AgentEvent::SteerRejected {
+                        prompt: "never answered".to_string(),
+                    }
+            })
+            .unwrap_or_else(|| panic!("{events:?}"));
+        let exited = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Exited { .. }))
+            .unwrap();
+        assert!(rejected < exited);
+        assert!(!events.contains(&AgentEvent::SteerDelivered));
+    }
+
+    #[test]
+    fn steer_params_name_the_active_turn() {
+        let params = steer_params("thread-9", "turn-3", "hello");
+        assert_eq!(params["threadId"], "thread-9");
+        assert_eq!(params["expectedTurnId"], "turn-3");
+        assert!(params["input"].is_array());
     }
 }

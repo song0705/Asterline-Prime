@@ -28,6 +28,7 @@ fn run_once(member: &TeamMember, prompt: &str) -> Vec<AgentEvent> {
     let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
+            steer: None,
             prompt: prompt.to_string(),
             session: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -140,6 +141,7 @@ fn real_codex_resume_smoke() {
     let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
+            steer: None,
             prompt: "Reply with the word you were asked to remember.".to_string(),
             session: Some(session),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -185,6 +187,7 @@ fn real_claude_resume_smoke() {
     let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
+            steer: None,
             prompt: "Reply with the word you were asked to remember.".to_string(),
             session: Some(session),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -230,6 +233,7 @@ fn real_grok_resume_smoke() {
     let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
+            steer: None,
             prompt: "Reply with the word you were asked to remember.".to_string(),
             session: Some(session),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -314,6 +318,7 @@ fn real_agy_resume_smoke() {
     let (tx, rx) = mpsc::sync_channel(65_536);
     runner.run(
         RunRequest {
+            steer: None,
             prompt: "Reply with the word you were asked to remember.".to_string(),
             session: Some(session),
             cancel: Arc::new(AtomicBool::new(false)),

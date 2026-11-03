@@ -1,8 +1,17 @@
 //! Claude Code streaming adapter.
 //!
-//! Drives `claude -p --output-format stream-json --verbose --include-partial-messages`
-//! and translates the NDJSON stream into [`AgentEvent`]s. Sessions are resumable
+//! Drives `claude -p --input-format stream-json --output-format stream-json
+//! --verbose --include-partial-messages --replay-user-messages` and translates
+//! the NDJSON stream into [`AgentEvent`]s. Sessions are resumable
 //! (`--resume <id>`); `--no-session-persistence` is never used.
+//!
+//! Input is NDJSON user messages on stdin, so another agent's message can be
+//! written while a tool is running and reaches the model right after that
+//! tool completes, within the same turn. `--replay-user-messages` makes Claude
+//! echo each consumed stdin message on stdout; the runner uses those echoes to
+//! know whether an injected message was consumed before the turn's `result`
+//! (then stdin is closed so the process exits) or is still waiting (then
+//! Claude runs another turn for it, and stdin stays open until that ends).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -12,7 +21,7 @@ use serde_json::Value;
 use crate::adapter::parser::{
     MAX_MESSAGE_TEXT_BYTES, append_bounded_text, bounded_text, str_field, summarize, tool_value,
 };
-use crate::adapter::process::{AdapterCommand, LineParser, StreamAdapter};
+use crate::adapter::process::{AdapterCommand, LineParser, SteerEncoder, StreamAdapter};
 use crate::domain::event::{AgentEvent, AgentSessionId};
 use crate::domain::team::{BackendKind, Effort, PermissionMode, TeamMember};
 
@@ -64,6 +73,9 @@ impl StreamAdapter for ClaudeStreamAdapter {
     ) -> AdapterCommand {
         let mut args = vec![
             "--print".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--replay-user-messages".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
@@ -115,18 +127,65 @@ impl StreamAdapter for ClaudeStreamAdapter {
             program: self.binary.clone(),
             args,
             cwd: self.cwd.clone(),
-            // Claude officially accepts print-mode prompts on stdin. Keeping
-            // user text out of argv prevents prompts such as `--version` from
-            // being reinterpreted as CLI options.
-            stdin: Some(crate::adapter::prompt_images::prompt_with_image_paths(
-                prompt,
-            )),
+            // Claude accepts stream-json user messages on stdin. Keeping user
+            // text out of argv prevents prompts such as `--version` from being
+            // reinterpreted as CLI options. Stdin stays open after the first
+            // message so later ones can be injected; the runner closes it when
+            // the turn is over.
+            stdin: Some(encode_user_message(prompt).0),
+            keep_stdin_open: true,
         }
+    }
+
+    fn steer_encoder(&self) -> Option<SteerEncoder> {
+        Some(encode_user_message)
     }
 
     fn parser(&self) -> Box<dyn LineParser> {
         Box::new(ClaudeLineParser::default())
     }
+}
+
+/// One stream-json user message as a stdin line, plus the text Claude will
+/// echo back (with `--replay-user-messages`) once it consumes the message.
+/// Image attachments are passed as text carrying their file paths.
+fn encode_user_message(prompt: &str) -> (String, String) {
+    let text = crate::adapter::prompt_images::prompt_with_image_paths(prompt);
+    let mut line = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+    })
+    .to_string();
+    line.push('\n');
+    (line, text)
+}
+
+/// The text of a user message that Claude echoed back from stdin, or `None`
+/// for any other user message (tool results, child-agent prompts). Tool
+/// results carry `tool_result` blocks; an echo is plain text.
+fn replayed_user_text(value: &Value) -> Option<String> {
+    if value
+        .get("parent_tool_use_id")
+        .is_some_and(|id| !id.is_null())
+    {
+        return None;
+    }
+    let content = &value["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let blocks = content.as_array()?;
+    if blocks
+        .iter()
+        .any(|block| str_field(block, "type") != Some("text"))
+    {
+        return None;
+    }
+    let text: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| str_field(block, "text"))
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n"))
 }
 
 fn native_session_name(display_name: &str) -> String {
@@ -145,6 +204,10 @@ pub struct ClaudeLineParser {
     /// from flooding the runtime while still starting the elapsed clock before
     /// the first `thinking_delta` arrives.
     thinking_clock: bool,
+    /// Texts of stdin messages Claude echoed back, awaiting pickup.
+    replayed: Vec<String>,
+    /// A `result` was parsed since the runner last asked.
+    turn_finished: bool,
 }
 
 impl ClaudeLineParser {
@@ -307,7 +370,16 @@ impl LineParser for ClaudeLineParser {
                 }
             }
             Some("stream_event") => self.handle_stream_event(&value["event"], &mut out),
-            Some("user") => self.handle_user_message(&value["message"], &mut out),
+            Some("user") => {
+                // With --replay-user-messages Claude echoes each consumed
+                // stdin message as a user line. Those are bookkeeping for the
+                // runner, never chat content, so they yield no events.
+                if let Some(text) = replayed_user_text(&value) {
+                    self.replayed.push(text);
+                } else {
+                    self.handle_user_message(&value["message"], &mut out);
+                }
+            }
             Some("assistant") => {
                 // Main-agent content is already represented by `stream_event`
                 // partials. `--forward-subagent-text` marks forwarded child
@@ -345,6 +417,7 @@ impl LineParser for ClaudeLineParser {
             }
             Some("result") => {
                 self.result_seen = true;
+                self.turn_finished = true;
                 if let Some(session) = str_field(&value, "session_id") {
                     out.push(AgentEvent::SessionDiscovered(AgentSessionId(
                         session.to_string(),
@@ -381,6 +454,14 @@ impl LineParser for ClaudeLineParser {
         let mut out = Vec::new();
         self.flush_message(&mut out);
         out
+    }
+
+    fn take_replayed_user_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.replayed)
+    }
+
+    fn take_turn_finished(&mut self) -> bool {
+        std::mem::take(&mut self.turn_finished)
     }
 
     fn finish_after_exit(&mut self, ok: bool) -> Vec<AgentEvent> {
@@ -421,6 +502,12 @@ fn result_error_message(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::domain::team::TeamMember;
+
+    /// The text content of the first stream-json user line on stdin.
+    fn stdin_text(command: &AdapterCommand) -> String {
+        let line: Value = serde_json::from_str(command.stdin.as_deref().unwrap()).unwrap();
+        line["message"]["content"].as_str().unwrap().to_string()
+    }
 
     fn parse_all(lines: &[&str]) -> Vec<AgentEvent> {
         let mut parser = ClaudeLineParser::default();
@@ -503,7 +590,25 @@ mod tests {
                 .any(|w| w == ["--tools", "Read,Bash"])
         );
         assert!(!command.args.iter().any(|arg| arg == "--allowed-tools"));
-        assert_eq!(command.stdin.as_deref(), Some("hello"));
+        // The first message is a stream-json user line; stdin stays open so
+        // later messages can be injected, and Claude echoes consumed ones.
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|w| w == ["--input-format", "stream-json"])
+        );
+        assert!(command.args.contains(&"--replay-user-messages".to_string()));
+        assert!(command.keep_stdin_open);
+        let first: Value = serde_json::from_str(command.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            first,
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "hello" },
+            })
+        );
+        assert!(command.stdin.as_deref().unwrap().ends_with('\n'));
         assert!(!command.args.iter().any(|arg| arg == "hello"));
         let img_dir =
             std::env::temp_dir().join(format!("asterline-claude-img-{}", std::process::id()));
@@ -516,7 +621,7 @@ mod tests {
             None,
         );
         let expected = format!("hello\n(attached image: {})", img.display());
-        assert_eq!(with_image.stdin.as_deref(), Some(expected.as_str()));
+        assert_eq!(stdin_text(&with_image), expected);
         let _ = std::fs::remove_dir_all(&img_dir);
         // The product path never disables session persistence.
         assert!(!command.args.iter().any(|a| a == "--no-session-persistence"));
@@ -538,8 +643,71 @@ mod tests {
         let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
         let command = adapter.build_command("--version", None, None);
 
-        assert_eq!(command.stdin.as_deref(), Some("--version"));
+        assert_eq!(stdin_text(&command), "--version");
         assert!(!command.args.iter().any(|arg| arg == "--version"));
+    }
+
+    #[test]
+    fn adapter_offers_a_steer_encoder_that_matches_the_first_message_format() {
+        let member = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
+        let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
+        let encode = adapter.steer_encoder().expect("claude can be steered");
+        let (line, echoed) = encode("also check the tests");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1);
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["message"]["content"], "also check the tests");
+        assert_eq!(echoed, "also check the tests");
+    }
+
+    #[test]
+    fn replayed_user_messages_are_not_chat_events_but_are_reported_to_the_runner() {
+        let mut parser = ClaudeLineParser::default();
+        // String content, as Claude echoes a stdin message.
+        let events = parser.parse_line(
+            r#"{"type":"user","message":{"role":"user","content":"first"},"parent_tool_use_id":null,"isReplay":true}"#,
+        );
+        assert!(events.is_empty(), "{events:?}");
+        // Text-block content.
+        let events = parser.parse_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]}}"#,
+        );
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            parser.take_replayed_user_messages(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert!(parser.take_replayed_user_messages().is_empty());
+    }
+
+    #[test]
+    fn tool_results_and_child_prompts_are_not_replays() {
+        let mut parser = ClaudeLineParser::default();
+        let events = parser.parse_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolCompleted { ok: true, .. }]
+        ));
+        let events = parser.parse_line(
+            r#"{"type":"user","message":{"role":"user","content":"child task"},"parent_tool_use_id":"toolu_1"}"#,
+        );
+        assert!(events.is_empty());
+        assert!(parser.take_replayed_user_messages().is_empty());
+    }
+
+    #[test]
+    fn a_result_marks_the_turn_finished_once() {
+        let mut parser = ClaudeLineParser::default();
+        assert!(!parser.take_turn_finished());
+        parser.parse_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        );
+        assert!(parser.take_turn_finished());
+        assert!(!parser.take_turn_finished());
     }
 
     #[test]
@@ -810,5 +978,215 @@ mod tests {
 
         parser.parse_line(r#"{"type":"result","is_error":false}"#);
         assert!(parser.finish_after_exit(true).is_empty());
+    }
+
+    // --- end to end through ProcessRunner with a fake `claude` script -------
+
+    #[cfg(unix)]
+    mod fake_process {
+        use super::*;
+        use crate::adapter::{MemberRunner, ProcessRunner, RunRequest, steer_channel};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1"}"#;
+        const REPLAY_FIRST: &str =
+            r#"{"type":"user","message":{"role":"user","content":"hello"},"isReplay":true}"#;
+        const REPLAY_STEER: &str =
+            r#"{"type":"user","message":{"role":"user","content":"steer me"},"isReplay":true}"#;
+
+        struct Fixture {
+            dir: std::path::PathBuf,
+        }
+
+        impl Fixture {
+            fn new(name: &str, script: &str) -> Self {
+                let dir = std::env::temp_dir()
+                    .join(format!("asterline-claude-{name}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("fake-claude");
+                std::fs::write(&path, script).unwrap();
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+                Self { dir }
+            }
+
+            /// Run one turn with `steer_messages` already waiting in the
+            /// run's steer channel; return every event the runner emitted.
+            fn run(&self, steer_messages: &[&str]) -> Vec<AgentEvent> {
+                let member = TeamMember::new("rev", "Rev", BackendKind::Claude, "review");
+                let adapter = ClaudeStreamAdapter::from_member(&member, &self.dir)
+                    .with_binary(self.dir.join("fake-claude").display().to_string());
+                let runner = ProcessRunner::new(adapter);
+                assert!(runner.supports_steer());
+                let (tx, rx) = steer_channel();
+                for message in steer_messages {
+                    tx.send((*message).to_string()).unwrap();
+                }
+                let (events, received) = mpsc::sync_channel(256);
+                runner.run(
+                    RunRequest {
+                        prompt: "hello".to_string(),
+                        session: None,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        effort: None,
+                        steer: Some(rx),
+                    },
+                    events,
+                );
+                // The run is over: further steers are refused.
+                assert!(tx.send("late".to_string()).is_err());
+                received.try_iter().collect()
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn count(events: &[AgentEvent], wanted: &AgentEvent) -> usize {
+            events.iter().filter(|event| *event == wanted).count()
+        }
+
+        #[test]
+        fn message_consumed_before_the_result_is_delivered_and_stdin_then_closes() {
+            let script = format!(
+                r#"#!/bin/bash
+read -r first
+printf '%s\n' '{REPLAY_FIRST}'
+read -r second
+printf '%s\n' '{REPLAY_STEER}'
+printf '%s\n' '{RESULT}'
+# Claude waits for more input after `result`; the runner must close stdin.
+cat > /dev/null
+"#
+            );
+            let fixture = Fixture::new("delivered", &script);
+            let events = fixture.run(&["steer me"]);
+            assert_eq!(count(&events, &AgentEvent::SteerDelivered), 1, "{events:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::SteerRejected { .. })),
+                "{events:?}"
+            );
+            assert!(
+                events.contains(&AgentEvent::Exited {
+                    code: Some(0),
+                    ok: true
+                }),
+                "{events:?}"
+            );
+            // Echoed user messages never become chat content.
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::MessageCompleted(text) if text.contains("steer me"))),
+                "{events:?}"
+            );
+        }
+
+        #[test]
+        fn message_not_yet_consumed_at_the_result_keeps_stdin_open_for_the_next_turn() {
+            let marker = "stdin-state";
+            let script = format!(
+                r#"#!/bin/bash
+read -r first
+printf '%s\n' '{REPLAY_FIRST}'
+read -r second
+# The first turn ends before the injected message was consumed.
+printf '%s\n' '{RESULT}'
+read -t 0.7 _ ; echo "$?" > {marker}
+printf '%s\n' '{REPLAY_STEER}'
+printf '%s\n' '{RESULT}'
+cat > /dev/null
+"#
+            );
+            let fixture = Fixture::new("pending", &script);
+            let events = fixture.run(&["steer me"]);
+            assert_eq!(count(&events, &AgentEvent::SteerDelivered), 1, "{events:?}");
+            assert!(
+                events.contains(&AgentEvent::Exited {
+                    code: Some(0),
+                    ok: true
+                }),
+                "{events:?}"
+            );
+            // `read -t` timing out (status above 128) means stdin was still
+            // open after the first result; EOF would have given status 1.
+            let status: i32 = std::fs::read_to_string(fixture.dir.join(marker))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(
+                status > 128,
+                "stdin closed too early (read status {status})"
+            );
+        }
+
+        #[test]
+        fn message_the_process_never_consumed_is_handed_back() {
+            let script = format!(
+                r#"#!/bin/bash
+read -r first
+printf '%s\n' '{REPLAY_FIRST}'
+read -r second
+printf '%s\n' '{RESULT}'
+exit 0
+"#
+            );
+            let fixture = Fixture::new("rejected", &script);
+            let events = fixture.run(&["steer me"]);
+            assert_eq!(
+                count(
+                    &events,
+                    &AgentEvent::SteerRejected {
+                        prompt: "steer me".to_string()
+                    }
+                ),
+                1,
+                "{events:?}"
+            );
+            assert_eq!(count(&events, &AgentEvent::SteerDelivered), 0);
+            // The rejection precedes the exit so the runtime sees it first.
+            let rejected = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::SteerRejected { .. }))
+                .unwrap();
+            let exited = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::Exited { .. }))
+                .unwrap();
+            assert!(rejected < exited);
+        }
+
+        #[test]
+        fn run_without_steered_messages_still_closes_stdin_after_the_result() {
+            let script = format!(
+                r#"#!/bin/bash
+read -r first
+printf '%s\n' '{REPLAY_FIRST}'
+printf '%s\n' '{RESULT}'
+cat > /dev/null
+"#
+            );
+            let fixture = Fixture::new("plain", &script);
+            let events = fixture.run(&[]);
+            assert!(
+                events.contains(&AgentEvent::Exited {
+                    code: Some(0),
+                    ok: true
+                }),
+                "{events:?}"
+            );
+            assert_eq!(count(&events, &AgentEvent::SteerDelivered), 0);
+        }
     }
 }
