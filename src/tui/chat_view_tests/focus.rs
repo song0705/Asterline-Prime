@@ -663,8 +663,9 @@ fn welcome_page_shows_the_model_and_the_model_command() {
     draw(&mut terminal, &state);
     let view = format!("{}", terminal.backend());
 
-    assert!(view.contains("Model: codex"), "{view}");
-    assert!(!view.contains("Model: codex ·"), "{view}");
+    assert!(view.contains("asterline"), "{view}");
+    assert!(view.contains("codex"), "{view}");
+    assert!(!view.contains("Model: codex"), "{view}");
     assert!(view.contains("/model"), "{view}");
     assert!(view.contains("switch model"), "{view}");
     assert!(view.contains("talk to Builder"), "{view}");

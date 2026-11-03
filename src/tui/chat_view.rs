@@ -25,7 +25,7 @@ use crate::tui::markdown;
 use crate::tui::model_picker;
 use crate::tui::status_indicator;
 use crate::tui::theme;
-use crate::tui::theme::{clip_width, truncate_width};
+use crate::tui::theme::{clip_width, display_width, truncate_width};
 use crate::tui::tool_display;
 
 /// Snapshot of the flattened chat layout for the last frame. Used by
@@ -694,7 +694,7 @@ fn render_chunk(
     let mut tool_titles = Vec::new();
     if start == 0 && state.chat().is_empty() {
         lines.push(Line::raw(""));
-        lines.extend(quick_start_lines(state));
+        lines.extend(quick_start_lines(state, width));
         lines.push(Line::raw(""));
     }
     render_chat_history_range(
@@ -2162,7 +2162,122 @@ fn line_is_blank(line: &Line<'_>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
-fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
+/// The letter-A logo of the welcome splash, one entry per row. Every glyph is
+/// one cell wide; the logo is `SPLASH_LOGO_WIDTH` cells wide.
+const SPLASH_LOGO: [&str; 7] = [
+    "      ▟▙",
+    "     ▟██▙",
+    "    ▟█▘▝█▙",
+    "   ▟█▘  ▝█▙",
+    "  ▟█▙▄▄▄▄▟█▙",
+    " ▟█▘      ▝█▙",
+    "▟█▘        ▝█▙",
+];
+const SPLASH_LOGO_WIDTH: usize = 14;
+/// Columns between the logo and the text beside it.
+const SPLASH_GAP: usize = 4;
+/// Minimum text columns beside the logo before the logo is dropped.
+const SPLASH_MIN_TEXT: usize = 24;
+
+fn splash_logo_row(row: usize) -> Vec<Span<'static>> {
+    if row == 4 {
+        return vec![
+            Span::styled("▄▄", theme::dim()),
+            Span::styled("▟█▙", theme::accent()),
+            Span::styled("▄▄▄▄", theme::dim()),
+            Span::styled("▟█▙", theme::accent()),
+        ];
+    }
+    vec![Span::styled(SPLASH_LOGO[row], theme::accent())]
+}
+
+/// The brand splash of an empty chat: the letter-A logo on the left with the
+/// name, model and working folder on the right. Rows never exceed `width - 1`
+/// columns. Terminals too narrow for the logo get just the three text rows.
+fn splash_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let avail = INDENT_TEXT.len() + content_width(width);
+    let text_col = INDENT_TEXT.len() + SPLASH_LOGO_WIDTH + SPLASH_GAP;
+    let with_logo = avail >= text_col + SPLASH_MIN_TEXT;
+    // Room for the text; the logo layout also keeps the line and its star.
+    let text_max = if with_logo {
+        avail - text_col - 4
+    } else {
+        avail.saturating_sub(INDENT_TEXT.len()).max(1)
+    };
+
+    let name = "asterline";
+    let version = clip_width(
+        &format!("  v{}", env!("CARGO_PKG_VERSION")),
+        text_max.saturating_sub(name.len()).max(1),
+    );
+    let title_width = name.len() + display_width(&version);
+    let title = vec![
+        Span::styled(name, theme::bold(theme::emphasis_color())),
+        Span::styled(version, theme::dim()),
+    ];
+    let model_span = state.welcome_model_summary().map(|model| {
+        let model = clip_width(&model, text_max);
+        (display_width(&model), Span::styled(model, theme::muted()))
+    });
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+    let workspace = crate::tui::header::display_workspace(state.workspace(), home.as_deref());
+    let path_span = (!workspace.is_empty()).then(|| {
+        let path = theme::clip_width_start(&workspace, text_max);
+        (display_width(&path), Span::styled(path, theme::dim()))
+    });
+
+    if !with_logo {
+        let mut first = vec![Span::raw(INDENT_TEXT)];
+        first.extend(title);
+        let mut lines = vec![Line::from(first)];
+        for (_, span) in [model_span, path_span].into_iter().flatten() {
+            lines.push(Line::from(vec![Span::raw(INDENT_TEXT), span]));
+        }
+        return lines;
+    }
+
+    let text_width = [
+        Some(title_width),
+        model_span.as_ref().map(|(w, _)| *w),
+        path_span.as_ref().map(|(w, _)| *w),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
+    // The crossbar row's logo part is 12 cells; its line runs on to two
+    // columns past the longest text, then ` ✦`.
+    let bar_tail = SPLASH_LOGO_WIDTH + SPLASH_GAP + text_width + 2 - 12;
+
+    let mut lines = Vec::new();
+    for (row, art) in SPLASH_LOGO.iter().enumerate() {
+        let mut spans = vec![Span::raw(INDENT_TEXT)];
+        spans.extend(splash_logo_row(row));
+        if row == 4 {
+            spans.push(Span::styled("▄".repeat(bar_tail), theme::dim()));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("✦", theme::accent()));
+        } else {
+            let side: Option<Vec<Span<'static>>> = match row {
+                3 => Some(title.clone()),
+                5 => model_span.clone().map(|(_, span)| vec![span]),
+                6 => path_span.clone().map(|(_, span)| vec![span]),
+                _ => None,
+            };
+            if let Some(side) = side {
+                let pad = SPLASH_LOGO_WIDTH + SPLASH_GAP - display_width(art);
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.extend(side);
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn quick_start_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     if state.members().is_empty() {
@@ -2170,12 +2285,7 @@ fn quick_start_lines(state: &AppState) -> Vec<Line<'static>> {
         return lines;
     }
 
-    if let Some(model) = state.welcome_model_summary() {
-        lines.push(Line::from(vec![
-            Span::styled("  Model: ", theme::muted()),
-            Span::styled(model, theme::text()),
-        ]));
-    }
+    lines.extend(splash_lines(state, width));
     lines.push(Line::raw(""));
 
     let talk_to = match state.focus() {

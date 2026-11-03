@@ -39,9 +39,11 @@ fn renders_empty_state_quick_start() {
 
     // Trimmed to a title, the model, and four things to try.
     // The header already says "Asterline", so the welcome block starts at the
-    // model line.
+    // splash.
     assert!(!view.contains("Multi-Agent Coding Console"));
-    assert!(view.contains("Model: codex"));
+    assert!(view.contains("asterline"));
+    assert!(view.contains("codex"));
+    assert!(view.contains("/Users/me/proj"));
     assert!(!view.contains("Members:"));
     assert!(!view.contains("builder (codex, implementation)"));
     assert!(view.contains("<message>"));
@@ -1785,4 +1787,128 @@ fn approval_card_renders_above_the_composer() {
     assert!(view.contains("git push origin main"), "{view}");
     assert!(view.contains("y agree"), "{view}");
     assert!(view.contains("n deny"), "{view}");
+}
+
+fn splash_state() -> AppState {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::Ready {
+        modes: Default::default(),
+        mode_overrides: Default::default(),
+        suggested_verify: None,
+        team: "t".to_string(),
+        workspace: "/srv/work/项目/proj".to_string(),
+        default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+        runs: Vec::new(),
+        members: vec![member_summary(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "implementation",
+            MemberStatus::Idle,
+        )],
+    });
+    state
+}
+
+fn splash_rows(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let all = quick_start_lines(state, width);
+    let end = all
+        .iter()
+        .position(|line| line_is_blank(line))
+        .expect("splash is followed by a blank line");
+    all[..end].to_vec()
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+#[test]
+fn wide_splash_draws_logo_with_name_model_and_path() {
+    let state = splash_state();
+    let rows = splash_rows(&state, 100);
+    assert_eq!(rows.len(), 7);
+    let text: Vec<String> = rows.iter().map(line_text).collect();
+    let art = [
+        "      ▟▙",
+        "     ▟██▙",
+        "    ▟█▘▝█▙",
+        "   ▟█▘  ▝█▙",
+        "▄▄▟█▙▄▄▄▄▟█▙",
+        " ▟█▘      ▝█▙",
+        "▟█▘        ▝█▙",
+    ];
+    for (row, expected) in art.iter().enumerate() {
+        let body = text[row].strip_prefix("  ").expect("two-space indent");
+        assert!(body.starts_with(expected), "row {row}: {body:?}");
+    }
+    assert!(text[3].contains("asterline"), "{:?}", text[3]);
+    assert!(text[3].contains(env!("CARGO_PKG_VERSION")), "{:?}", text[3]);
+    let model = state.welcome_model_summary().unwrap();
+    assert!(text[5].contains(&model), "{:?}", text[5]);
+    assert!(text[6].contains("/srv/work/项目/proj"), "{:?}", text[6]);
+    // Text begins 4 cells after the 14-cell logo, after the 2-space indent.
+    let side = |row: &str| row.chars().skip(2 + 14 + 4).collect::<String>();
+    assert!(side(&text[3]).starts_with("asterline"), "{:?}", text[3]);
+    assert!(side(&text[5]).starts_with(&model), "{:?}", text[5]);
+    assert!(text[4].ends_with(" ✦"), "{:?}", text[4]);
+    // The line runs two columns past the longest text, then ` ✦`.
+    let longest = [3, 5, 6]
+        .iter()
+        .map(|&row| theme::display_width(&side(&text[row])))
+        .max()
+        .unwrap();
+    assert_eq!(theme::display_width(&text[4]), 2 + 14 + 4 + longest + 2 + 2);
+
+    // Colours: A strokes accent, crossbar dim.
+    let fg = |line: &Line<'_>, ch: char| {
+        line.spans
+            .iter()
+            .find(|span| span.content.contains(ch))
+            .and_then(|span| span.style.fg)
+    };
+    for row in [0, 1, 2, 3, 5, 6] {
+        assert_eq!(
+            fg(&rows[row], '▟'),
+            Some(theme::accent_color()),
+            "row {row}"
+        );
+    }
+    assert_eq!(fg(&rows[4], '▟'), Some(theme::accent_color()));
+    assert_eq!(fg(&rows[4], '▄'), Some(theme::dim_color()));
+    assert_eq!(fg(&rows[4], '✦'), Some(theme::accent_color()));
+    assert_eq!(rows[4].spans[1].style.fg, Some(theme::dim_color()));
+}
+
+#[test]
+fn narrow_splash_drops_the_logo() {
+    let state = splash_state();
+    let rows = splash_rows(&state, 40);
+    let text: Vec<String> = rows.iter().map(line_text).collect();
+    assert_eq!(text.len(), 3, "{text:?}");
+    assert!(
+        text.iter()
+            .all(|row| !row.contains('▟') && !row.contains('✦'))
+    );
+    assert!(text[0].starts_with("  asterline"), "{:?}", text[0]);
+    assert!(text[1].contains(&state.welcome_model_summary().unwrap()));
+    assert!(text[2].contains("proj"), "{:?}", text[2]);
+    assert!(text.iter().all(|row| theme::display_width(row) <= 40));
+}
+
+#[test]
+fn splash_rows_never_exceed_the_width() {
+    let state = splash_state();
+    for width in [20, 30, 40, 43, 44, 45, 50, 60, 80, 120] {
+        for row in splash_rows(&state, width) {
+            let text = line_text(&row);
+            assert!(
+                theme::display_width(&text) <= width,
+                "width {width}: {text:?}"
+            );
+        }
+    }
 }
