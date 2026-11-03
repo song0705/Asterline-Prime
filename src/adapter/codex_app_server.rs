@@ -31,7 +31,11 @@ use crate::domain::event::{AgentEvent, AgentSessionId, ApprovalDecision, FileCha
 use crate::domain::team::{BackendKind, Effort, PermissionMode, SandboxPolicy, TeamMember};
 
 const RPC_QUEUE_CAPACITY: usize = 256;
-const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+// Only for requests with no cancel path (model catalog discovery in a
+// background worker): without it a hung server would block that worker forever.
+// Requests made during a run have no fixed limit; they end on a response, on
+// cancel, or when the server process or its stdout dies.
+const UNCANCELLABLE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const RPC_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 const TOOL_SUMMARY_MAX: usize = 160;
@@ -168,7 +172,8 @@ pub(crate) fn discover_models(cwd: &Path) -> Result<Vec<DiscoveredModel>, String
     // nevertheless so an unexpectedly chatty server cannot allocate without
     // limit while discovery is in progress.
     let (events, _event_rx) = mpsc::sync_channel(RPC_QUEUE_CAPACITY);
-    let (mut client, _native_approval_tx) = AppServerClient::start(&config, &events)?;
+    let (mut client, _native_approval_tx) = AppServerClient::start(&config, &events, None)?
+        .ok_or_else(|| "Codex App Server startup was cancelled".to_string())?;
     let mut mapper = AppServerEventMapper::default();
     let mut cursor = None;
     let mut models = Vec::new();
@@ -276,8 +281,17 @@ impl MemberRunner for CodexAppServerRunner {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
         if guard.is_none() {
-            match AppServerClient::start(&self.config, &events) {
-                Ok((client, native_approval_tx)) => {
+            match AppServerClient::start(&self.config, &events, Some(&req.cancel)) {
+                Ok(None) => {
+                    // Cancelled while the server was starting: a normal
+                    // cancelled outcome, not an error.
+                    let _ = events.send(AgentEvent::Exited {
+                        code: None,
+                        ok: false,
+                    });
+                    return;
+                }
+                Ok(Some((client, native_approval_tx))) => {
                     *self
                         .native_approval_tx
                         .lock()
@@ -303,6 +317,13 @@ impl MemberRunner for CodexAppServerRunner {
         match result {
             Ok(ok) => {
                 let _ = events.send(AgentEvent::Exited { code: None, ok });
+                if guard.as_ref().is_some_and(|client| client.abandoned) {
+                    *guard = None;
+                    *self
+                        .native_approval_tx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                }
             }
             Err(error) => {
                 // Reset only on a transport/protocol failure. A normal failed
@@ -352,13 +373,17 @@ struct AppServerClient {
     active_thread_id: Option<String>,
     native_approval_rx: Receiver<NativeApprovalDecision>,
     next_native_approval_id: u64,
+    // A cancelled request may still be running inside the server (an unknown
+    // thread or turn). The runner drops this client so that work dies with it.
+    abandoned: bool,
 }
 
 impl AppServerClient {
     fn start(
         config: &CodexAppServerConfig,
         events: &SyncSender<AgentEvent>,
-    ) -> Result<(Self, mpsc::Sender<NativeApprovalDecision>), String> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<(Self, mpsc::Sender<NativeApprovalDecision>)>, String> {
         let program =
             resolve_binary_on_path(&config.binary).unwrap_or_else(|| PathBuf::from(&config.binary));
         let mut command = Command::new(program);
@@ -411,10 +436,12 @@ impl AppServerClient {
             active_thread_id: None,
             native_approval_rx,
             next_native_approval_id: 1,
+            abandoned: false,
         };
 
         let mut mapper = AppServerEventMapper::default();
-        let _ = client.request(
+        // Dropping `client` on cancel terminates the half-started server.
+        let Some(_) = client.request_cancellable(
             "initialize",
             json!({
                 "clientInfo": {
@@ -426,12 +453,16 @@ impl AppServerClient {
             }),
             events,
             &mut mapper,
-        )?;
+            cancel,
+        )?
+        else {
+            return Ok(None);
+        };
         client.notify("initialized", Some(json!({})))?;
         let _ = events.send(AgentEvent::Log(
             "connected to persistent Codex App Server".to_string(),
         ));
-        Ok((client, native_approval_tx))
+        Ok(Some((client, native_approval_tx)))
     }
 
     fn has_exited(&mut self) -> bool {
@@ -445,14 +476,23 @@ impl AppServerClient {
         events: &SyncSender<AgentEvent>,
     ) -> Result<bool, String> {
         let mut mapper = AppServerEventMapper::default();
-        let thread_id = self.resolve_thread(config, req.session.as_ref(), events, &mut mapper)?;
+        let cancel = Some(&*req.cancel);
+        let Some(thread_id) =
+            self.resolve_thread(config, req.session.as_ref(), events, &mut mapper, cancel)?
+        else {
+            return Ok(false);
+        };
         mapper.thread_id = Some(thread_id.clone());
-        let turn = self.request(
+        let Some(turn) = self.request_cancellable(
             "turn/start",
             config.turn_params(&thread_id, &req.prompt, req.effort),
             events,
             &mut mapper,
-        )?;
+            cancel,
+        )?
+        else {
+            return Ok(false);
+        };
         let turn_id = turn
             .pointer("/turn/id")
             .and_then(Value::as_str)
@@ -470,31 +510,54 @@ impl AppServerClient {
         requested_session: Option<&AgentSessionId>,
         events: &SyncSender<AgentEvent>,
         mapper: &mut AppServerEventMapper,
-    ) -> Result<String, String> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<String>, String> {
         if let Some(session) = requested_session
             && self.active_thread_id.as_deref() == Some(session.as_str())
         {
-            return Ok(session.as_str().to_string());
+            return Ok(Some(session.as_str().to_string()));
         }
 
         let response = if let Some(session) = requested_session {
-            match self.request(
+            match self.request_cancellable(
                 "thread/resume",
                 config.resume_params(session.as_str()),
                 events,
                 mapper,
+                cancel,
             ) {
-                Ok(response) => response,
+                Ok(Some(response)) => response,
+                Ok(None) => return Ok(None),
                 Err(error) if resume_target_is_missing(&error) => {
                     let _ = events.send(AgentEvent::Log(format!(
                         "Codex thread {session} is unavailable; starting a new native thread"
                     )));
-                    self.request("thread/start", config.thread_params(), events, mapper)?
+                    let Some(response) = self.request_cancellable(
+                        "thread/start",
+                        config.thread_params(),
+                        events,
+                        mapper,
+                        cancel,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    response
                 }
                 Err(error) => return Err(error),
             }
         } else {
-            self.request("thread/start", config.thread_params(), events, mapper)?
+            let Some(response) = self.request_cancellable(
+                "thread/start",
+                config.thread_params(),
+                events,
+                mapper,
+                cancel,
+            )?
+            else {
+                return Ok(None);
+            };
+            response
         };
         let thread_id = response
             .pointer("/thread/id")
@@ -506,9 +569,9 @@ impl AppServerClient {
         let _ = events.send(AgentEvent::SessionDiscovered(AgentSessionId(
             thread_id.clone(),
         )));
-        self.set_native_thread_name(&thread_id, config, events, mapper);
+        self.set_native_thread_name(&thread_id, config, events, mapper, cancel);
         self.active_thread_id = Some(thread_id.clone());
-        Ok(thread_id)
+        Ok(Some(thread_id))
     }
 
     /// Keep App Server-created threads recognizable in Codex's own resume
@@ -520,12 +583,14 @@ impl AppServerClient {
         config: &CodexAppServerConfig,
         events: &SyncSender<AgentEvent>,
         mapper: &mut AppServerEventMapper,
+        cancel: Option<&AtomicBool>,
     ) {
-        if let Err(error) = self.request(
+        if let Err(error) = self.request_cancellable(
             "thread/name/set",
             json!({ "threadId": thread_id, "name": config.native_session_name() }),
             events,
             mapper,
+            cancel,
         ) {
             let _ = events.send(AgentEvent::ParseWarning(format!(
                 "could not label native Codex thread {thread_id}: {error}"
@@ -581,6 +646,7 @@ impl AppServerClient {
         }
     }
 
+    /// Request with no cancel path (model listing): bounded by a timeout.
     fn request(
         &mut self,
         method: &str,
@@ -588,10 +654,39 @@ impl AppServerClient {
         events: &SyncSender<AgentEvent>,
         mapper: &mut AppServerEventMapper,
     ) -> Result<Value, String> {
+        self.request_cancellable(method, params, events, mapper, None)?
+            .ok_or_else(|| format!("codex app-server {method} was cancelled"))
+    }
+
+    /// Request that also watches the run's cancel flag, with no fixed time
+    /// limit when a cancel flag is given (a dead server still errors at once
+    /// via `next_message`). Without a flag it is bounded by
+    /// `UNCANCELLABLE_RPC_TIMEOUT`. `Ok(None)` means the
+    /// run was cancelled; the caller reports a normal cancelled outcome rather
+    /// than an error. A request abandoned mid-flight marks the client so the
+    /// runner restarts the server and nothing keeps running unseen.
+    fn request_cancellable(
+        &mut self,
+        method: &str,
+        params: Value,
+        events: &SyncSender<AgentEvent>,
+        mapper: &mut AppServerEventMapper,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<Value>, String> {
+        let is_cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+        if is_cancelled() {
+            return Ok(None);
+        }
         let request_id = self.send_request(method, params)?;
-        let deadline = Instant::now() + RPC_RESPONSE_TIMEOUT;
+        let deadline = cancel
+            .is_none()
+            .then(|| Instant::now() + UNCANCELLABLE_RPC_TIMEOUT);
         loop {
-            if Instant::now() >= deadline {
+            if is_cancelled() {
+                self.abandoned = true;
+                return Ok(None);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(format!("timed out waiting for codex app-server {method}"));
             }
             let Some(message) = self.next_message(RPC_POLL_INTERVAL, events)? else {
@@ -601,7 +696,7 @@ impl AppServerClient {
                 && message.get("id").is_some()
                 && message.get("id") == Some(&request_id)
             {
-                return message.get("result").cloned().ok_or_else(|| {
+                return message.get("result").cloned().map(Some).ok_or_else(|| {
                     format!(
                         "codex app-server {method} failed: {}",
                         rpc_error_message(&message).unwrap_or_else(|| {
@@ -2338,6 +2433,123 @@ done
         assert!(input.iter().any(|message| {
             message["method"] == "turn/start" && message["params"]["effort"] == "high"
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uncancellable_rpc_timeout_is_a_generous_safety_net() {
+        assert_eq!(UNCANCELLABLE_RPC_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_during_pending_request_returns_promptly_as_cancel() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-codex-app-server-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("fake-codex-app-server");
+        // Answers initialize, then never answers thread/start.
+        let script = r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"userAgent":"fake-codex"}}'
+while IFS= read -r line; do :; done
+"#;
+        std::fs::write(&server, script).unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+        let runner = CodexAppServerRunner::from_member(&member, &dir)
+            .with_binary(server.display().to_string());
+        let (events, received) = mpsc::sync_channel(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        runner.run(
+            RunRequest {
+                prompt: "hello".to_string(),
+                session: None,
+                cancel,
+                effort: None,
+            },
+            events,
+        );
+        let elapsed = started.elapsed();
+        setter.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cancel took {elapsed:?}, far longer than the 300 ms delay"
+        );
+        let seen = received.try_iter().collect::<Vec<_>>();
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_))),
+            "cancel must not surface as an error: {seen:?}"
+        );
+        assert!(seen.contains(&AgentEvent::Exited {
+            code: None,
+            ok: false
+        }));
+        // The abandoned server is discarded so unseen work cannot continue.
+        assert!(runner.client.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_server_fails_a_pending_request_without_waiting() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-codex-app-server-dead-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("fake-codex-app-server");
+        // Answers initialize, reads thread/start, then exits without replying.
+        let script = r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"userAgent":"fake-codex"}}'
+IFS= read -r line
+IFS= read -r line
+exit 0
+"#;
+        std::fs::write(&server, script).unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+
+        let member = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
+        let runner = CodexAppServerRunner::from_member(&member, &dir)
+            .with_binary(server.display().to_string());
+        let (events, received) = mpsc::sync_channel(64);
+        let started = Instant::now();
+        runner.run(
+            RunRequest {
+                prompt: "hello".to_string(),
+                session: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                effort: None,
+            },
+            events,
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let seen = received.try_iter().collect::<Vec<_>>();
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_))),
+            "{seen:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
