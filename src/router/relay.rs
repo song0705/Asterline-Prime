@@ -1,8 +1,11 @@
 //! Structured relay guard.
 //!
-//! Bounds automatic agent-to-agent relays so two agents cannot loop forever.
-//! Counting is keyed by `(turn, sender)` so each member gets an independent
-//! budget within a turn, and a new user turn starts fresh.
+//! Stops runaway agent-to-agent chatter without limiting real work. The limit
+//! is the number of *consecutive* automatic relays per sender with no member
+//! doing any work in between: [`RelayGuard::note_progress`] (called when a tool
+//! runs or a file changes) clears every sender's count for that turn. Counting
+//! is keyed by `(turn, sender)`, so each member gets an independent budget, and
+//! a new user turn starts fresh.
 
 use std::collections::HashMap;
 
@@ -44,6 +47,12 @@ impl RelayGuard {
         } else {
             RelayDecision::Continue { count: *count }
         }
+    }
+
+    /// Real work happened in `turn` (a tool call or a file change): forget every
+    /// sender's relay count for it, so only relays with no work in between add up.
+    pub fn note_progress(&mut self, turn: TurnId) {
+        self.counts.retain(|(t, _), _| *t != turn);
     }
 
     /// Forget all counters for a finished turn.
@@ -109,6 +118,50 @@ mod tests {
             guard.record_auto_relay(turn1, &member("a")),
             RelayDecision::Pause { count: 2 }
         );
+    }
+
+    #[test]
+    fn note_progress_clears_counts_for_that_turn_only() {
+        let mut guard = RelayGuard::new(2);
+        let turn1 = TurnId(1);
+        let turn2 = TurnId(2);
+        for _ in 0..2 {
+            guard.record_auto_relay(turn1, &member("a"));
+            guard.record_auto_relay(turn1, &member("b"));
+            guard.record_auto_relay(turn2, &member("a"));
+        }
+
+        guard.note_progress(turn1);
+
+        // turn1: every sender starts over, so each may relay up to the limit again.
+        for expected in 1..=2 {
+            assert_eq!(
+                guard.record_auto_relay(turn1, &member("a")),
+                RelayDecision::Continue { count: expected }
+            );
+            assert_eq!(
+                guard.record_auto_relay(turn1, &member("b")),
+                RelayDecision::Continue { count: expected }
+            );
+        }
+        // turn2 was not touched: still at the limit, so the next relay pauses.
+        assert_eq!(
+            guard.record_auto_relay(turn2, &member("a")),
+            RelayDecision::Pause { count: 3 }
+        );
+    }
+
+    #[test]
+    fn progress_between_relays_never_pauses() {
+        let mut guard = RelayGuard::new(2);
+        let turn = TurnId(1);
+        for _ in 0..50 {
+            guard.note_progress(turn);
+            assert_eq!(
+                guard.record_auto_relay(turn, &member("a")),
+                RelayDecision::Continue { count: 1 }
+            );
+        }
     }
 
     #[test]

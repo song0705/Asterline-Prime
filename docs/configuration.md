@@ -142,7 +142,7 @@ targets (case-insensitive).
 | `workspace`       | Yes      | Default working directory                       |
 | `members`         | Yes      | Non-empty member list                           |
 | `default_target`  | No       | `{"member":"id"}`, `"all"`, or the first member |
-| `max_auto_relays` | No       | Automatic teammate handoff limit; default `6`   |
+| `max_auto_relays` | No       | Handoffs in a row with no tool use; default `6` |
 | `modes`           | No       | Role bindings and budgets for collab modes      |
 | `approvals`       | No       | Approval-gate categories and surfaces           |
 
@@ -567,7 +567,10 @@ can customize the method while retaining the `@@brainstorm_card` and
 
 Asterline removes valid envelopes from the visible response, renders the
 handoff, persists it, and delivers the body to the target members. Automatic
-handoffs are capped by `max_auto_relays`; `/retry` resumes a paused route.
+handoffs are capped by `max_auto_relays` consecutive messages per sender with
+no member running a tool or changing a file in between; any tool call or file
+change resets the count, so long coordinated work is not interrupted but a
+chat-only loop pauses. `/retry` resumes a paused route.
 
 ### Roster requests
 

@@ -738,7 +738,7 @@ impl TeamRuntime {
                 from,
                 vec![from.clone()],
                 prompt,
-                &format!("auto-relay limit reached ({count})"),
+                &relay_pause_reason(count),
                 step,
             ),
         }

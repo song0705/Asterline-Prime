@@ -13,8 +13,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::mode::ModesConfig;
 
-/// The default ceiling on consecutive automatic agent-to-agent relays within a
-/// single turn before the runtime pauses and asks the user to continue.
+/// The default ceiling on consecutive automatic agent-to-agent relays per
+/// sender within a turn, counted without any member doing work (a tool call or
+/// a file change) in between, before the runtime pauses and asks the user to
+/// continue.
 pub const DEFAULT_MAX_AUTO_RELAYS: u32 = 6;
 
 /// The most sub-agents (members opened with `@@spawn`) one conversation holds.
@@ -780,6 +782,9 @@ pub struct TeamConfig {
     pub members: Vec<TeamMember>,
     #[serde(default)]
     pub default_target: Option<DefaultTarget>,
+    /// How many automatic relays in a row one member may send, with no member
+    /// running a tool or changing a file in between, before the route pauses
+    /// until `/retry`. Any real work resets the count.
     #[serde(default = "default_max_auto_relays")]
     pub max_auto_relays: u32,
     /// Optional collaboration-mode role bindings (`review` / `plan` / `brainstorm`).

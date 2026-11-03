@@ -2357,6 +2357,18 @@ impl TeamRuntime {
             return step;
         }
 
+        // Real work (a tool call or a file change) resets the relay guard's
+        // "messages in a row" counts; plain text and reasoning do not.
+        if matches!(
+            event,
+            AgentEvent::ToolStarted { .. }
+                | AgentEvent::ToolCompleted { .. }
+                | AgentEvent::FileChange { .. }
+        ) && let Some(turn) = self.running_turn(member)
+        {
+            self.relay.note_progress(turn);
+        }
+
         match event {
             AgentEvent::MessageStarted => self.start_message(member, &mut step),
             AgentEvent::TextDelta(text) => {
@@ -3093,7 +3105,7 @@ impl TeamRuntime {
                         from,
                         members,
                         prompt,
-                        &format!("auto-relay limit reached ({count})"),
+                        &relay_pause_reason(count),
                         step,
                     );
                 }
@@ -3865,6 +3877,12 @@ include!("team_runtime_sub_agents.inc.rs");
 
 // The persistent goal of the main agent (`/goal`) and its continuation loop.
 include!("team_runtime_goal.inc.rs");
+
+/// Why an automatic relay was paused. The chat adds the "/retry to resume"
+/// hint after the reason.
+fn relay_pause_reason(count: u32) -> String {
+    format!("auto-relay paused: {count} messages in a row with no tool use or file change")
+}
 
 fn relay_prompt(from: &MemberId, from_display: &str, kind: Option<&str>, body: &str) -> String {
     let reply_instruction = if kind == Some("reply") {

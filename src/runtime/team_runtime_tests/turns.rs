@@ -1764,10 +1764,75 @@ fn relay_guard_pauses_after_limit() {
         &builder,
         AgentEvent::MessageCompleted(r#"@@team_message {"to":"reviewer","body":"2"}"#.to_string()),
     );
-    assert!(
-        step.events
-            .iter()
-            .any(|e| matches!(e, RuntimeEvent::RoutePaused { .. }))
+    let reason = step
+        .events
+        .iter()
+        .find_map(|e| match e {
+            RuntimeEvent::RoutePaused { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("second relay pauses");
+    assert_eq!(
+        reason,
+        "auto-relay paused: 2 messages in a row with no tool use or file change"
+    );
+}
+
+fn relay_paused_count(step: &RuntimeStep) -> usize {
+    step.events
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::RoutePaused { .. }))
+        .count()
+}
+
+#[test]
+fn relay_limit_counts_only_relays_without_work_between_them() {
+    let mut config = team();
+    config.max_auto_relays = 2;
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+    rt.on_ui_command(user("go"));
+    let builder = MemberId::new("builder");
+    let relay = |n: usize| {
+        AgentEvent::MessageCompleted(format!(
+            r#"@@team_message {{"to":"reviewer","body":"{n}"}}"#
+        ))
+    };
+
+    // Far more relays than the limit, each preceded by a tool call or a file
+    // change: the count restarts every time, so nothing pauses.
+    for n in 0..20 {
+        let work = if n % 2 == 0 {
+            AgentEvent::ToolStarted {
+                id: format!("t{n}"),
+                name: "shell".to_string(),
+                summary: "ls".to_string(),
+            }
+        } else {
+            AgentEvent::FileChange {
+                files: Vec::new(),
+                ok: true,
+            }
+        };
+        rt.on_agent_event(&builder, work);
+        let step = rt.on_agent_event(&builder, relay(n));
+        assert_eq!(
+            relay_paused_count(&step),
+            0,
+            "relay {n} paused despite work"
+        );
+    }
+
+    // Reasoning and plain streamed text are not work, so relays now add up
+    // (the last loop relay already counted 1; the limit is 2).
+    rt.on_agent_event(&builder, AgentEvent::Reasoning("thinking".to_string()));
+    rt.on_agent_event(&builder, AgentEvent::TextDelta("chatting".to_string()));
+    let second = rt.on_agent_event(&builder, relay(100));
+    let third = rt.on_agent_event(&builder, relay(101));
+    assert_eq!(relay_paused_count(&second), 0);
+    assert_eq!(
+        relay_paused_count(&third),
+        1,
+        "pure message ping-pong pauses"
     );
 }
 
