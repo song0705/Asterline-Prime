@@ -971,9 +971,28 @@ impl SqliteStore {
         mode: TerminalMode,
         mode_overrides: &ModesConfig,
     ) -> Result<()> {
+        self.save_conversation_snapshot_for(
+            self.active_conversation(),
+            team,
+            sessions,
+            mode,
+            mode_overrides,
+        )
+    }
+
+    /// Like [`Self::save_conversation_snapshot`] for an explicit chat, for
+    /// callers that run before the active conversation is bound.
+    pub fn save_conversation_snapshot_for(
+        &self,
+        conversation: i64,
+        team: &TeamConfig,
+        sessions: &[StoredConversationSession],
+        mode: TerminalMode,
+        mode_overrides: &ModesConfig,
+    ) -> Result<()> {
         let (team_json, sessions_json) = serialize_conversation_snapshot(team, sessions)?;
         self.write_conversation_snapshot(
-            self.active_conversation(),
+            conversation,
             &team_json,
             &sessions_json,
             mode,

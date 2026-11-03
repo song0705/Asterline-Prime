@@ -138,7 +138,7 @@ A team can mix providers or use the same backend more than once. Each member has
 
 Asterline does not replace provider authentication, billing, model access, or usage limits.
 
-Each launch starts a new, empty conversation; earlier ones are reached with `/resume`. `/new` (optionally with a first prompt) and `/clear` both start a clean conversation and keep the mode settings. `/resume` picks a saved conversation in the Agents list and restores its transcript, roster, backend sessions, mode, and Runs. Project state lives under `~/.asterline` (override with `ASTERLINE_HOME`), never in your project folder:
+Each launch starts a new, empty conversation; earlier ones are reached with `/resume`. `/new` (optionally with a first prompt) and `/clear` both start a clean conversation and keep the mode settings. Every new conversation starts with one default `main` agent on the first installed CLI; members added in `/team` and model changes stay with the chat they were made in and return with `/resume` (an explicit `--team` file is used for new chats in that session). `/resume` picks a saved conversation in the Agents list and restores its transcript, roster, backend sessions, mode, and Runs. Project state lives under `~/.asterline` (override with `ASTERLINE_HOME`), never in your project folder:
 
 ```text
 ~/.asterline/

@@ -230,7 +230,13 @@ Persist the current conversation, create a new conversation, clear the visible
 transcript and current run list, create fresh backend session IDs, and reset
 the terminal mode to `normal`. Mode field settings from the previous chat
 (reviewer, builder, limits, and other this-chat overrides) stay in effect for
-the new conversation. New runs in that chat start again at `run-1`. If a
+the new conversation. The new chat starts with one default `main` agent on the
+first installed CLI (Codex, then Claude, Grok, Agy), using that CLI's own
+default model and permission preset. Members added in `/team` and `/model`
+changes belong to the chat you leave; they are not carried over, and
+`/resume` brings them back with that chat. Team settings such as
+`max_auto_relays`, `modes`, and `approvals` stay. When Asterline was started
+with `--team <PATH>`, `/new` resets to that file's members instead. New runs in that chat start again at `run-1`. If a
 member, collaboration run, or verification is active, `/new` is rejected;
 press `Esc` and wait for cancellation first.
 
@@ -243,7 +249,8 @@ is untouched.
 `/clear` takes no argument and does the same full new-conversation operation
 as a bare `/new` rather than merely hiding history (`/clear text` answers
 `Usage: /clear`). A normal restart opens a new conversation and leaves the earlier
-one available in `/resume`. `/new` also removes the chat's sub-agents (see
+one available in `/resume`, and the new chat starts with the default `main`
+agent as above. `/new` also removes the chat's sub-agents (see
 [Sub-agents](configuration.md#sub-agents); one at a time, `Ctrl+X` in the Agents list removes a single sub-agent). The old chat stays in the Agents
 list's **Inactive** section (see [Agents list](#agents-list-)). `Ctrl+N` in
 that list is the same as `/new`.
@@ -257,7 +264,8 @@ that list is the same as `/new`.
 
 `/resume` opens the Agents list with the highlight on its newest **Inactive**
 row, the saved conversations. Press `Enter` (or `→`, or click) on one to
-restore its transcript, team configuration, roster, native backend session
+restore its transcript, team configuration, roster (including members added in
+`/team` and model changes made in that chat), native backend session
 IDs, active mode, and conversation-scoped runs; the restored chat itself is
 the confirmation. `/resume <number>` restores the conversation with that
 number directly; anything else after `/resume` answers a usage message.
@@ -436,6 +444,10 @@ startup, so the editor stays responsive and reports the actual detected model.
 Focus the member's `model` field and press `t` to re-fetch it at any time; the
 result is shared by matching backend/workspace members.
 Missing CLIs remain visible for diagnosis but cannot be selected.
+
+The roster you edit here belongs to the current chat: the next new chat (a
+launch, `/new`, or `/clear`) starts again from one default `main` agent, and
+`/resume` brings this chat's roster back.
 
 The editor changes the roster, names, backend, model, effort, native session ID,
 and approval behavior. The model field shows what the member effectively runs:

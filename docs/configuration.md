@@ -26,6 +26,18 @@ There is no setup screen. Use `/model` to change the viewed agent's model; the
 choice is saved. A hidden `--pick-team` flag ignores the saved roster and
 starts over from step 3.
 
+Steps 1 and 2 decide only the settings a project carries (`name`, `workspace`,
+`max_auto_relays`, `modes`, `approvals`). The members of a **new chat** do not
+come from the previous chat. Every new chat (the one a launch opens, `/new`,
+`/clear`, and `Ctrl+N`) starts with one default `main` agent on the first
+installed CLI (Codex, then Claude, Grok, Agy) with that CLI's own default model
+and permission preset, as in step 3. Members you added in `/team` and model or
+effort changes you made with `/model` belong to the chat they were made in;
+`/resume` brings them back with that chat, and the new chat does not inherit
+them. The exception is an explicit `--team <PATH>` file: its members are used
+for the first chat and again for every `/new` in that session. If no supported
+CLI is installed, a new chat keeps the current top-level members.
+
 Use `/team` to modify the live roster. Asterline loads installed Agent CLIs
 and their model catalogs once when it starts; opening `/team` reuses that
 cache. The same lookup reads non-Codex CLIs' local permission defaults for
@@ -493,10 +505,12 @@ verification outcomes.
 Protect this directory like any other development transcript. It is outside
 your repositories, so there is nothing to add to `.gitignore`.
 
-Every launch opens a new, empty conversation (an existing blank one is reused);
-earlier conversations are reached with `/resume`. `/new` and
-`/clear` both create a clean conversation in normal mode and new backend
-sessions while retaining older database records. They are rejected while
+Every launch opens a new, empty conversation (an existing blank one is reused
+and gets the new chat's roster); earlier conversations are reached with
+`/resume`. `/new` and `/clear` both create a clean conversation in normal mode
+and new backend sessions while retaining older database records. Each new
+conversation starts with one default `main` agent (see
+[How Asterline resolves a team](#how-asterline-resolves-a-team)). They are rejected while
 members, runs, or verification are active; press `Esc` and wait for
 cancellation first.
 `--no-restore` skips startup replay without deleting data. `--db <PATH>` moves
@@ -505,7 +519,8 @@ the database to another location.
 `/resume` opens the Agents list on its saved chats (the **Inactive** section);
 `/new <prompt>` starts a clean chat and sends the prompt. Restoring a chat also restores the
 roster, full member configuration, and each member's native backend session ID
-that belonged to that chat.
+that belonged to that chat, including members added in `/team` and model
+changes made there; the chat you leave keeps them.
 
 ## Terminal color theme
 
@@ -626,7 +641,9 @@ sends the parent one short explanation; hand-backs and refusals count against
 Sub-agents belong to the current chat only. They are never written to
 the saved `team.json` (not even after `/model` or `/team` changes), they are
 saved with the chat so `/resume` and a normal restart bring them back with
-their sessions, and `/new` removes them all. A single sub-agent can be removed
+their sessions, and `/new` removes them all (a new chat starts with only the
+default `main`, so the top-level members of the old chat are not carried over
+either). A single sub-agent can be removed
 with `Ctrl+X` (twice) on its row in the Agents list, or by its parent with
 `@@close {"name":"reviewer"}` (`"id"` also works); a busy one is stopped first,
 its past messages stay in the chat, and the parent gets a one-line note. Both
@@ -697,7 +714,8 @@ launch start from the default `main` agent again.
 ### Start without the previous transcript
 
 Use `asterline --no-restore`. This skips replay but does not delete SQLite data.
-Use `/new` or `/clear` for a clean conversation with new backend sessions.
+Use `/new` or `/clear` for a clean conversation with new backend sessions and
+a single default `main` agent.
 
 ### Test without invoking backend CLIs
 

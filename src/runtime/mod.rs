@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use crate::adapter::process::{ChildProcessTree, configure_process_tree};
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
+use crate::domain::config::FreshChatRoster;
 use crate::domain::event::{AgentEvent, ImportedMessage, LogLevel, RunId, RuntimeEvent, UiCommand};
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::{MemberId, TeamConfig, TeamMember};
@@ -142,6 +143,8 @@ struct RuntimeLoopOptions {
     approvals: bool,
     fake: bool,
     team_save_path: Option<PathBuf>,
+    /// What `/new` starts a chat with; `None` keeps the current top-level members.
+    fresh_chat_roster: Option<FreshChatRoster>,
 }
 
 struct ActiveVerification {
@@ -270,6 +273,7 @@ struct RuntimeChannels {
 /// Spawn the runtime on its own thread. `events` receives every [`RuntimeEvent`]
 /// (starting with [`RuntimeEvent::Ready`]). Returns a handle for sending
 /// commands and the thread's join handle.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     config: TeamConfig,
     store: SqliteStore,
@@ -278,6 +282,7 @@ pub fn spawn(
     approvals: bool,
     fake: bool,
     team_save_path: Option<PathBuf>,
+    fresh_chat_roster: Option<FreshChatRoster>,
 ) -> (RuntimeHandle, JoinHandle<()>) {
     spawn_inner(
         config,
@@ -287,12 +292,14 @@ pub fn spawn(
         approvals,
         fake,
         team_save_path,
+        fresh_chat_roster,
     )
 }
 
 /// Spawn the runtime with a bounded event sink. This is the preferred product
 /// path: canonical state events wait in order while redundant stream-only
 /// updates are shed under renderer backpressure.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_bounded(
     config: TeamConfig,
     store: SqliteStore,
@@ -301,6 +308,7 @@ pub fn spawn_bounded(
     approvals: bool,
     fake: bool,
     team_save_path: Option<PathBuf>,
+    fresh_chat_roster: Option<FreshChatRoster>,
 ) -> (RuntimeHandle, JoinHandle<()>) {
     spawn_inner(
         config,
@@ -310,9 +318,11 @@ pub fn spawn_bounded(
         approvals,
         fake,
         team_save_path,
+        fresh_chat_roster,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_inner(
     config: TeamConfig,
     store: SqliteStore,
@@ -321,6 +331,7 @@ fn spawn_inner(
     approvals: bool,
     fake: bool,
     team_save_path: Option<PathBuf>,
+    fresh_chat_roster: Option<FreshChatRoster>,
 ) -> (RuntimeHandle, JoinHandle<()>) {
     // UI commands are low-volume control traffic and must remain enqueueable
     // while workers are backpressured. In particular, cancellation and Shutdown
@@ -337,6 +348,7 @@ fn spawn_inner(
             approvals,
             fake,
             team_save_path,
+            fresh_chat_roster,
         };
         let channels = RuntimeChannels {
             events,
@@ -365,7 +377,9 @@ fn run_loop(
         control_rx,
     } = channels;
     let mut cancel_member_ids: HashSet<MemberId> = config.all_member_ids().into_iter().collect();
-    let mut runtime = TeamRuntime::new(config, store).with_approvals(options.approvals);
+    let mut runtime = TeamRuntime::new(config, store)
+        .with_approvals(options.approvals)
+        .with_fresh_chat_roster(options.fresh_chat_roster.clone());
     let mut active_verifications: HashMap<RunId, ActiveVerification> = HashMap::new();
     let mut agent_workers: Vec<JoinHandle<()>> = Vec::new();
     let mut pending_events = VecDeque::new();
@@ -1089,6 +1103,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
 
         // First event is Ready.
@@ -1141,6 +1156,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         handle.send(UiCommand::Goal {
@@ -1306,6 +1322,7 @@ mod tests {
                     approvals: true,
                     fake: false,
                     team_save_path: None,
+                    fresh_chat_roster: None,
                 },
                 RuntimeChannels {
                     events: RuntimeEventSender::Unbounded(evt_tx),
@@ -1339,6 +1356,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
         assert!(matches!(
@@ -1469,6 +1487,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
 
         // Ready fills the sole output slot and the receiver deliberately stays
@@ -1542,6 +1561,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
 
@@ -1658,6 +1678,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
 
@@ -1783,6 +1804,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         assert!(matches!(
             evt_rx.recv_timeout(Duration::from_secs(2)),
@@ -1899,6 +1921,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
         assert!(matches!(
@@ -2024,6 +2047,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
         assert!(matches!(
@@ -2186,6 +2210,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         assert!(matches!(
             evt_rx.recv_timeout(Duration::from_secs(2)),
@@ -2251,6 +2276,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
         assert!(matches!(
@@ -2323,6 +2349,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
 
@@ -2418,6 +2445,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         assert!(matches!(
             evt_rx.recv_timeout(Duration::from_secs(2)),
@@ -2501,6 +2529,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         assert!(matches!(
             evt_rx.recv_timeout(Duration::from_secs(2)),
@@ -2568,6 +2597,7 @@ mod tests {
             evt_tx,
             true,
             false,
+            None,
             None,
         );
 
@@ -2640,6 +2670,7 @@ mod tests {
                     approvals: true,
                     fake: false,
                     team_save_path: None,
+                    fresh_chat_roster: None,
                 },
                 channels,
             );
@@ -2723,6 +2754,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
 
@@ -2774,6 +2806,7 @@ mod tests {
             true,
             true,
             Some(save_path.clone()),
+            None,
         );
         let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
 
@@ -2828,6 +2861,7 @@ mod tests {
             true,
             true,
             Some(save_path),
+            None,
         );
         let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
 
@@ -2963,6 +2997,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");

@@ -2710,3 +2710,213 @@ fn naming_the_current_chat_persists_survives_resume_and_clears_on_new() {
     rt.on_ui_command(UiCommand::NewSession { prompt: None });
     assert_eq!(rt.chat_name_event(), None);
 }
+
+fn default_main_roster() -> crate::domain::config::FreshChatRoster {
+    crate::domain::config::FreshChatRoster::default_main(BackendKind::Codex)
+}
+
+fn runtime_with_fresh_roster() -> TeamRuntime {
+    runtime().with_fresh_chat_roster(Some(default_main_roster()))
+}
+
+#[test]
+fn new_chat_with_a_fresh_roster_replaces_the_team_with_a_default_main() {
+    let mut rt = runtime_with_fresh_roster();
+    rt.config.max_auto_relays = 7;
+    rt.on_ui_command(user("old chat"));
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    let old = rt.store.active_conversation();
+
+    let step = rt.on_ui_command(UiCommand::NewSession { prompt: None });
+
+    assert_ne!(rt.store.active_conversation(), old);
+    // The live roster is only Main, and the settings of the team stay.
+    let ids: Vec<&str> = rt
+        .config
+        .members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect();
+    assert_eq!(ids, ["main"]);
+    assert_eq!(rt.config.name, "mixed");
+    assert_eq!(rt.config.max_auto_relays, 7);
+    assert_eq!(
+        rt.config.default_target,
+        Some(DefaultTarget::Member(MemberId::new("main")))
+    );
+    assert_eq!(rt.members.len(), 1);
+    assert!(rt.members.contains_key(&MemberId::new("main")));
+    // Every old runner is removed and the new one installed.
+    for gone in ["builder", "reviewer"] {
+        assert!(step.runner_changes.iter().any(|change| matches!(
+            change,
+            RunnerChange::Remove(member) if member.as_str() == gone
+        )));
+    }
+    assert!(step.runner_changes.iter().any(|change| matches!(
+        change,
+        RunnerChange::Upsert { member, .. } if member.id.as_str() == "main"
+    )));
+    // The Ready event is what refreshes the header and the /team editor.
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Ready { members, .. }
+            if members.len() == 1 && members[0].id.as_str() == "main"
+    )));
+    // team.json mirrors the live roster, without protocol text.
+    let persisted = step.persist_team.expect("team.json is rewritten");
+    assert_eq!(persisted.members.len(), 1);
+    assert_eq!(persisted.members[0].id.as_str(), "main");
+    assert_eq!(persisted.members[0].system_prompt, None);
+    assert_eq!(persisted.max_auto_relays, 7);
+    // The new chat's snapshot has only Main; the old one keeps both.
+    let snapshot = rt
+        .store
+        .conversation_snapshot(rt.store.active_conversation())
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.team.members.len(), 1);
+    assert_eq!(snapshot.team.members[0].id.as_str(), "main");
+    let previous = rt.store.conversation_snapshot(old).unwrap().unwrap();
+    assert_eq!(previous.team.members.len(), 2);
+    // The new Main carries the team instructions and runs the prompt.
+    assert!(rt.config.members[0].system_prompt.is_some());
+    let next = rt.on_ui_command(user("hello"));
+    assert_eq!(next.actions[0].member, MemberId::new("main"));
+    assert_eq!(next.actions[0].session, None);
+}
+
+#[test]
+fn resuming_the_old_chat_after_a_fresh_roster_new_chat_restores_its_roster() {
+    let mut rt = runtime_with_fresh_roster();
+    let old = rt.store.active_conversation();
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+
+    let step = rt.on_ui_command(UiCommand::ResumeConversation { conversation: old });
+
+    let ids: Vec<&str> = rt
+        .config
+        .members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect();
+    assert_eq!(ids, ["builder", "reviewer"]);
+    assert!(step.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Ready { members, .. } if members.len() == 2
+    )));
+    // A second /new starts from the default Main again, not from Builder.
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    assert_eq!(rt.config.members.len(), 1);
+    assert_eq!(rt.config.members[0].id.as_str(), "main");
+}
+
+#[test]
+fn new_chat_prompt_goes_to_main_when_a_fresh_roster_replaces_the_team() {
+    let mut rt = runtime_with_fresh_roster();
+    rt.on_ui_command(user("old chat"));
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+
+    let step = rt.on_ui_command(UiCommand::NewSession {
+        prompt: Some("start here".to_string()),
+    });
+
+    assert_eq!(step.actions.len(), 1);
+    assert_eq!(step.actions[0].member, MemberId::new("main"));
+    assert!(step.actions[0].prompt.contains("start here"));
+}
+
+#[test]
+fn new_chat_with_a_fresh_roster_keeps_everything_when_the_atomic_reset_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "asterline-new-chat-roster-reset-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    remove_sqlite_test_files(&path);
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap())
+        .with_approvals(false)
+        .with_fresh_chat_roster(Some(default_main_roster()));
+    let original = rt.store.active_conversation();
+    rt.on_ui_command(user("old chat"));
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::SessionDiscovered(AgentSessionId("old-session".to_string())),
+    );
+    rt.on_agent_event(
+        &MemberId::new("builder"),
+        AgentEvent::Exited {
+            code: Some(0),
+            ok: true,
+        },
+    );
+    let external = Connection::open(&path).unwrap();
+    external
+        .execute_batch(
+            "CREATE TRIGGER fail_new_chat_roster_session_clear
+             BEFORE DELETE ON agent_sessions
+             BEGIN SELECT RAISE(ABORT, 'session clear unavailable'); END;",
+        )
+        .unwrap();
+
+    let reset = rt.on_ui_command(UiCommand::NewSession { prompt: None });
+
+    assert_eq!(rt.store.active_conversation(), original);
+    assert_eq!(rt.config.members.len(), 2);
+    assert_eq!(rt.members.len(), 2);
+    assert!(reset.runner_changes.is_empty());
+    assert!(reset.persist_team.is_none());
+    assert!(reset.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text) if text.contains("could not start a new chat")
+    )));
+    drop(external);
+    drop(rt);
+    remove_sqlite_test_files(&path);
+}
+
+#[test]
+fn new_chat_with_an_explicit_team_roster_resets_to_that_files_members() {
+    let mut explicit_team = team();
+    explicit_team.members[0].session_id = Some("configured".to_string());
+    explicit_team.members[0].session_policy = SessionPolicy::Resume;
+    let roster = crate::domain::config::FreshChatRoster::from_team(&explicit_team);
+    let mut rt = runtime().with_fresh_chat_roster(Some(roster));
+    // A member added in /team during this session is not part of the file.
+    rt.config.members.push(TeamMember::new(
+        "extra",
+        "Extra",
+        BackendKind::Grok,
+        "helper",
+    ));
+    rt.members
+        .insert(MemberId::new("extra"), MemberState::new(None));
+
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+
+    let ids: Vec<&str> = rt
+        .config
+        .members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect();
+    assert_eq!(ids, ["builder", "reviewer"]);
+    assert!(rt.config.members.iter().all(|member| {
+        member.session_id.is_none() && member.session_policy == SessionPolicy::Fresh
+    }));
+    assert_eq!(
+        rt.config.default_target,
+        Some(DefaultTarget::Member(MemberId::new("builder")))
+    );
+}

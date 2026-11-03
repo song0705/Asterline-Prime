@@ -20,7 +20,7 @@ use crate::adapter::parser::{
 };
 use crate::adapter::steer::{SteerReceiver, SteerSender, steer_channel};
 use crate::domain::config::{
-    ASTERLINE_BRAINSTORM_SKILL_NAME, MAIN_MEMBER_ID, brainstorm_skill_text,
+    ASTERLINE_BRAINSTORM_SKILL_NAME, FreshChatRoster, MAIN_MEMBER_ID, brainstorm_skill_text,
     inject_team_protocol_with, replace_model_style_name, strip_team_protocol, strip_team_protocols,
     sub_agent_member, team_protocol_text, team_skill_hint,
 };
@@ -274,6 +274,9 @@ pub struct TeamRuntime {
     /// Sub-agents being removed that still have a run winding down; each is
     /// taken off the roster when that run exits.
     closing: HashMap<MemberId, CloseOrigin>,
+    /// What `/new` starts a chat with (a default Main, or an explicit `--team`
+    /// file's members). `None` keeps the current top-level members.
+    fresh_chat_roster: Option<FreshChatRoster>,
 }
 
 impl TeamRuntime {
@@ -391,6 +394,7 @@ impl TeamRuntime {
             models_path: state_paths::models_path(),
             session_protocols: HashMap::new(),
             closing: HashMap::new(),
+            fresh_chat_roster: None,
         };
         let mut runtime = runtime;
         if let Err(err) = runtime.restore_goal() {
@@ -419,6 +423,13 @@ impl TeamRuntime {
 
     pub fn with_manual_approvals(mut self, enabled: bool) -> Self {
         self.manual_approvals = enabled;
+        self
+    }
+
+    /// Set the roster every `/new` chat starts with. Without it, `/new` keeps
+    /// the current top-level members.
+    pub fn with_fresh_chat_roster(mut self, roster: Option<FreshChatRoster>) -> Self {
+        self.fresh_chat_roster = roster;
         self
     }
 
@@ -1114,11 +1125,24 @@ impl TeamRuntime {
         // A fresh chat: a new conversation (so the transcript starts clean and
         // restart shows only this chat) plus new backend sessions for everyone.
         // Sub-agents belong to the chat being left; the new one starts with
-        // the top-level members only.
-        let mut snapshot_team = strip_team_protocols(self.config.without_sub_agents());
+        // the top-level members only, or with the fresh-chat roster when the
+        // launch computed one.
+        let base = match &self.fresh_chat_roster {
+            Some(roster) => roster.apply_to(&self.config),
+            None => self.config.clone(),
+        };
+        let mut snapshot_team = strip_team_protocols(base.without_sub_agents());
         for member in &mut snapshot_team.members {
             member.session_id = None;
             member.session_policy = SessionPolicy::Fresh;
+        }
+        if self.fresh_chat_roster.is_some()
+            && let Err(err) = snapshot_team.validate()
+        {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "could not start a new chat: {err}"
+            )));
+            return false;
         }
         match self.store.create_fresh_conversation(
             &snapshot_team,
@@ -1136,6 +1160,7 @@ impl TeamRuntime {
         let previous_mode = self.active_mode;
         self.active_mode = TerminalMode::Normal;
         self.sessions = SessionRegistry::new();
+        let swapped_roster = self.fresh_chat_roster.is_some();
         let removed_sub_agents: Vec<MemberId> = self
             .config
             .members
@@ -1143,17 +1168,20 @@ impl TeamRuntime {
             .filter(|member| member.parent.is_some())
             .map(|member| member.id.clone())
             .collect();
-        self.config.members.retain(|member| member.parent.is_none());
-        for id in &removed_sub_agents {
-            self.members.remove(id);
-            step.runner_changes.push(RunnerChange::Remove(id.clone()));
-        }
-        for member in &mut self.config.members {
-            member.session_id = None;
-            member.session_policy = SessionPolicy::Fresh;
-        }
-        if !removed_sub_agents.is_empty() {
-            // Parents' protocol text lists their sub-agents; refresh it.
+        if swapped_roster {
+            // Same swap as `/resume`: every old runner goes, the new roster's
+            // runners are installed, and the saved team mirrors the live one.
+            let old_ids: Vec<MemberId> = self.members.keys().cloned().collect();
+            for id in old_ids {
+                step.runner_changes.push(RunnerChange::Remove(id));
+            }
+            self.config = snapshot_team.clone();
+            self.members = self
+                .config
+                .members
+                .iter()
+                .map(|member| (member.id.clone(), MemberState::new(member.effort)))
+                .collect();
             inject_team_protocol_with(&mut self.config, &self.models);
             if let Err(err) = self.store.upsert_team(&self.config) {
                 self.report_store_error("update the saved roster", err, step);
@@ -1163,6 +1191,36 @@ impl TeamRuntime {
                     member: Box::new(member),
                     workspace: self.config.workspace.clone(),
                 });
+            }
+            step.persist_team = Some(snapshot_team);
+            self.relay = RelayGuard::new(self.config.max_auto_relays);
+            self.run_turns.clear();
+            self.failed_runs.clear();
+            self.mode_sessions.clear();
+            self.session_protocols.clear();
+            self.protocol_stale.clear();
+        } else {
+            self.config.members.retain(|member| member.parent.is_none());
+            for id in &removed_sub_agents {
+                self.members.remove(id);
+                step.runner_changes.push(RunnerChange::Remove(id.clone()));
+            }
+            for member in &mut self.config.members {
+                member.session_id = None;
+                member.session_policy = SessionPolicy::Fresh;
+            }
+            if !removed_sub_agents.is_empty() {
+                // Parents' protocol text lists their sub-agents; refresh it.
+                inject_team_protocol_with(&mut self.config, &self.models);
+                if let Err(err) = self.store.upsert_team(&self.config) {
+                    self.report_store_error("update the saved roster", err, step);
+                }
+                for member in self.config.members.clone() {
+                    step.runner_changes.push(RunnerChange::Upsert {
+                        member: Box::new(member),
+                        workspace: self.config.workspace.clone(),
+                    });
+                }
             }
         }
         for state in self.members.values_mut() {
@@ -1185,7 +1243,7 @@ impl TeamRuntime {
             });
         }
         step.events.push(RuntimeEvent::SessionReset);
-        if !removed_sub_agents.is_empty() {
+        if swapped_roster || !removed_sub_agents.is_empty() {
             step.events.push(self.ready_event());
         }
         step.events.push(self.emit_modes_updated());

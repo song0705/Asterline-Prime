@@ -2262,3 +2262,44 @@ fn backends_that_resend_their_instructions_every_run_get_no_note() {
         .set_external(main_id(), AgentSessionId("claude-session".to_string()), 0);
     assert_eq!(send(&mut rt, "hello"), "hello");
 }
+
+#[test]
+fn new_chat_with_a_fresh_roster_drops_sub_agents_and_the_other_top_level_members() {
+    let roster = crate::domain::config::FreshChatRoster::default_main(BackendKind::Codex);
+    let mut rt = spawn_runtime().with_fresh_chat_roster(Some(roster));
+    let old = rt.store.active_conversation();
+    main_replies(&mut rt, &spawn_line("kid", ""));
+    complete_ok(&mut rt, &id("kid"), "r");
+    complete_ok(&mut rt, &main_id(), "done");
+    assert_eq!(rt.config.sub_agent_count(), 1);
+
+    let step = rt.on_ui_command(UiCommand::NewSession { prompt: None });
+
+    assert_eq!(rt.config.sub_agent_count(), 0);
+    assert_eq!(rt.config.members.len(), 1);
+    assert!(rt.config.member(&id("other")).is_none());
+    assert!(!rt.members.contains_key(&id("kid")));
+    assert!(rt.sessions.get(&id("kid")).is_none());
+    // The new Main is the default one: Codex, no pinned model or effort.
+    let main = rt.config.member(&main_id()).unwrap();
+    assert_eq!(main.backend, BackendKind::Codex);
+    assert_eq!(main.model, None);
+    assert_eq!(main.effort, None);
+    for gone in ["kid", "other", "main"] {
+        assert!(step.runner_changes.iter().any(|change| matches!(
+            change,
+            RunnerChange::Remove(member) if member == &id(gone)
+        )));
+    }
+    let snapshot = rt
+        .store
+        .conversation_snapshot(rt.store.active_conversation())
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.team.members.len(), 1);
+    // The old chat keeps Main (Claude), Other and the sub-agent for /resume.
+    let previous = rt.store.conversation_snapshot(old).unwrap().unwrap();
+    assert_eq!(previous.team.members.len(), 3);
+    let prompt = main.system_prompt.clone().unwrap();
+    assert!(!prompt.contains("Your sub-agents"));
+}

@@ -2040,6 +2040,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let ctrl_c = KeyEvent::new(
             crossterm::event::KeyCode::Char('c'),
@@ -2251,6 +2252,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
@@ -2273,6 +2275,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -2302,6 +2305,7 @@ mod tests {
             event_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -2359,6 +2363,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
@@ -2410,6 +2415,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         // Ready cannot enter the zero-capacity event sink, so the runtime
         // deliberately stops consuming ordinary UI work. Fill that bounded
@@ -2445,6 +2451,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut state = AppState::new(vec![ChatItem::Notice {
             member: None,
@@ -2478,6 +2485,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         handle.send(UiCommand::Shutdown);
@@ -2535,6 +2543,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         handle.send(UiCommand::Shutdown);
@@ -2599,6 +2608,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut state = AppState::new(Vec::new());
         for ch in "build the parser".chars() {
@@ -2629,6 +2639,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -2662,6 +2673,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(vec![ChatItem::Notice {
@@ -2704,6 +2716,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut state = AppState::new(Vec::new());
         state.insert_text("/mode");
@@ -2728,6 +2741,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -2821,6 +2835,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
@@ -2883,6 +2898,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -2950,6 +2966,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let mut state = AppState::new(Vec::new());
         state.apply(RuntimeEvent::Ready {
@@ -2997,6 +3014,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -3053,6 +3071,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -3112,6 +3131,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = AppState::new(Vec::new());
@@ -3246,6 +3266,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         (handle, join, evt_rx)
@@ -3656,6 +3677,7 @@ mod tests {
             evt_tx,
             true,
             true,
+            None,
             None,
         );
         let mut state = focus_test_state(0);

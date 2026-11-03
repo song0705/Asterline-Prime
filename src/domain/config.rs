@@ -240,6 +240,34 @@ pub fn detect_backends() -> DetectedBackends {
     }
 }
 
+/// The first installed backend in default-main order (Codex, Claude, Grok,
+/// Agy). Unlike [`detect_backends`] it stops at the first hit, so the slow
+/// Agy version check only runs when no other CLI is on `PATH`.
+pub fn first_installed_backend() -> Option<BackendKind> {
+    let paths = env::var_os("PATH");
+    let dirs: Vec<PathBuf> = paths
+        .as_ref()
+        .map(|value| env::split_paths(value).collect())
+        .unwrap_or_default();
+    first_installed_backend_in_dirs(&dirs, env::var_os("PATHEXT").as_deref(), cfg!(windows))
+}
+
+fn first_installed_backend_in_dirs(
+    dirs: &[PathBuf],
+    path_ext: Option<&OsStr>,
+    windows: bool,
+) -> Option<BackendKind> {
+    [
+        (BackendKind::Codex, "codex"),
+        (BackendKind::Claude, "claude"),
+        (BackendKind::Grok, "grok"),
+    ]
+    .into_iter()
+    .find(|(_, name)| resolve_binary_in_dirs(dirs, name, path_ext, windows).is_some())
+    .map(|(backend, _)| backend)
+    .or_else(|| supported_agy_in_dirs(dirs, path_ext, windows).then_some(BackendKind::Agy))
+}
+
 fn binary_in_dirs(dirs: &[PathBuf], name: &str) -> bool {
     resolve_binary_in_dirs(dirs, name, env::var_os("PATHEXT").as_deref(), cfg!(windows)).is_some()
 }
@@ -530,6 +558,46 @@ pub fn main_member(backend: BackendKind) -> TeamMember {
     let mut member = TeamMember::new(MAIN_MEMBER_ID, "Main", backend, "");
     apply_backend_defaults(&mut member);
     member
+}
+
+/// The members and default target every new chat starts with: one default
+/// `main` member, or an explicit `--team` file's top-level members. Computed
+/// once at launch; the launch path and `/new` both apply it with
+/// [`FreshChatRoster::apply_to`] so they cannot drift.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreshChatRoster {
+    pub members: Vec<TeamMember>,
+    pub default_target: Option<DefaultTarget>,
+}
+
+impl FreshChatRoster {
+    /// One `main` member on `backend` with that CLI's default model and
+    /// permission preset, as in [`default_team`].
+    pub fn default_main(backend: BackendKind) -> Self {
+        Self {
+            members: vec![main_member(backend)],
+            default_target: Some(DefaultTarget::Member(MemberId::new(MAIN_MEMBER_ID))),
+        }
+    }
+
+    /// The top-level members of `team`, as loaded (an explicit `--team` file).
+    pub fn from_team(team: &TeamConfig) -> Self {
+        let top = team.without_sub_agents();
+        Self {
+            members: top.members,
+            default_target: top.default_target,
+        }
+    }
+
+    /// `current` with only the members and default target replaced; the
+    /// team-level settings (name, workspace, relay limit, modes, approvals)
+    /// are kept. Sessions are left as the roster carries them.
+    pub fn apply_to(&self, current: &TeamConfig) -> TeamConfig {
+        let mut next = current.clone();
+        next.members = self.members.clone();
+        next.default_target = self.default_target.clone();
+        next
+    }
 }
 
 /// Build the sub-agent an `@@spawn` asks for. Omitted backend, model, and effort
@@ -951,6 +1019,110 @@ mod tests {
         apply_backend_defaults(&mut member);
         assert_eq!(member.permission_mode, Some(PermissionMode::Auto));
         assert_eq!(member.sandbox, SandboxPolicy::WorkspaceWrite);
+    }
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(dir).unwrap();
+        let binary = dir.join(name);
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_installed_backend_prefers_codex_without_running_the_agy_check() {
+        let root = std::env::temp_dir().join(format!(
+            "asterline-cfg-first-backend-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let marker = root.join("agy-was-run");
+        write_script(&root, "codex", "exit 0");
+        write_script(
+            &root,
+            "agy",
+            &format!("touch '{}'\nprintf '1.1.12\\n'", marker.display()),
+        );
+
+        let found = first_installed_backend_in_dirs(std::slice::from_ref(&root), None, false);
+        assert_eq!(found, Some(BackendKind::Codex));
+        assert!(!marker.exists(), "the agy version check must be skipped");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_installed_backend_follows_default_order_and_falls_back_to_agy() {
+        let root = std::env::temp_dir().join(format!(
+            "asterline-cfg-first-backend-order-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let claude_dir = root.join("claude");
+        let grok_dir = root.join("grok");
+        let agy_dir = root.join("agy");
+        let old_agy_dir = root.join("old-agy");
+        write_script(&claude_dir, "claude", "exit 0");
+        write_script(&claude_dir, "grok", "exit 0");
+        write_script(&grok_dir, "grok", "exit 0");
+        write_script(&agy_dir, "agy", "printf '1.1.12\\n'");
+        write_script(&old_agy_dir, "agy", "printf '1.1.11\\n'");
+
+        assert_eq!(
+            first_installed_backend_in_dirs(&[claude_dir], None, false),
+            Some(BackendKind::Claude)
+        );
+        assert_eq!(
+            first_installed_backend_in_dirs(&[grok_dir], None, false),
+            Some(BackendKind::Grok)
+        );
+        assert_eq!(
+            first_installed_backend_in_dirs(&[agy_dir], None, false),
+            Some(BackendKind::Agy)
+        );
+        assert_eq!(
+            first_installed_backend_in_dirs(&[old_agy_dir], None, false),
+            None
+        );
+        assert_eq!(first_installed_backend_in_dirs(&[], None, false), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_chat_roster_replaces_only_members_and_default_target() {
+        let mut current = TeamConfig::new("team-name", "/tmp/ws")
+            .with_member(TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "",
+            ))
+            .with_member(TeamMember::new(
+                "reviewer",
+                "Reviewer",
+                BackendKind::Claude,
+                "",
+            ));
+        current.default_target = Some(DefaultTarget::Member(MemberId::new("builder")));
+        current.max_auto_relays = 7;
+
+        let next = FreshChatRoster::default_main(BackendKind::Claude).apply_to(&current);
+        assert_eq!(next.name, "team-name");
+        assert_eq!(next.workspace, current.workspace);
+        assert_eq!(next.max_auto_relays, 7);
+        assert_eq!(next.members.len(), 1);
+        assert_eq!(next.members[0].id.as_str(), MAIN_MEMBER_ID);
+        assert_eq!(next.members[0].backend, BackendKind::Claude);
+        assert_eq!(
+            next.default_target,
+            Some(DefaultTarget::Member(MemberId::new(MAIN_MEMBER_ID)))
+        );
+        assert!(next.validate().is_ok());
     }
 
     #[test]
