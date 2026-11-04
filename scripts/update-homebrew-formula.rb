@@ -13,7 +13,7 @@ checksums = [mac_arm_sha, mac_intel_sha, linux_arm_sha, linux_intel_sha]
 abort "every checksum must be a lowercase SHA-256" unless checksums.all? { |checksum| checksum.match?(/\A[0-9a-f]{64}\z/) }
 
 formula = File.read(formula_path)
-release_url = "https://github.com/song0705/Asterline/releases/download/v#{version}"
+release_url = "https://github.com/song0705/Asterline-Prime/releases/download/v#{version}"
 updates = [
   ["on_macos do", "on_arm", "asterline-#{version}-aarch64-apple-darwin.tar.gz", mac_arm_sha],
   ["on_macos do", "on_intel", "asterline-#{version}-x86_64-apple-darwin.tar.gz", mac_intel_sha],

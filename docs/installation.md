@@ -16,7 +16,7 @@ a team. Rust is required only when building Asterline from source.
 The universal DMG supports both Apple silicon and Intel Macs.
 
 1. Open the
-   [latest Release](https://github.com/song0705/Asterline/releases/latest).
+   [latest Release](https://github.com/song0705/Asterline-Prime/releases/latest).
 2. Download `asterline-<version>-macos-universal.dmg`.
 3. Open the DMG and double-click `Install Asterline.pkg`.
 4. Complete the standard macOS Installer flow.
@@ -33,12 +33,12 @@ The package installs `ast` and `asterline` into `/usr/local/bin`.
 Install the official Formula, then use the same command for later updates:
 
 ```bash
-brew install song0705/asterline/asterline
+brew install song0705/asterline-prime/asterline
 ast update
 ```
 
 `ast update` verifies that the running binary belongs to the installed Formula,
-then runs `brew update` and `brew upgrade song0705/asterline/asterline`.
+then runs `brew update` and `brew upgrade song0705/asterline-prime/asterline`.
 
 ### Portable macOS archive
 
@@ -93,7 +93,7 @@ instead.
 The Windows installer supports 64-bit Windows 10 and 11.
 
 1. Open the
-   [latest Release](https://github.com/song0705/Asterline/releases/latest).
+   [latest Release](https://github.com/song0705/Asterline-Prime/releases/latest).
 2. Download `asterline-<version>-x86_64-windows-setup.exe`.
 3. Run Setup with the default options.
 4. Open a new PowerShell window and verify the installation:

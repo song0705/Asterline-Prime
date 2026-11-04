@@ -1,3 +1,5 @@
+> Prime: the active Homebrew formula and source-release sync workflow live in https://github.com/song0705/homebrew-asterline-prime. The in-tree Homebrew/AUR definitions and older release instructions below are inherited historical references. No cross-repository token is required by the Prime release workflow.
+
 # 第三方包定义
 
 [English](README.md)
@@ -18,16 +20,16 @@ Apple silicon / Intel macOS，以及 ARM64 / x86_64 Linux。Linux 归档是已�
 用户安装命令：
 
 ```bash
-brew install song0705/asterline/asterline
+brew install song0705/asterline-prime/asterline
 ```
 
 使用以下命令验证已发布的 Formula：
 
 ```bash
 brew tap song0705/asterline
-brew audit --strict --online --formula song0705/asterline/asterline
-brew install --formula song0705/asterline/asterline
-brew test song0705/asterline/asterline
+brew audit --strict --online --formula song0705/asterline-prime/asterline
+brew install --formula song0705/asterline-prime/asterline
+brew test song0705/asterline-prime/asterline
 ```
 
 ## Arch User Repository

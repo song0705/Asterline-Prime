@@ -1,3 +1,5 @@
+> Prime: the active Homebrew formula and source-release sync workflow live in https://github.com/song0705/homebrew-asterline-prime. The in-tree Homebrew/AUR definitions and older release instructions below are inherited historical references. No cross-repository token is required by the Prime release workflow.
+
 # Releasing Asterline
 
 [简体中文](releasing.zh-CN.md)
@@ -39,7 +41,7 @@ guidance](https://docs.github.com/en/code-security/how-tos/secure-your-supply-ch
    git fetch --tags
    test -z "$(git tag --list "v${version}")"
    ! git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1
-   ! gh release view "v${version}" --repo song0705/Asterline >/dev/null 2>&1
+   ! gh release view "v${version}" --repo song0705/Asterline-Prime >/dev/null 2>&1
    ```
 
 6. Commit and push the version change and release notes without a tag.
@@ -156,13 +158,13 @@ they do not replace Developer ID signing or Apple notarization.
 ## Homebrew Formula updates
 
 Before releasing, configure `HOMEBREW_TAP_TOKEN` as an Actions secret in
-`song0705/Asterline`. Use a fine-grained token restricted to
-`song0705/homebrew-asterline`, with **Contents: Read and write** and **Pull
+`song0705/Asterline-Prime`. Use a fine-grained token restricted to
+`song0705/homebrew-asterline-prime`, with **Contents: Read and write** and **Pull
 requests: Read and write** permissions. Do not use a broad personal token.
 Set the token without placing it in shell history:
 
 ```bash
-gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline
+gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline-Prime
 ```
 
 After the GitHub Release is published, the workflow downloads its `SHA256SUMS`,
@@ -233,7 +235,7 @@ version, and publish a new tag instead.
 ## Historical provenance note: v0.2.2
 
 The successful [v0.2.2 release workflow
-run](https://github.com/song0705/Asterline/actions/runs/31376054346) recorded
+run](https://github.com/song0705/Asterline-Prime/actions/runs/31376054346) recorded
 source commit `61b56740606ec3ab52e423b3dcc4b1377babe461`. The public `v0.2.2`
 tag now resolves to `c4be080788be4187b9daff91c561ecbd68f4347e`. Those commits have
 the same Git tree, `d99f356a23a2d4b38dc0045759a159db3de23816`, but different commit

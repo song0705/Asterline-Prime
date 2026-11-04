@@ -54,7 +54,7 @@ Agy job 特意不在含凭据环境中运行第三方 toolchain 或 cache Action
 明确警告 fork PR 可能攻破不受限制的 self-hosted runner。优先使用通过
 `config.sh --ephemeral` 注册的一任务临时 runner，任务后擦除主机，并将 runner 日志保留在
 机器外。如有 organization runner group，把它限制到本仓库和
-`song0705/Asterline/.github/workflows/real-smoke.yml@refs/heads/main`；不要把 runner
+`song0705/Asterline-Prime/.github/workflows/real-smoke.yml@refs/heads/main`；不要把 runner
 留在可被任意 workflow 使用的组中。参阅 GitHub 的
 [runner-group 访问控制](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
 和[临时 runner 指引](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#ephemeral-runners-for-autoscaling)。

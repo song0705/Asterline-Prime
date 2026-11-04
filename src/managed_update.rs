@@ -24,7 +24,7 @@ pub(crate) fn run() -> Result<String, String> {
 }
 
 #[cfg(not(windows))]
-const HOMEBREW_FORMULA: &str = "song0705/asterline/asterline";
+const HOMEBREW_FORMULA: &str = "song0705/asterline-prime/asterline";
 
 #[cfg(not(windows))]
 fn run_unix() -> Result<String, String> {
@@ -102,7 +102,7 @@ fn unmanaged_install_message() -> String {
     "This Asterline copy is not managed by Homebrew, so ast update did not replace it. \
      Update a portable archive, macOS package, or direct .deb/.rpm installation from the next \
      matching GitHub Release; rebuild source installs with cargo. For managed updates on macOS \
-     or Linux, install with Homebrew: brew install song0705/asterline/asterline."
+     or Linux, install with Homebrew: brew install song0705/asterline-prime/asterline."
         .to_string()
 }
 

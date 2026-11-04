@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::event::RuntimeEvent;
 
-const RELEASE_API: &str = "https://api.github.com/repos/song0705/Asterline/releases/latest";
+const RELEASE_API: &str = "https://api.github.com/repos/song0705/Asterline-Prime/releases/latest";
 const INSTALL_MARKER: &str = ".asterline-installer-managed";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STALE_LOCK_AGE: Duration = Duration::from_secs(10 * 60);

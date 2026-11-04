@@ -12,7 +12,7 @@ Asterline 用于协调各提供商的 CLI，并不代替这些 CLI。创建团�
 
 通用 DMG 同时支持 Apple silicon 和 Intel Mac。
 
-1. 打开[最新版本](https://github.com/song0705/Asterline/releases/latest)。
+1. 打开[最新版本](https://github.com/song0705/Asterline-Prime/releases/latest)。
 2. 下载 `asterline-<version>-macos-universal.dmg`。
 3. 打开 DMG，双击 `Install Asterline.pkg`。
 4. 按照 macOS 标准安装器完成安装。
@@ -29,12 +29,12 @@ ast --help
 安装官方 Formula，之后使用同一个命令更新：
 
 ```bash
-brew install song0705/asterline/asterline
+brew install song0705/asterline-prime/asterline
 ast update
 ```
 
 `ast update` 会先确认当前二进制属于已安装的 Formula，再运行 `brew update` 和
-`brew upgrade song0705/asterline/asterline`。
+`brew upgrade song0705/asterline-prime/asterline`。
 
 ### macOS 便携包
 
@@ -82,7 +82,7 @@ sudo pkgutil --forget io.github.song0705.asterline
 
 Windows 安装器支持 64 位 Windows 10 和 11。
 
-1. 打开[最新版本](https://github.com/song0705/Asterline/releases/latest)。
+1. 打开[最新版本](https://github.com/song0705/Asterline-Prime/releases/latest)。
 2. 下载 `asterline-<version>-x86_64-windows-setup.exe`。
 3. 使用默认选项完成安装。
 4. 打开新的 PowerShell 窗口并验证：

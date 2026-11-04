@@ -1,4 +1,6 @@
-<h1 align="center">Asterline</h1>
+<h1 align="center">Asterline Prime</h1>
+
+> **Prime 独立发行版：** 从 `feat/prime-style-main-agent` 独立，保留 Git 历史。安装：`brew install song0705/asterline-prime/asterline`。首版在 macOS/Linux 从带 SHA-256 校验的源码编译；下文原生安装器说明来自继承的发布流程，首版尚未提供这些安装包。命令仍为 `asterline` 和 `ast`。
 
 <p align="center">
   <strong>在一个终端里，运行一支看得见、能恢复的编程 Agent 团队。</strong><br>
@@ -12,14 +14,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/song0705/Asterline/actions/workflows/ci.yml"><img src="https://github.com/song0705/Asterline/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/song0705/Asterline/releases/latest"><img src="https://img.shields.io/github/v/release/song0705/Asterline" alt="最新版本"></a>
+  <a href="https://github.com/song0705/Asterline-Prime/actions/workflows/ci.yml"><img src="https://github.com/song0705/Asterline-Prime/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/song0705/Asterline-Prime/releases/latest"><img src="https://img.shields.io/github/v/release/song0705/Asterline-Prime" alt="最新版本"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 Asterline 把各厂商官方 CLI 的原生事件汇进同一块工作台：消息、思考、工具、diff、审批和交接都挂在真正产出它的成员上。多步骤工作记成结构化 Runs，关掉再打开也能接着干。
 
-[安装](#安装) · [开始使用](#开始使用) · [工作模式](#工作模式) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline/releases/latest)
+[安装](#安装) · [开始使用](#开始使用) · [工作模式](#工作模式) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline-Prime/releases/latest)
 
 ## 安装
 
@@ -30,7 +32,7 @@ Asterline 支持 macOS、Linux 和 Windows 10/11。它只调度本机 CLI，不�
 | macOS    | 打开 `asterline-<version>-macos-universal.dmg`，运行 `Install Asterline.pkg`                 |
 | Windows  | 运行 `asterline-<version>-x86_64-windows-setup.exe`                                          |
 | Linux    | 按架构选 `asterline-v<version>-Linux-x86_64` 或 `Linux-arm64` 的 `.tar.gz`、`.deb` 或 `.rpm` |
-| Homebrew | `brew install song0705/asterline/asterline`                                                  |
+| Homebrew | `brew install song0705/asterline-prime/asterline`                                                  |
 
 安装器同时提供 `asterline` 和短命令 `ast`。Linux 包要求 GNU/glibc 2.28 或更高，并内置 SQLite；没有 Alpine/musl 发布包。Homebrew、便携包、源码构建、校验、更新和卸载见[安装指南](docs/installation.zh-CN.md)。
 
@@ -215,7 +217,7 @@ cargo test --all-targets --locked --no-fail-fast
 cargo audit
 ```
 
-完整检查需要 Rust 1.88 或更高，以及 `cargo-audit` 0.22.2。真实后端 smoke 是显式启用的，见[说明](docs/real-smoke.zh-CN.md)。可复现的问题和范围明确的建议请提到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
+完整检查需要 Rust 1.88 或更高，以及 `cargo-audit` 0.22.2。真实后端 smoke 是显式启用的，见[说明](docs/real-smoke.zh-CN.md)。可复现的问题和范围明确的建议请提到 [GitHub Issues](https://github.com/song0705/Asterline-Prime/issues)。
 
 ## 项目状态
 

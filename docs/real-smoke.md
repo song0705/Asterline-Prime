@@ -68,7 +68,7 @@ an unrestricted self-hosted runner. Prefer a one-job ephemeral runner registered
 with `config.sh --ephemeral`, wipe its host after the job, and preserve runner
 logs outside the machine. If an organization runner group is available, limit
 it to this repository and exactly
-`song0705/Asterline/.github/workflows/real-smoke.yml@refs/heads/main`; do not
+`song0705/Asterline-Prime/.github/workflows/real-smoke.yml@refs/heads/main`; do not
 leave the runner in a group usable by arbitrary workflows. See GitHub's
 [runner-group access controls](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
 and [ephemeral-runner guidance](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#ephemeral-runners-for-autoscaling).

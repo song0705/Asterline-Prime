@@ -8,7 +8,7 @@ Version:        @VERSION@
 Release:        1
 Summary:        Local-first terminal workspace for coordinating coding agents
 License:        MIT
-URL:            https://github.com/song0705/Asterline
+URL:            https://github.com/song0705/Asterline-Prime
 Source0:        asterline-@VERSION@-@TARGET@.tar.gz
 BuildArch:      @ARCH@
 

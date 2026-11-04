@@ -130,7 +130,7 @@ running binary:
   checks the latest stable Release, verifies Setup against that Release's
   `SHA256SUMS`, schedules it after Asterline exits, then exits.
 - A Homebrew installation on macOS or Linux runs `brew update` followed by
-  `brew upgrade song0705/asterline/asterline`. Asterline first verifies that
+  `brew upgrade song0705/asterline-prime/asterline`. Asterline first verifies that
   its own executable is inside that Formula's installed prefix.
 
 Portable archives, direct `.deb`/`.rpm` installs, macOS packages, and source

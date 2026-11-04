@@ -1,3 +1,5 @@
+> Prime: the active Homebrew formula and source-release sync workflow live in https://github.com/song0705/homebrew-asterline-prime. The in-tree Homebrew/AUR definitions and older release instructions below are inherited historical references. No cross-repository token is required by the Prime release workflow.
+
 # 发布 Asterline
 
 [English](releasing.md)
@@ -35,7 +37,7 @@ Asterline 由 GitHub Actions 构建和发布。Release tag 必须与 `Cargo.toml
    git fetch --tags
    test -z "$(git tag --list "v${version}")"
    ! git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1
-   ! gh release view "v${version}" --repo song0705/Asterline >/dev/null 2>&1
+   ! gh release view "v${version}" --repo song0705/Asterline-Prime >/dev/null 2>&1
    ```
 
 6. 提交并推送版本变更和 release notes，**不要**带 tag。
@@ -134,14 +136,14 @@ Apple 公证。
 
 ## Homebrew Formula 自动更新
 
-发布前，在 `song0705/Asterline` 的 Actions secret 中配置 `HOMEBREW_TAP_TOKEN`。请创建仅限
-`song0705/homebrew-asterline` 的 fine-grained token，授予 **Contents: Read and write** 与
+发布前，在 `song0705/Asterline-Prime` 的 Actions secret 中配置 `HOMEBREW_TAP_TOKEN`。请创建仅限
+`song0705/homebrew-asterline-prime` 的 fine-grained token，授予 **Contents: Read and write** 与
 **Pull requests: Read and write**；不要把宽权限个人 token 交给 CI。
 
 使用以下命令设置 token，避免其进入 shell history：
 
 ```bash
-gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline
+gh secret set HOMEBREW_TAP_TOKEN --repo song0705/Asterline-Prime
 ```
 
 GitHub Release 发布后，workflow 会下载其 `SHA256SUMS`，更新 tap 中
@@ -199,7 +201,7 @@ workflow 可以在 tag 不变时重跑；不得通过新 tag 来绕过一个尚�
 ## 历史 provenance 说明：v0.2.2
 
 成功的 [v0.2.2 release workflow
-run](https://github.com/song0705/Asterline/actions/runs/31376054346) 记录的 source commit 是
+run](https://github.com/song0705/Asterline-Prime/actions/runs/31376054346) 记录的 source commit 是
 `61b56740606ec3ab52e423b3dcc4b1377babe461`。公开 `v0.2.2` tag 当前解析为
 `c4be080788be4187b9daff91c561ecbd68f4347e`。它们具有相同 Git tree
 `d99f356a23a2d4b38dc0045759a159db3de23816`，但 commit identity 不同。这是历史 provenance

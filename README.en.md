@@ -1,4 +1,6 @@
-<h1 align="center">Asterline</h1>
+<h1 align="center">Asterline Prime</h1>
+
+> **Prime distribution:** Independent repository based on `feat/prime-style-main-agent`, with its Git history preserved. Install with `brew install song0705/asterline-prime/asterline`. The first Prime release builds from checksum-pinned source on macOS/Linux; native installers listed below belong to the inherited release tooling and are not included in this first release. Commands remain `asterline` and `ast`.
 
 <p align="center">
   <strong>Run a visible, persistent team of coding agents in one terminal.</strong><br>
@@ -12,14 +14,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/song0705/Asterline/actions/workflows/ci.yml"><img src="https://github.com/song0705/Asterline/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/song0705/Asterline/releases/latest"><img src="https://img.shields.io/github/v/release/song0705/Asterline" alt="Latest release"></a>
+  <a href="https://github.com/song0705/Asterline-Prime/actions/workflows/ci.yml"><img src="https://github.com/song0705/Asterline-Prime/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/song0705/Asterline-Prime/releases/latest"><img src="https://img.shields.io/github/v/release/song0705/Asterline-Prime" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 Asterline folds each provider's native event stream into one workspace. Messages, reasoning, tools, diffs, approvals, and handoffs stay attached to the member that produced them. Multi-step work is recorded as structured Runs, so you can close the terminal and continue later.
 
-[Install](#installation) · [Get started](#get-started) · [Modes](#modes) · [Documentation](#documentation) · [Releases](https://github.com/song0705/Asterline/releases/latest)
+[Install](#installation) · [Get started](#get-started) · [Modes](#modes) · [Documentation](#documentation) · [Releases](https://github.com/song0705/Asterline-Prime/releases/latest)
 
 The default product README is [Chinese](README.md). This page is the English counterpart.
 
@@ -32,7 +34,7 @@ Asterline supports macOS, Linux, and Windows 10/11. It coordinates provider CLIs
 | macOS    | Open `asterline-<version>-macos-universal.dmg` and run `Install Asterline.pkg`              |
 | Windows  | Run `asterline-<version>-x86_64-windows-setup.exe`                                          |
 | Linux    | Choose `asterline-v<version>-Linux-x86_64` or `Linux-arm64` as `.tar.gz`, `.deb`, or `.rpm` |
-| Homebrew | `brew install song0705/asterline/asterline`                                                 |
+| Homebrew | `brew install song0705/asterline-prime/asterline`                                                 |
 
 Installers provide both `asterline` and the shorter `ast` command. Linux archives target GNU/glibc 2.28 or newer and embed SQLite; Alpine/musl is not a release target. See the [installation guide](docs/installation.md) for Homebrew, portable packages, source builds, verification, updates, and uninstall.
 
@@ -217,7 +219,7 @@ cargo test --all-targets --locked --no-fail-fast
 cargo audit
 ```
 
-Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate. Real-backend smoke tests are opt-in; see the [controlled local and Actions entrypoints](docs/real-smoke.md). Use [GitHub Issues](https://github.com/song0705/Asterline/issues) for reproducible bugs and focused proposals.
+Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate. Real-backend smoke tests are opt-in; see the [controlled local and Actions entrypoints](docs/real-smoke.md). Use [GitHub Issues](https://github.com/song0705/Asterline-Prime/issues) for reproducible bugs and focused proposals.
 
 ## Project status
 

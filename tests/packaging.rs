@@ -228,7 +228,7 @@ fn third_party_package_definitions_are_version_pinned_and_safe() {
     assert!(packaging_readme.contains("v0.2.7 is the first Release with the visible"));
     assert!(
         packaging_readme
-            .contains("brew audit --strict --online --formula song0705/asterline/asterline")
+            .contains("brew audit --strict --online --formula song0705/asterline-prime/asterline")
     );
     assert!(PACKAGING_README.contains("GLIBC_2.39"));
     assert!(

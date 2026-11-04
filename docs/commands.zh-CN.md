@@ -114,7 +114,7 @@ asterline --banner
 - Windows Setup 管理的安装保留原有的校验安装器流程：检查最新稳定 Release，使用
   同一 Release 的 `SHA256SUMS` 校验 Setup，安排在 Asterline 退出后运行，然后退出。
 - macOS 或 Linux 上的 Homebrew 安装会先执行 `brew update`，再执行
-  `brew upgrade song0705/asterline/asterline`。Asterline 会先确认自己的可执行文件
+  `brew upgrade song0705/asterline-prime/asterline`。Asterline 会先确认自己的可执行文件
   确实位于该 Formula 的安装前缀内。
 
 便携归档、直接安装的 `.deb`/`.rpm`、macOS 安装包和源码构建版不会被猜测覆盖；
