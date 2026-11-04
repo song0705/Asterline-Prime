@@ -1267,13 +1267,13 @@ fn team_editor_includes_children_and_preserves_their_parent() {
         None,
         vec![
             summary("builder", "Builder", BackendKind::Codex, MemberStatus::Idle),
-            child_summary("scout", "Scout", "builder", MemberStatus::Idle),
             summary(
                 "reviewer",
                 "Reviewer",
                 BackendKind::Claude,
                 MemberStatus::Idle,
             ),
+            child_summary("scout", "Scout", "builder", MemberStatus::Idle),
         ],
     ));
 

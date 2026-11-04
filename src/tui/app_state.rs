@@ -3950,6 +3950,14 @@ impl AppState {
         let members = self
             .members
             .iter()
+            .filter(|view| view.parent.is_none())
+            .flat_map(|parent| {
+                std::iter::once(parent).chain(
+                    self.members
+                        .iter()
+                        .filter(|child| child.parent.as_ref() == Some(&parent.id)),
+                )
+            })
             .map(|view| self.view_to_member(view))
             .collect();
         let model_catalog = std::mem::take(&mut self.model_catalog);
