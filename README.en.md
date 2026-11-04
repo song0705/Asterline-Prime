@@ -232,3 +232,5 @@ Thanks to the [LINUX DO](https://linux.do) community.
 ## License
 
 Asterline is available under the [MIT License](LICENSE).
+
+The main-agent/sub-agent interaction model draws on [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent). Its upstream copyright and MIT license, including the Mario Zechner attribution, are preserved in [LICENSE](LICENSE).

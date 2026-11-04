@@ -230,3 +230,5 @@ cargo audit
 ## 许可证
 
 Asterline 使用 [MIT License](LICENSE)。
+
+主 Agent / 子 Agent 交互模型参考了 [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)。其上游版权和 MIT 许可声明（含 Mario Zechner 署名）完整保留于 [LICENSE](LICENSE)。
