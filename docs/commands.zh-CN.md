@@ -776,6 +776,8 @@ brainstorm 运行重跑当前生成波次（或投票/综合阶段）；处于�
 | `Ctrl+C`                   | 复制聊天/输入框选区；否则保持原有的中断行为              |
 | `Ctrl+V` / `Cmd+V`         | 把剪贴板图片附到下一条消息（不是 Ctrl+C）                |
 
+点击已有思考块、文件变更、工具组或单条工具输出的标题即可展开/收起；工具输出的截断提示也可点击。单击只改变对应块，拖动仍用于选择文字。`Ctrl+T`、`Ctrl+G`、`Ctrl+O` 仍可全局切换。Codex 思考摘要目前仍作为即时状态显示，不保留为历史思考块。
+
 截图或复制的图片写在进程临时目录
 `std::env::temp_dir()/asterline-pasted/<pid>/`：Windows 是 `%TEMP%`，macOS 是
 `$TMPDIR`，Linux 是 `/tmp`。不依赖系统自动回收。输入框 Backspace / 清空会立刻

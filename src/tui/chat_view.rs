@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::domain::event::{ChatItem, FileChangeItem};
 use crate::domain::team::{BackendKind, MemberId};
 use crate::tui::agents_view;
-use crate::tui::app_state::{AppState, FocusRow, focus_row, member_status_is_active};
+use crate::tui::app_state::{AppState, FocusRow, FoldTarget, focus_row, member_status_is_active};
 use crate::tui::completion::Completion;
 use crate::tui::drawer_view::{inline_height, is_inline, render_drawer, render_inline_drawer};
 use crate::tui::drawers::Drawer;
@@ -51,20 +51,27 @@ pub struct ChatLayout {
     pub composer_wrap: usize,
     /// Visual rows reserved above composer text (attachment chips).
     pub composer_text_origin: u16,
-    /// Clickable tool-group title rows inside the viewport, as
-    /// `(flattened line index, chat index of the group's first item)`. The
+    /// Clickable disclosure title rows inside the viewport, as
+    /// `(flattened line index, disclosure target)`. The
     /// line index is content-anchored, like `first_line`, so a click maps
     /// correctly after the view has scrolled.
-    pub tool_titles: Vec<(usize, usize)>,
+    pub fold_titles: Vec<(usize, FoldTarget)>,
 }
 
 impl ChatLayout {
-    /// Chat index of the tool group whose title sits on flattened line `line`.
-    pub fn tool_group_at_line(&self, line: usize) -> Option<usize> {
-        self.tool_titles
+    pub fn fold_target_at_line(&self, line: usize) -> Option<FoldTarget> {
+        self.fold_titles
             .iter()
             .find(|(at, _)| *at == line)
-            .map(|(_, key)| *key)
+            .map(|(_, target)| *target)
+    }
+
+    #[cfg(test)]
+    pub fn tool_group_at_line(&self, line: usize) -> Option<usize> {
+        match self.fold_target_at_line(line) {
+            Some(FoldTarget::Tools(first)) => Some(first),
+            _ => None,
+        }
     }
 
     /// Maximum scroll offset (lines up from the bottom) for this layout.
@@ -443,8 +450,13 @@ struct ChatPaintCache {
 }
 
 /// Visible styled lines, their plain text, the total flattened line count,
-/// and the clickable tool-group titles `(line index, group key)`.
-type PaintedChat = (Vec<Line<'static>>, Vec<String>, usize, Vec<(usize, usize)>);
+/// and clickable disclosure titles `(line index, target)`.
+type PaintedChat = (
+    Vec<Line<'static>>,
+    Vec<String>,
+    usize,
+    Vec<(usize, FoldTarget)>,
+);
 
 #[derive(Clone, Default)]
 struct CachedChunk {
@@ -453,9 +465,8 @@ struct CachedChunk {
     height: usize,
     lines: Option<Vec<Line<'static>>>,
     plain: Option<Vec<String>>,
-    /// `(line offset in the chunk, chat index of the group's first item)` for
-    /// each clickable tool-group title.
-    tool_titles: Vec<(usize, usize)>,
+    /// Content-anchored `(line offset in the chunk, disclosure target)` pairs.
+    fold_titles: Vec<(usize, FoldTarget)>,
 }
 
 #[derive(Clone, Debug)]
@@ -524,7 +535,7 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
 
     let width = inner.width as usize;
     let height = inner.height as usize;
-    let (mut visible, plain, total, tool_titles) =
+    let (mut visible, plain, total, fold_titles) =
         painted_chat(state, width, state.scroll(), height);
 
     let max_start = total.saturating_sub(height);
@@ -544,7 +555,7 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
         composer_area: None,
         composer_wrap: 0,
         composer_text_origin: 0,
-        tool_titles,
+        fold_titles,
     }
 }
 
@@ -691,7 +702,7 @@ fn render_chunk(
     live_slots: &mut Vec<LiveSlot>,
 ) -> CachedChunk {
     let mut lines = Vec::new();
-    let mut tool_titles = Vec::new();
+    let mut fold_titles = Vec::new();
     if start == 0 && state.chat().is_empty() {
         lines.push(Line::raw(""));
         lines.extend(quick_start_lines(state, width));
@@ -704,7 +715,7 @@ fn render_chunk(
         end,
         &mut lines,
         LiveRender::Record(live_slots),
-        &mut tool_titles,
+        &mut fold_titles,
     );
     if end == state.chat().len() && state.omitted_active_output_count() > 0 {
         let omitted = state.omitted_active_output_count();
@@ -725,7 +736,7 @@ fn render_chunk(
         height: lines.len(),
         plain: Some(lines.iter().map(line_to_plain).collect()),
         lines: Some(lines),
-        tool_titles,
+        fold_titles,
     }
 }
 
@@ -819,8 +830,8 @@ fn compose_scrollback(
     let mut titles = Vec::new();
     let mut index = 0usize;
     let mut live_at = 0usize;
-    // `title` is the chat index of the tool group this row titles, if any.
-    let mut emit = |line: &Line<'static>, title: Option<usize>| {
+    // `title` identifies the disclosure header on this row, if any.
+    let mut emit = |line: &Line<'static>, title: Option<FoldTarget>| {
         if index >= start && visible.len() < height {
             plain.push(line_to_plain(line));
             visible.push(line.clone());
@@ -831,7 +842,9 @@ fn compose_scrollback(
         index += 1;
     };
     let flush_live_at =
-        |at: usize, live_at: &mut usize, emit: &mut dyn FnMut(&Line<'static>, Option<usize>)| {
+        |at: usize,
+         live_at: &mut usize,
+         emit: &mut dyn FnMut(&Line<'static>, Option<FoldTarget>)| {
             while *live_at < live.len() && live[*live_at].0 == at {
                 for live_line in &live[*live_at].1 {
                     emit(live_line, None);
@@ -839,29 +852,30 @@ fn compose_scrollback(
                 *live_at += 1;
             }
         };
-    let emit_chunk = |chunk: Option<&CachedChunk>,
-                      origin: usize,
-                      live_at: &mut usize,
-                      emit: &mut dyn FnMut(&Line<'static>, Option<usize>)| {
-        if let Some(chunk) = chunk
-            && let Some(lines) = chunk.lines.as_ref()
-        {
-            for (offset, line) in lines.iter().enumerate() {
-                flush_live_at(origin + offset, live_at, emit);
-                let title = chunk
-                    .tool_titles
-                    .iter()
-                    .find(|(at, _)| *at == offset)
-                    .map(|(_, key)| *key);
-                emit(line, title);
+    let emit_chunk =
+        |chunk: Option<&CachedChunk>,
+         origin: usize,
+         live_at: &mut usize,
+         emit: &mut dyn FnMut(&Line<'static>, Option<FoldTarget>)| {
+            if let Some(chunk) = chunk
+                && let Some(lines) = chunk.lines.as_ref()
+            {
+                for (offset, line) in lines.iter().enumerate() {
+                    flush_live_at(origin + offset, live_at, emit);
+                    let title = chunk
+                        .fold_titles
+                        .iter()
+                        .find(|(at, _)| *at == offset)
+                        .map(|(_, key)| *key);
+                    emit(line, title);
+                }
+            } else if let Some(chunk) = chunk {
+                for offset in 0..chunk.height {
+                    flush_live_at(origin + offset, live_at, emit);
+                    emit(&Line::raw(""), None);
+                }
             }
-        } else if let Some(chunk) = chunk {
-            for offset in 0..chunk.height {
-                flush_live_at(origin + offset, live_at, emit);
-                emit(&Line::raw(""), None);
-            }
-        }
-    };
+        };
     emit_chunk(cache.prefix.as_ref(), 0, &mut live_at, &mut emit);
     emit_chunk(cache.tail.as_ref(), prefix_h, &mut live_at, &mut emit);
     while live_at < live.len() {
@@ -1092,7 +1106,7 @@ fn render_chat_history_range(
     end: usize,
     out: &mut Vec<Line<'static>>,
     mut live: LiveRender<'_>,
-    titles: &mut Vec<(usize, usize)>,
+    titles: &mut Vec<(usize, FoldTarget)>,
 ) {
     let items = state.chat();
     let start = start.min(items.len());
@@ -1156,7 +1170,17 @@ fn render_chat_history_range(
             render_agent_messages(&run, width, state, out);
             skip_until = run_end + 1;
         } else {
-            render_item(item, width, state, out, show_sender_header);
+            render_item(
+                item,
+                width,
+                state,
+                out,
+                show_sender_header,
+                Some(ToolGroupAnchor {
+                    first_index: i,
+                    titles,
+                }),
+            );
         }
         if is_find_current && let Some(line) = out.get_mut(before) {
             // Marker in column 0, over the first blank column of the row, so
@@ -1356,7 +1380,7 @@ fn consecutive_work_run_end(items: &[ChatItem], order: &[usize], pos: usize) -> 
 /// which output row is the clickable title.
 struct ToolGroupAnchor<'a> {
     first_index: usize,
-    titles: &'a mut Vec<(usize, usize)>,
+    titles: &'a mut Vec<(usize, FoldTarget)>,
 }
 
 fn render_work_run(
@@ -1429,8 +1453,22 @@ fn render_work_run(
                 )
         })
         .collect();
+    let ToolGroupAnchor {
+        first_index,
+        titles,
+    } = anchor;
     if !tools.is_empty() {
-        render_tool_group(&tools, Some(anchor), width, state, out, show_sender_header);
+        render_tool_group(
+            &tools,
+            Some(ToolGroupAnchor {
+                first_index,
+                titles,
+            }),
+            width,
+            state,
+            out,
+            show_sender_header,
+        );
     }
     let member = diff_member.or_else(|| {
         edit_tools.iter().find_map(|item| match item {
@@ -1456,7 +1494,17 @@ fn render_work_run(
             if index > 0 {
                 out.push(Line::from(vec![Span::raw(" "), Span::raw("")]));
             }
-            render_file_changes(state, &files, diff_ok, width, out);
+            render_file_changes(
+                state,
+                &files,
+                diff_ok,
+                width,
+                out,
+                Some(ToolGroupAnchor {
+                    first_index,
+                    titles,
+                }),
+            );
         }
     }
 }
@@ -1601,7 +1649,7 @@ fn tool_kind_counts(tools: &[&ChatItem]) -> String {
 
 fn render_tool_group(
     tools: &[&ChatItem],
-    anchor: Option<ToolGroupAnchor<'_>>,
+    mut anchor: Option<ToolGroupAnchor<'_>>,
     width: usize,
     state: &AppState,
     out: &mut Vec<Line<'static>>,
@@ -1648,8 +1696,8 @@ fn render_tool_group(
         (Some(_), true) => "▸ ",
         (Some(_), false) => "▾ ",
     };
-    if let (Some(anchor), Some(key)) = (anchor, key) {
-        anchor.titles.push((out.len(), key));
+    if let (Some(anchor), Some(key)) = (anchor.as_mut(), key) {
+        anchor.titles.push((out.len(), FoldTarget::Tools(key)));
     }
     if !collapsed {
         out.push(Line::from(vec![Span::styled(
@@ -1657,17 +1705,7 @@ fn render_tool_group(
             title_style,
         )]));
         for item in tools {
-            let ChatItem::Tool {
-                name,
-                summary,
-                detail,
-                ok,
-                ..
-            } = item
-            else {
-                continue;
-            };
-            render_tool_row(name, summary, detail, *ok, width, state, out);
+            render_anchored_tool_row(item, width, state, out, &mut anchor);
         }
         return;
     }
@@ -1690,15 +1728,55 @@ fn render_tool_group(
     }
     out.push(Line::from(spans));
     // Keep progress visible: the newest call, while it is still running.
-    if let Some(ChatItem::Tool {
+    if let Some(item @ ChatItem::Tool { ok: None, .. }) = tools.last().copied() {
+        render_anchored_tool_row(item, width, state, out, &mut anchor);
+    }
+}
+
+fn render_anchored_tool_row(
+    item: &ChatItem,
+    width: usize,
+    state: &AppState,
+    out: &mut Vec<Line<'static>>,
+    anchor: &mut Option<ToolGroupAnchor<'_>>,
+) {
+    let ChatItem::Tool {
         name,
         summary,
         detail,
-        ok: None,
+        ok,
         ..
-    }) = tools.last().copied()
-    {
-        render_tool_row(name, summary, detail, None, width, state, out);
+    } = item
+    else {
+        return;
+    };
+    let body = if *ok == Some(false) {
+        tool_display::tool_error_body(detail)
+    } else {
+        tool_display::tool_body(detail)
+    };
+    let target = anchor
+        .as_ref()
+        .filter(|_| !body.trim().is_empty())
+        .and_then(|anchor| {
+            state
+                .chat()
+                .iter()
+                .enumerate()
+                .skip(anchor.first_index)
+                .find(|(_, candidate)| std::ptr::eq(*candidate, item))
+                .map(|(index, _)| FoldTarget::ToolOutput(index))
+        });
+    if let (Some(anchor), Some(target)) = (anchor.as_mut(), target) {
+        anchor.titles.push((out.len(), target));
+    }
+    let expanded = target.map_or_else(
+        || state.tools_expanded(),
+        |target| state.fold_expanded(target),
+    );
+    let footer = render_tool_row(name, summary, detail, *ok, width, expanded, out);
+    if let (Some(anchor), Some(target), Some(line)) = (anchor.as_mut(), target, footer) {
+        anchor.titles.push((line, target));
     }
 }
 
@@ -1709,9 +1787,9 @@ fn render_tool_row(
     detail: &str,
     ok: Option<bool>,
     width: usize,
-    state: &AppState,
+    expanded: bool,
     out: &mut Vec<Line<'static>>,
-) {
+) -> Option<usize> {
     let (prefix, color, text_style) = match ok {
         None => (
             status_indicator::spinner(),
@@ -1725,8 +1803,23 @@ fn render_tool_row(
     let target = tool_display::tool_target(name, summary, detail);
     let kind_col = theme::pad_width(&kind, 6);
     let rest_width = width.saturating_sub(8).max(10);
+    let body = if ok == Some(false) {
+        tool_display::tool_error_body(detail)
+    } else {
+        tool_display::tool_body(detail)
+    };
+    let disclosure = if body.trim().is_empty() {
+        ""
+    } else if expanded {
+        "▾ "
+    } else {
+        "▸ "
+    };
     let mut spans = vec![
-        Span::styled(format!("    {prefix} "), Style::default().fg(color)),
+        Span::styled(
+            format!("    {prefix} {disclosure}"),
+            Style::default().fg(color),
+        ),
         Span::styled(kind_col, text_style),
     ];
     if !target.is_empty() {
@@ -1735,15 +1828,13 @@ fn render_tool_row(
         spans.push(Span::styled(shown, theme::muted()));
     }
     out.push(Line::from(spans));
-    if detail.trim().is_empty() {
-        return;
+    if body.trim().is_empty() {
+        return None;
     }
     let detail_style = theme::muted();
     let detail_width = width.saturating_sub(10).max(1);
-    let expanded = state.tools_expanded();
     let failure = ok == Some(false);
     let (lines, clipped) = if failure {
-        let body = tool_display::tool_error_body(detail);
         if body.is_empty() {
             (Vec::new(), false)
         } else if expanded {
@@ -1755,7 +1846,7 @@ fn render_tool_row(
             (wrapped.into_iter().take(6).collect::<Vec<_>>(), clipped)
         }
     } else if expanded {
-        let wrapped = markdown::wrap(&tool_display::tool_body(detail), detail_width);
+        let wrapped = markdown::wrap(&body, detail_width);
         (wrapped, false)
     } else {
         (Vec::new(), false)
@@ -1772,11 +1863,14 @@ fn render_tool_row(
         ]));
     }
     if clipped && !expanded {
+        let footer = out.len();
         out.push(Line::from(vec![Span::styled(
-            "        … Ctrl+O expand tool output",
+            "        … click to expand · Ctrl+O expand tool output",
             theme::muted_italic(),
         )]));
+        return Some(footer);
     }
+    None
 }
 
 fn is_agent_message(item: &ChatItem) -> bool {
@@ -1965,13 +2059,23 @@ fn render_file_changes(
     ok: bool,
     width: usize,
     out: &mut Vec<Line<'static>>,
+    anchor: Option<ToolGroupAnchor<'_>>,
 ) {
     let (marker, title_style) = if ok {
         ("✎", theme::accent_bold())
     } else {
         ("✕", theme::error_bold())
     };
-    if !state.diffs_expanded() {
+    let expanded = anchor.as_ref().map_or_else(
+        || state.diffs_expanded(),
+        |a| state.fold_expanded(FoldTarget::Diff(a.first_index)),
+    );
+    if let Some(anchor) = anchor {
+        anchor
+            .titles
+            .push((out.len(), FoldTarget::Diff(anchor.first_index)));
+    }
+    if !expanded {
         let count = files.len();
         let summary = if count == 1 {
             files
@@ -1984,7 +2088,7 @@ fn render_file_changes(
         out.push(Line::from(vec![
             Span::styled(format!("  {marker} file changes"), title_style),
             Span::styled(
-                format!(" · {summary} · Ctrl+G expand"),
+                format!(" · {summary} · click to expand · Ctrl+G expand all"),
                 theme::muted_italic(),
             ),
         ]));
@@ -1992,7 +2096,10 @@ fn render_file_changes(
     }
     out.push(Line::from(vec![
         Span::styled(format!("  {marker} file changes"), title_style),
-        Span::styled(" · Ctrl+G collapse", theme::muted_italic()),
+        Span::styled(
+            " · click to collapse · Ctrl+G collapse all",
+            theme::muted_italic(),
+        ),
     ]));
     for (index, file) in files.iter().enumerate() {
         if index > 0 {
@@ -2460,6 +2567,7 @@ fn render_item(
     state: &AppState,
     out: &mut Vec<Line<'static>>,
     show_sender_header: bool,
+    anchor: Option<ToolGroupAnchor<'_>>,
 ) {
     if show_sender_header
         && !matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
@@ -2525,16 +2633,31 @@ fn render_item(
             } else {
                 format!("✻ {label}")
             };
-            if !state.thinking_expanded() {
+            let expanded = anchor.as_ref().map_or_else(
+                || state.thinking_expanded(),
+                |a| state.fold_expanded(FoldTarget::Thinking(a.first_index)),
+            );
+            if let Some(anchor) = anchor {
+                anchor
+                    .titles
+                    .push((out.len(), FoldTarget::Thinking(anchor.first_index)));
+            }
+            if !expanded {
                 out.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(format!("{label} · Ctrl+T expand"), theme::muted_italic()),
+                    Span::styled(
+                        format!("{label} · click to expand · Ctrl+T expand all"),
+                        theme::muted_italic(),
+                    ),
                 ]));
                 return;
             }
             out.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(format!("{label} · Ctrl+T collapse"), theme::muted_italic()),
+                Span::styled(
+                    format!("{label} · click to collapse · Ctrl+T collapse all"),
+                    theme::muted_italic(),
+                ),
             ]));
             for line in markdown::wrap(text.trim(), width.saturating_sub(5).max(1)) {
                 out.push(Line::from(vec![
@@ -2547,7 +2670,7 @@ fn render_item(
             render_tool_group(&[item], None, width, state, out, false);
         }
         ChatItem::Diff { files, ok, .. } => {
-            render_file_changes(state, files, *ok, width, out);
+            render_file_changes(state, files, *ok, width, out, anchor);
         }
         ChatItem::Route { .. } | ChatItem::Spawn { .. } | ChatItem::Close { .. } => {
             render_agent_messages(&[item], width, state, out);

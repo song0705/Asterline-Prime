@@ -2,6 +2,15 @@
 //! [`AppState::apply`]; the renderer reads it and the key handler mutates the
 //! composer / drawer / scroll. No state is inferred from matching strings.
 
+/// Stable transcript identity of a clickable disclosure header.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FoldTarget {
+    Tools(usize),
+    ToolOutput(usize),
+    Thinking(usize),
+    Diff(usize),
+}
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -342,10 +351,11 @@ pub struct AppState {
     thinking_expanded: bool,
     diffs_expanded: bool,
     tools_expanded: bool,
-    /// Long tool groups the user opened with a click, keyed by the chat index
-    /// of the group's first item. Ctrl+O (`tools_expanded`) overrides it.
+    /// Per-group choices restored when the global Ctrl+O override is off.
     expanded_tool_groups: HashSet<usize>,
-    /// Bumps on every change to `expanded_tool_groups`, for the paint cache.
+    /// Per-block disclosure choices, keyed by stable transcript identity.
+    fold_overrides: HashMap<FoldTarget, bool>,
+    /// Bumps on every per-block expansion change, for the paint cache.
     tool_groups_revision: u64,
     active_reasoning: HashMap<MemberId, String>,
     reasoning_buffers: HashMap<MemberId, String>,
@@ -521,6 +531,7 @@ impl AppState {
             diffs_expanded: true,
             tools_expanded: false,
             expanded_tool_groups: HashSet::new(),
+            fold_overrides: HashMap::new(),
             tool_groups_revision: 0,
             active_reasoning: HashMap::new(),
             reasoning_buffers: HashMap::new(),
@@ -4608,22 +4619,67 @@ impl AppState {
     pub fn toggle_thinking_expansion(&mut self) {
         self.disarm_quit();
         self.thinking_expanded = !self.thinking_expanded;
+        self.fold_overrides
+            .retain(|target, _| !matches!(target, FoldTarget::Thinking(_)));
+        self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
     }
 
     pub fn toggle_diffs_expansion(&mut self) {
         self.disarm_quit();
         self.diffs_expanded = !self.diffs_expanded;
+        self.fold_overrides
+            .retain(|target, _| !matches!(target, FoldTarget::Diff(_)));
+        self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
     }
 
     pub fn toggle_tools_expansion(&mut self) {
         self.disarm_quit();
         self.tools_expanded = !self.tools_expanded;
+        self.fold_overrides.retain(|target, _| {
+            !matches!(target, FoldTarget::ToolOutput(_) | FoldTarget::Tools(_))
+        });
+        self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
+    }
+
+    pub fn fold_expanded(&self, target: FoldTarget) -> bool {
+        match target {
+            FoldTarget::Tools(first) => self.tool_group_expanded(first),
+            FoldTarget::ToolOutput(_) => self
+                .fold_overrides
+                .get(&target)
+                .copied()
+                .unwrap_or(self.tools_expanded),
+            FoldTarget::Thinking(_) => self
+                .fold_overrides
+                .get(&target)
+                .copied()
+                .unwrap_or(self.thinking_expanded),
+            FoldTarget::Diff(_) => self
+                .fold_overrides
+                .get(&target)
+                .copied()
+                .unwrap_or(self.diffs_expanded),
+        }
+    }
+
+    pub fn toggle_fold(&mut self, target: FoldTarget) {
+        if let FoldTarget::Tools(first) = target {
+            self.toggle_tool_group(first);
+            return;
+        }
+        self.disarm_quit();
+        let expanded = self.fold_expanded(target);
+        self.fold_overrides.insert(target, !expanded);
+        self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
     }
 
     /// Whether the tool group starting at chat index `first` shows every row.
     /// Ctrl+O opens all groups; otherwise only clicked ones are open.
     pub fn tool_group_expanded(&self, first: usize) -> bool {
-        self.tools_expanded || self.expanded_tool_groups.contains(&first)
+        self.fold_overrides
+            .get(&FoldTarget::Tools(first))
+            .copied()
+            .unwrap_or(self.tools_expanded || self.expanded_tool_groups.contains(&first))
     }
 
     pub(crate) fn tool_groups_revision(&self) -> u64 {
@@ -4633,17 +4689,20 @@ impl AppState {
     /// Flip one tool group between its one-line and full forms.
     pub fn toggle_tool_group(&mut self, first: usize) {
         self.disarm_quit();
-        if !self.expanded_tool_groups.remove(&first) {
+        let expanded = self.tool_group_expanded(first);
+        if self.tools_expanded {
+            self.fold_overrides
+                .insert(FoldTarget::Tools(first), !expanded);
+        } else if !self.expanded_tool_groups.remove(&first) {
             self.expanded_tool_groups.insert(first);
         }
         self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
     }
 
-    /// Forget every per-group choice (new chat, resumed chat).
+    /// Forget per-block choices on a new or resumed chat.
     fn clear_tool_group_expansion(&mut self) {
-        if !self.expanded_tool_groups.is_empty() {
-            self.expanded_tool_groups.clear();
-        }
+        self.expanded_tool_groups.clear();
+        self.fold_overrides.clear();
         self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);
     }
 

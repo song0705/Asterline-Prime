@@ -1624,7 +1624,7 @@ fn agent_markdown_header_and_table_share_one_unstyled_margin() {
     };
     let mut lines = Vec::new();
 
-    render_item(&item, 80, &state, &mut lines, true);
+    render_item(&item, 80, &state, &mut lines, true, None);
 
     assert!(!lines.is_empty());
     assert!(lines.iter().all(|line| {

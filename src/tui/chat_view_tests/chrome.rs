@@ -220,7 +220,7 @@ fn user_text_agent_text_and_tool_titles_share_one_left_edge() {
     assert_eq!(column("⇄ agents"), 2, "{text:?}");
     assert_eq!(column("a notice"), 2, "{text:?}");
     // The rows inside a group sit one step deeper, under their title.
-    assert_eq!(column("· Shell"), 4, "{text:?}");
+    assert_eq!(column("· ▸ Shell"), 4, "{text:?}");
 }
 
 #[test]
@@ -248,8 +248,8 @@ fn entries_are_one_blank_row_apart_with_no_rules_and_none_inside_a_group() {
     assert!(text[at("reply") + 1].is_empty(), "{text:?}");
     assert!(text[at("⚒ tools") - 1].is_empty(), "{text:?}");
     // The two tool rows follow their title directly.
-    assert_eq!(at("· Shell   ls") + 1, at("· Shell   pwd"), "{text:?}");
-    assert_eq!(at("⚒ tools") + 1, at("· Shell   ls"), "{text:?}");
+    assert_eq!(at("· ▸ Shell   ls") + 1, at("· ▸ Shell   pwd"), "{text:?}");
+    assert_eq!(at("⚒ tools") + 1, at("· ▸ Shell   ls"), "{text:?}");
     // The second user band follows a blank row, then its own padding row.
     let second = at("second");
     assert!(text[second - 2].is_empty(), "{text:?}");

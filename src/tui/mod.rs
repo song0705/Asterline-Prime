@@ -465,6 +465,9 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if state.drawer().is_some() {
+                return;
+            }
             let composer_text = state.finish_composer_selection();
             if !composer_text.is_empty() {
                 copy_to_clipboard(&composer_text);
@@ -472,7 +475,7 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
             if let (Some(layout), Some(selection)) = (layout, state.chat_selection()) {
                 // A press and release on the same cell is a click, not a
-                // drag. On a tool group title it folds or unfolds the group.
+                // drag. On a disclosure title it folds or unfolds that block.
                 if selection.is_empty()
                     && let Some(url) = hyperlink::url_at(mouse.column, mouse.row)
                 {
@@ -481,10 +484,12 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
                     return;
                 }
                 if selection.is_empty()
-                    && let Some(first) = layout.tool_group_at_line(selection.start.0)
+                    && layout.contains(mouse.column, mouse.row)
+                    && layout.screen_to_content(mouse.column, mouse.row) == Some(selection.start)
+                    && let Some(target) = layout.fold_target_at_line(selection.start.0)
                 {
                     state.clear_chat_selection();
-                    state.toggle_tool_group(first);
+                    state.toggle_fold(target);
                     return;
                 }
                 let text = layout.selected_text(selection);
@@ -1719,7 +1724,7 @@ mod tests {
             composer_area: None,
             composer_wrap: 0,
             composer_text_origin: 0,
-            tool_titles: Vec::new(),
+            fold_titles: Vec::new(),
         };
         let mut state = AppState::new(Vec::new());
         state.begin_chat_selection((0, 0));
@@ -1739,7 +1744,7 @@ mod tests {
             composer_area: None,
             composer_wrap: 0,
             composer_text_origin: 0,
-            tool_titles: Vec::new(),
+            fold_titles: Vec::new(),
         };
         let mut blank = AppState::new(Vec::new());
         blank.begin_chat_selection((0, 0));
@@ -1793,7 +1798,10 @@ mod tests {
 
     /// Screen `(column, row)` of the tool title that opens group `key`.
     fn title_cell(layout: &chat_view::ChatLayout, key: usize) -> Option<(u16, u16)> {
-        let (line, _) = layout.tool_titles.iter().find(|(_, group)| *group == key)?;
+        let (line, _) = layout
+            .fold_titles
+            .iter()
+            .find(|(_, group)| *group == app_state::FoldTarget::Tools(key))?;
         Some((
             layout.area.x + 6,
             layout.area.y + (line - layout.first_line) as u16,
@@ -1919,6 +1927,163 @@ mod tests {
             !text.contains('\x1b') && !text.contains("example.com"),
             "{text:?}"
         );
+    }
+
+    fn thinking_item(text: &str) -> ChatItem {
+        ChatItem::Thinking {
+            member: MemberId::new("reviewer"),
+            display_name: "Reviewer".to_string(),
+            backend: BackendKind::Claude,
+            text: text.to_string(),
+            elapsed_secs: Some(2),
+        }
+    }
+
+    fn fold_cell(layout: &chat_view::ChatLayout, target: app_state::FoldTarget) -> (u16, u16) {
+        let (line, _) = layout
+            .fold_titles
+            .iter()
+            .find(|(_, item)| *item == target)
+            .expect("visible disclosure");
+        (
+            layout.area.x + 4,
+            layout.area.y + (line - layout.first_line) as u16,
+        )
+    }
+
+    #[test]
+    fn clicking_thinking_toggles_only_that_block_and_keyboard_still_controls_all() {
+        use app_state::FoldTarget::Thinking;
+        let mut state = AppState::new(vec![
+            thinking_item("first private body"),
+            thinking_item("second private body"),
+        ]);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("first private body"));
+        click(&mut state, &layout, fold_cell(&layout, Thinking(0)));
+        let layout = paint(&mut terminal, &state);
+        let view = format!("{}", terminal.backend());
+        assert!(view.contains("first private body"));
+        assert!(!view.contains("second private body"));
+        assert!(state.fold_expanded(Thinking(0)));
+        assert!(!state.fold_expanded(Thinking(1)));
+        click(&mut state, &layout, fold_cell(&layout, Thinking(0)));
+        let _ = paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("first private body"));
+        state.toggle_thinking_expansion();
+        assert!(state.fold_expanded(Thinking(0)) && state.fold_expanded(Thinking(1)));
+        state.toggle_fold(Thinking(0));
+        assert!(!state.fold_expanded(Thinking(0)) && state.fold_expanded(Thinking(1)));
+        state.toggle_thinking_expansion();
+        assert!(!state.fold_expanded(Thinking(0)) && !state.fold_expanded(Thinking(1)));
+        state.toggle_fold(Thinking(0));
+        state.apply(crate::domain::event::RuntimeEvent::SessionReset);
+        assert!(
+            !state.fold_expanded(Thinking(0)),
+            "new chat forgets item overrides"
+        );
+    }
+
+    #[test]
+    fn thinking_clicks_survive_scrolling_and_resizing_but_dragging_does_not_toggle() {
+        use app_state::FoldTarget::Thinking;
+        let mut items = vec![thinking_item("wrapped reasoning body ".repeat(20).as_str())];
+        items.extend((0..30).map(|n| ChatItem::Notice {
+            member: None,
+            text: format!("later notice {n}"),
+        }));
+        let mut state = AppState::new(items);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(70, 14)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        state.scroll_by(layout.total_lines as i32);
+        let layout = paint(&mut terminal, &state);
+        let cell = fold_cell(&layout, Thinking(0));
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+        );
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Drag(MouseButton::Left),
+            (cell.0 + 7, cell.1),
+        );
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Up(MouseButton::Left),
+            (cell.0 + 7, cell.1),
+        );
+        assert!(!state.fold_expanded(Thinking(0)));
+        click(&mut state, &layout, cell);
+        assert!(state.fold_expanded(Thinking(0)));
+        let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+        let layout = paint(&mut narrow, &state);
+        state.scroll_by(layout.total_lines as i32);
+        let layout = paint(&mut narrow, &state);
+        click(&mut state, &layout, fold_cell(&layout, Thinking(0)));
+        assert!(!state.fold_expanded(Thinking(0)));
+    }
+
+    #[test]
+    fn clicking_tool_output_toggles_just_that_call_even_after_ctrl_o() {
+        use app_state::FoldTarget::ToolOutput;
+        let mut state = AppState::new(vec![
+            ChatItem::Tool {
+                member: MemberId::new("builder"),
+                name: "shell".to_string(),
+                summary: "first".to_string(),
+                detail: "first output body".to_string(),
+                ok: Some(true),
+            },
+            ChatItem::Tool {
+                member: MemberId::new("builder"),
+                name: "shell".to_string(),
+                summary: "second".to_string(),
+                detail: "second output body".to_string(),
+                ok: Some(true),
+            },
+        ]);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        click(&mut state, &layout, fold_cell(&layout, ToolOutput(0)));
+        assert!(state.fold_expanded(ToolOutput(0)));
+        assert!(!state.fold_expanded(ToolOutput(1)));
+        let _ = paint(&mut terminal, &state);
+        assert!(format!("{}", terminal.backend()).contains("first output body"));
+        state.toggle_tools_expansion();
+        let layout = paint(&mut terminal, &state);
+        click(&mut state, &layout, fold_cell(&layout, ToolOutput(0)));
+        assert!(!state.fold_expanded(ToolOutput(0)));
+        assert!(state.fold_expanded(ToolOutput(1)));
+    }
+
+    #[test]
+    fn clicking_file_changes_collapses_and_reopens_the_diff() {
+        use app_state::FoldTarget::Diff;
+        let mut state = AppState::new(vec![ChatItem::Diff {
+            member: MemberId::new("builder"),
+            files: vec![crate::domain::event::FileChangeItem {
+                path: "example.rs".to_string(),
+                kind: "update".to_string(),
+                old_text: Some("before".to_string()),
+                new_text: Some("after_unique_change".to_string()),
+                patch: None,
+            }],
+            ok: true,
+        }]);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        assert!(format!("{}", terminal.backend()).contains("after_unique_change"));
+        click(&mut state, &layout, fold_cell(&layout, Diff(0)));
+        let layout = paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("after_unique_change"));
+        click(&mut state, &layout, fold_cell(&layout, Diff(0)));
+        let _ = paint(&mut terminal, &state);
+        assert!(format!("{}", terminal.backend()).contains("after_unique_change"));
     }
 
     #[test]

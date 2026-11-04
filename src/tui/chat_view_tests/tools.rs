@@ -208,7 +208,7 @@ fn the_title_row_is_registered_and_clicking_it_repaints_the_group() {
         layout.tool_group_at_line(layout.first_line + title_line),
         Some(0)
     );
-    assert_eq!(layout.tool_titles.len(), 1);
+    assert_eq!(layout.fold_titles.len(), 1);
     let view = format!("{}", terminal.backend());
     assert!(!view.contains("src/file3.rs"), "{view}");
 
@@ -268,7 +268,7 @@ fn title_rows_keep_their_content_line_after_scrolling() {
         state.reset_scroll();
         state.scroll_by(back as i32);
         let layout = draw(&mut terminal, &state);
-        for &(line, key) in &layout.tool_titles {
+        for &(line, key) in &layout.fold_titles {
             let row = &layout.lines[line - layout.first_line];
             assert!(row.contains("▸ ⚒ tools · 5 calls"), "scroll {back}: {row}");
             assert_eq!(
@@ -276,10 +276,16 @@ fn title_rows_keep_their_content_line_after_scrolling() {
                 line,
                 "scroll {back}"
             );
-            assert_eq!(layout.tool_group_at_line(line), Some(key));
+            assert_eq!(layout.fold_target_at_line(line), Some(key));
         }
     }
-    let mut keys: Vec<_> = lines_by_key.keys().copied().collect();
+    let mut keys: Vec<_> = lines_by_key
+        .keys()
+        .map(|target| match target {
+            FoldTarget::Tools(first) => *first,
+            other => panic!("unexpected disclosure: {other:?}"),
+        })
+        .collect();
     keys.sort_unstable();
     assert_eq!(keys, vec![0, 6], "both groups must be reachable by click");
 }

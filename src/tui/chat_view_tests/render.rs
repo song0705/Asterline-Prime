@@ -1185,7 +1185,7 @@ fn selected_text_joins_visible_chat_lines() {
         composer_area: None,
         composer_wrap: 0,
         composer_text_origin: 0,
-        tool_titles: Vec::new(),
+        fold_titles: Vec::new(),
     };
     let text = layout.selected_text(crate::tui::app_state::ChatSelection {
         start: (0, 0),
@@ -1715,7 +1715,7 @@ fn screen_to_content_round_trip_edges() {
         composer_area: None,
         composer_wrap: 0,
         composer_text_origin: 0,
-        tool_titles: Vec::new(),
+        fold_titles: Vec::new(),
     };
     // Top-left of area → first_line, col 0.
     assert_eq!(
