@@ -1,6 +1,6 @@
 <h1 align="center">Asterline Prime</h1>
 
-> **Prime distribution:** Independent repository based on `feat/prime-style-main-agent`, with its Git history preserved. Install with `brew install song0705/asterline-prime/asterline`. The first Prime release builds from checksum-pinned source on macOS/Linux; native installers listed below belong to the inherited release tooling and are not included in this first release. Commands remain `asterline` and `ast`.
+> **Prime distribution:** Independent repository based on `feat/prime-style-main-agent`, with its Git history preserved. Install with `brew install song0705/asterline-prime/asterline`. Homebrew downloads checksum-verified Intel/ARM binaries on macOS/Linux without compiling Rust locally; native installers listed below belong to the inherited release tooling and are not yet provided by Prime. Commands remain `asterline` and `ast`.
 
 <p align="center">
   <strong>Run a visible, persistent team of coding agents in one terminal.</strong><br>

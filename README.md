@@ -1,6 +1,6 @@
 <h1 align="center">Asterline Prime</h1>
 
-> **Prime 独立发行版：** 从 `feat/prime-style-main-agent` 独立，保留 Git 历史。安装：`brew install song0705/asterline-prime/asterline`。首版在 macOS/Linux 从带 SHA-256 校验的源码编译；下文原生安装器说明来自继承的发布流程，首版尚未提供这些安装包。命令仍为 `asterline` 和 `ast`。
+> **Prime 独立发行版：** 从 `feat/prime-style-main-agent` 独立，保留 Git 历史。安装：`brew install song0705/asterline-prime/asterline`。Homebrew 在 macOS/Linux 下载带 SHA-256 校验的 Intel/ARM 预编译包，无需本机编译 Rust；下文原生安装器说明来自继承的发布流程，Prime 尚未提供这些安装器。命令仍为 `asterline` 和 `ast`。
 
 <p align="center">
   <strong>在一个终端里，运行一支看得见、能恢复的编程 Agent 团队。</strong><br>
