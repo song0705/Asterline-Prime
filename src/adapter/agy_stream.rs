@@ -767,19 +767,14 @@ mod tests {
     }
 
     #[test]
-    fn default_agy_member_passes_workspace_write_and_accept_edits() {
+    fn default_agy_member_disables_sandbox_and_skips_permissions() {
         let member = crate::domain::config::default_member(BackendKind::Agy);
         let adapter = AgyStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
         let command = adapter.build_command("hi", None, None);
         assert!(!command.args.contains(&"--sandbox".to_string()));
+        assert!(!command.args.contains(&"--mode".to_string()));
         assert!(
             command
-                .args
-                .windows(2)
-                .any(|w| w == ["--mode", "accept-edits"])
-        );
-        assert!(
-            !command
                 .args
                 .contains(&"--dangerously-skip-permissions".to_string())
         );

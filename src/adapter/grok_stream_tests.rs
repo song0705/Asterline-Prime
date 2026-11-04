@@ -60,13 +60,13 @@ fn fake_acp_server(
 }
 
 #[test]
-fn default_grok_member_passes_workspace_sandbox_and_auto() {
+fn default_grok_member_disables_sandbox_and_always_approves() {
     let member = crate::domain::config::default_member(BackendKind::Grok);
     let runner = GrokAcpRunner::from_member(&member, Path::new("/tmp/ws"));
     let args = runner.command_args(None);
-    assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace"]));
-    assert!(args.windows(2).any(|w| w == ["--permission-mode", "auto"]));
-    assert!(!args.contains(&"--always-approve".to_string()));
+    assert!(args.windows(2).any(|w| w == ["--sandbox", "off"]));
+    assert!(!args.contains(&"--permission-mode".to_string()));
+    assert!(args.contains(&"--always-approve".to_string()));
 }
 
 #[test]

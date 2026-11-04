@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(editor.members[0].backend, BackendKind::Claude);
         assert_eq!(
             editor.members[0].permission_mode,
-            Some(crate::domain::team::PermissionMode::AcceptEdits)
+            Some(crate::domain::team::PermissionMode::BypassPermissions)
         );
         assert_eq!(editor.members[0].model, None);
         assert_eq!(editor.members[0].effort, None);

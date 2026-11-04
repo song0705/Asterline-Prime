@@ -1254,10 +1254,10 @@ fn agent_added_agy_member_gets_write_defaults() {
 
     let qa = rt.config.member(&MemberId::new("qa")).expect("qa added");
     assert_eq!(qa.backend, BackendKind::Agy);
-    assert_eq!(qa.sandbox, SandboxPolicy::WorkspaceWrite);
-    assert_eq!(qa.permission_mode, Some(PermissionMode::AcceptEdits));
+    assert_eq!(qa.sandbox, SandboxPolicy::DangerFullAccess);
+    assert_eq!(qa.permission_mode, Some(PermissionMode::BypassPermissions));
     assert_eq!(qa.sandbox_native_label(), "off");
-    assert_eq!(qa.permission_native_label(), "accept-edits");
+    assert_eq!(qa.permission_native_label(), "dangerously-skip-permissions");
 }
 
 #[test]

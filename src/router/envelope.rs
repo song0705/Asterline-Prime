@@ -1013,10 +1013,10 @@ mod tests {
 
         assert_eq!(parsed.members[0].display_name, "qa");
         assert_eq!(parsed.members[0].backend, BackendKind::Agy);
-        assert_eq!(parsed.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(parsed.members[0].sandbox, SandboxPolicy::DangerFullAccess);
         assert_eq!(
             parsed.members[0].permission_mode,
-            Some(PermissionMode::AcceptEdits)
+            Some(PermissionMode::BypassPermissions)
         );
     }
 

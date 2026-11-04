@@ -25,6 +25,8 @@ Asterline folds each provider's native event stream into one workspace. Messages
 
 The default product README is [Chinese](README.md). This page is the English counterpart.
 
+New members and new chats default to full access: Codex uses `Full Access`, Claude `bypassPermissions`, Grok `always-approve` with sandbox off, and Agy `dangerously-skip-permissions` with sandbox off. Same-backend sub-agents inherit the parent’s permissions; existing explicit settings remain unchanged and can be adjusted in `/team`.
+
 ## Installation
 
 Asterline supports macOS, Linux, and Windows 10/11. It coordinates provider CLIs; it does not install or sign in to Codex, Claude, Grok, or Agy for you. Have at least one of those CLIs installed and authenticated first.

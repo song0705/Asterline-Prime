@@ -2172,11 +2172,11 @@ mod tests {
     }
 
     #[test]
-    fn default_codex_member_passes_ask_for_approval() {
+    fn default_codex_member_passes_full_access() {
         let member = crate::domain::config::default_member(BackendKind::Codex);
         let config = CodexAppServerConfig::from_member(&member, Path::new("/tmp"));
-        assert_eq!(config.thread_params()["sandbox"], "workspace-write");
-        assert_eq!(config.thread_params()["approvalPolicy"], "on-request");
+        assert_eq!(config.thread_params()["sandbox"], "danger-full-access");
+        assert_eq!(config.thread_params()["approvalPolicy"], "never");
         assert_eq!(config.thread_params()["approvalsReviewer"], "user");
     }
 

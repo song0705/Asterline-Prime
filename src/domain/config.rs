@@ -749,32 +749,22 @@ pub fn apply_backend_defaults(member: &mut TeamMember) {
 /// The canonical permission preset for a backend. Custom rosters (roles,
 /// sandboxes, prompts) come via a config file.
 pub fn default_member(backend: BackendKind) -> TeamMember {
-    match backend {
-        BackendKind::Codex => {
-            let mut m = TeamMember::new("builder", "Builder", BackendKind::Codex, "");
-            m.apply_codex_permissions_preset(
-                crate::domain::team::CodexPermissionsPreset::AskForApproval,
-            );
-            m
-        }
-        BackendKind::Claude => {
-            let mut m = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "");
-            m.permission_mode = Some(PermissionMode::AcceptEdits);
-            m
-        }
-        BackendKind::Grok => {
-            let mut m = TeamMember::new("grok", "Grok", BackendKind::Grok, "");
-            m.sandbox = SandboxPolicy::WorkspaceWrite;
-            m.permission_mode = Some(PermissionMode::Auto);
-            m
-        }
-        BackendKind::Agy => {
-            let mut m = TeamMember::new("researcher", "Researcher", BackendKind::Agy, "");
-            m.sandbox = SandboxPolicy::WorkspaceWrite;
-            m.permission_mode = Some(PermissionMode::AcceptEdits);
-            m
-        }
+    let (id, name) = match backend {
+        BackendKind::Codex => ("builder", "Builder"),
+        BackendKind::Claude => ("reviewer", "Reviewer"),
+        BackendKind::Grok => ("grok", "Grok"),
+        BackendKind::Agy => ("researcher", "Researcher"),
+    };
+    let mut member = TeamMember::new(id, name, backend, "");
+    if backend == BackendKind::Codex {
+        member.apply_codex_permissions_preset(
+            crate::domain::team::CodexPermissionsPreset::FullAccess,
+        );
+    } else {
+        member.sandbox = SandboxPolicy::DangerFullAccess;
+        member.permission_mode = Some(PermissionMode::BypassPermissions);
     }
+    member
 }
 
 /// Prepend a compact Asterline team hint to each member's system prompt.
@@ -993,23 +983,29 @@ mod tests {
     #[test]
     fn default_main_member_uses_each_backends_permission_preset() {
         let codex = main_member(BackendKind::Codex);
-        assert_eq!(codex.sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(codex.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(codex.sandbox, SandboxPolicy::DangerFullAccess);
+        assert_eq!(codex.permission_mode, Some(PermissionMode::DontAsk));
         assert_eq!(
             codex.codex_permissions_preset(),
-            Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+            Some(crate::domain::team::CodexPermissionsPreset::FullAccess)
         );
 
         let claude = main_member(BackendKind::Claude);
-        assert_eq!(claude.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(
+            claude.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
 
         let grok = main_member(BackendKind::Grok);
-        assert_eq!(grok.sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(grok.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(grok.sandbox, SandboxPolicy::DangerFullAccess);
+        assert_eq!(
+            grok.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
 
         let agy = main_member(BackendKind::Agy);
-        assert_eq!(agy.sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(agy.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(agy.sandbox, SandboxPolicy::DangerFullAccess);
+        assert_eq!(agy.permission_mode, Some(PermissionMode::BypassPermissions));
     }
 
     #[test]
@@ -1017,8 +1013,11 @@ mod tests {
         let mut member = main_member(BackendKind::Claude);
         member.backend = BackendKind::Grok;
         apply_backend_defaults(&mut member);
-        assert_eq!(member.permission_mode, Some(PermissionMode::Auto));
-        assert_eq!(member.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(
+            member.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
+        assert_eq!(member.sandbox, SandboxPolicy::DangerFullAccess);
     }
 
     #[cfg(unix)]
@@ -1300,23 +1299,29 @@ mod tests {
     #[test]
     fn default_member_uses_permissive_backend_controls() {
         let codex = default_member(BackendKind::Codex);
-        assert_eq!(codex.sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(codex.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(codex.sandbox, SandboxPolicy::DangerFullAccess);
+        assert_eq!(codex.permission_mode, Some(PermissionMode::DontAsk));
         assert_eq!(
             codex.codex_permissions_preset(),
-            Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+            Some(crate::domain::team::CodexPermissionsPreset::FullAccess)
         );
 
         let claude = default_member(BackendKind::Claude);
-        assert_eq!(claude.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(
+            claude.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
 
         let grok = default_member(BackendKind::Grok);
-        assert_eq!(grok.sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(grok.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(grok.sandbox, SandboxPolicy::DangerFullAccess);
+        assert_eq!(
+            grok.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
 
         let agy = default_member(BackendKind::Agy);
-        assert_eq!(agy.sandbox, SandboxPolicy::WorkspaceWrite);
-        assert_eq!(agy.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(agy.sandbox, SandboxPolicy::DangerFullAccess);
+        assert_eq!(agy.permission_mode, Some(PermissionMode::BypassPermissions));
     }
 
     #[test]
@@ -1655,6 +1660,34 @@ mod tests {
     }
 
     #[test]
+    fn default_children_have_full_access_on_every_backend() {
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Grok,
+            BackendKind::Agy,
+        ] {
+            let parent = main_member(backend);
+            let child = sub_agent_member(&parent, &spawn("helper")).unwrap();
+            assert_eq!(child.sandbox, SandboxPolicy::DangerFullAccess);
+            assert_eq!(child.permission_mode, parent.permission_mode);
+            assert_eq!(child.approvals_reviewer, parent.approvals_reviewer);
+        }
+    }
+
+    #[test]
+    fn explicit_parent_permissions_are_preserved_for_children() {
+        let mut parent = main_member(BackendKind::Codex);
+        parent
+            .apply_codex_permissions_preset(crate::domain::team::CodexPermissionsPreset::ReadOnly);
+        let child = sub_agent_member(&parent, &spawn("helper")).unwrap();
+        assert_eq!(
+            child.codex_permissions_preset(),
+            Some(crate::domain::team::CodexPermissionsPreset::ReadOnly)
+        );
+    }
+
+    #[test]
     fn sub_agent_on_another_backend_takes_that_backends_defaults() {
         let mut parent = main_member(BackendKind::Claude);
         parent.model = Some("opus".to_string());
@@ -1669,7 +1702,7 @@ mod tests {
         assert_eq!(child.effort, Some(Effort::Max));
         assert_eq!(
             child.codex_permissions_preset(),
-            Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+            Some(crate::domain::team::CodexPermissionsPreset::FullAccess)
         );
     }
 

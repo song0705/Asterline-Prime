@@ -23,6 +23,8 @@ Asterline 把各厂商官方 CLI 的原生事件汇进同一块工作台：消�
 
 [安装](#安装) · [开始使用](#开始使用) · [工作模式](#工作模式) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline-Prime/releases/latest)
 
+新建成员和新聊天默认使用全权限：Codex 为 `Full Access`，Claude 为 `bypassPermissions`，Grok 为关闭沙箱的 `always-approve`，Agy 为关闭沙箱的 `dangerously-skip-permissions`。同后端子 Agent 继承主 Agent 的权限；已有显式配置保留，可在 `/team` 中调整。
+
 ## 安装
 
 Asterline 支持 macOS、Linux 和 Windows 10/11。它只调度本机 CLI，不会替你安装或登录 Codex、Claude、Grok、Agy。先保证至少有一个已经装好并登录。

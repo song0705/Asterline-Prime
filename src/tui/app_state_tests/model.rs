@@ -547,7 +547,10 @@ fn backend_change_takes_that_clis_defaults_and_a_fresh_session() {
     // (the lowest level the model offers) is what is saved.
     assert_eq!(builder.effort, Some(Effort::High));
     assert_eq!(builder.session_id, None);
-    assert_eq!(builder.permission_mode, Some(PermissionMode::AcceptEdits));
+    assert_eq!(
+        builder.permission_mode,
+        Some(PermissionMode::BypassPermissions)
+    );
     assert_eq!(builder.id, MemberId::new("builder"));
     assert_eq!(builder.display_name, "Builder");
     assert_eq!(builder.role, "role");

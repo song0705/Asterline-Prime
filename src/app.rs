@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(main.effort, None);
         assert_eq!(
             main.permission_mode,
-            Some(crate::domain::team::PermissionMode::AcceptEdits)
+            Some(crate::domain::team::PermissionMode::BypassPermissions)
         );
         let reloaded = load_team_config(&saved).expect("saved team loads");
         assert_eq!(reloaded.members.len(), 1);

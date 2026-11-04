@@ -173,7 +173,7 @@ fn spawn_overrides_backend_model_and_effort() {
     // A different backend gets its own default permission preset, not main's.
     assert_eq!(
         child.codex_permissions_preset(),
-        Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+        Some(crate::domain::team::CodexPermissionsPreset::FullAccess)
     );
 }
 
@@ -1578,7 +1578,7 @@ fn respawn_to_another_backend_starts_a_fresh_session_with_that_backends_defaults
     assert_eq!(child.session_id, None);
     assert_eq!(
         child.codex_permissions_preset(),
-        Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+        Some(crate::domain::team::CodexPermissionsPreset::FullAccess)
     );
 }
 

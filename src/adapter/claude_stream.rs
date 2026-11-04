@@ -520,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn default_claude_member_passes_accept_edits() {
+    fn default_claude_member_bypasses_permissions() {
         let member = crate::domain::config::default_member(BackendKind::Claude);
         let adapter = ClaudeStreamAdapter::from_member(&member, Path::new("/tmp/ws"));
         let command = adapter.build_command("hello", None, None);
@@ -528,7 +528,7 @@ mod tests {
             command
                 .args
                 .windows(2)
-                .any(|w| w == ["--permission-mode", "acceptEdits"])
+                .any(|w| w == ["--permission-mode", "bypassPermissions"])
         );
     }
 
