@@ -1,3 +1,5 @@
+> Prime 1.0.6：Homebrew 在 macOS/Linux 安装 Intel/ARM 预编译包。Linux 要求 glibc 2.39 或更高（Ubuntu 24.04 或同等环境）。下文原生安装器及 glibc 2.28 保证来自继承的 Asterline 发布流程，不适用于 Prime 便携包。
+
 # 安装 Asterline
 
 [English](installation.md)
