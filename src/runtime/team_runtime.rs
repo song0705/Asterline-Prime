@@ -1706,8 +1706,8 @@ impl TeamRuntime {
     }
 
     /// Carry the conversation's sub-agents across a roster edit that only
-    /// knows the top-level members (the `/team` editor). A sub-agent the edit
-    /// does mention (a `/model` change) is taken as given.
+    /// knows the top-level members. A sub-agent the edit does mention
+    /// (from `/team` or `/model`) is taken as given.
     fn with_existing_sub_agents(&self, mut members: Vec<TeamMember>) -> Vec<TeamMember> {
         let mentioned: HashSet<MemberId> = members.iter().map(|member| member.id.clone()).collect();
         let previous = strip_team_protocols(self.config.clone());

@@ -583,7 +583,14 @@ fn drawer_team_editor(
                 },
             ),
             Span::styled(
-                pad_width(&member.display_name, EDITOR_COLUMNS[0] - 3),
+                pad_width(
+                    &if member.parent.is_some() {
+                        format!("↳ {}", member.display_name)
+                    } else {
+                        member.display_name.clone()
+                    },
+                    EDITOR_COLUMNS[0] - 3,
+                ),
                 row_style,
             ),
             sep,
@@ -597,6 +604,18 @@ fn drawer_team_editor(
         && let Some(member) = editor.selected_member()
     {
         lines.push(Line::raw(""));
+        if let Some(parent) = &member.parent {
+            let parent_name = editor
+                .members()
+                .iter()
+                .find(|candidate| &candidate.id == parent)
+                .map(|candidate| candidate.display_name.as_str())
+                .unwrap_or(parent.as_str());
+            lines.push(Line::styled(
+                format!(" Sub-agent of {parent_name} · saved with this chat"),
+                theme::muted(),
+            ));
+        }
         lines.push(Line::from(Span::styled(
             " Selected member fields",
             theme::accent_bold(),

@@ -888,6 +888,46 @@ fn team_json_never_receives_sub_agents() {
 }
 
 #[test]
+fn edited_child_settings_are_saved_with_the_chat_and_busy_edits_are_rejected() {
+    let mut rt = spawn_runtime();
+    main_replies(&mut rt, &spawn_line("reviewer", ""));
+    let original = strip_team_protocols(rt.config.clone());
+    let mut edited = original.members.clone();
+    let child = edited
+        .iter_mut()
+        .find(|member| member.id == id("reviewer"))
+        .unwrap();
+    child.model = Some("sonnet".to_string());
+    child.effort = Some(Effort::Low);
+    child.permission_mode = Some(PermissionMode::AcceptEdits);
+    child.display_name = "Researcher".to_string();
+    let expected = child.clone();
+    let rejected = rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: edited.clone(),
+        default_target: original.default_target.clone(),
+    });
+    assert!(rejected.persist_team.is_none());
+    assert_eq!(
+        rt.config.member(&id("reviewer")).unwrap().model,
+        original.member(&id("reviewer")).unwrap().model
+    );
+    complete_ok(&mut rt, &id("reviewer"), "done");
+    complete_ok(&mut rt, &main_id(), "received");
+    let applied = rt.on_ui_command(UiCommand::ReplaceTeam {
+        members: edited,
+        default_target: original.default_target,
+    });
+    let launch = applied.persist_team.expect("saved launch roster");
+    assert!(launch.member(&id("reviewer")).is_none());
+    let restored = rt.store.restore_active_team_config(&launch).unwrap();
+    assert_eq!(restored.member(&id("reviewer")), Some(&expected));
+    assert_eq!(
+        restored.member(&main_id()).unwrap().model.as_deref(),
+        Some("opus")
+    );
+}
+
+#[test]
 fn team_editor_replace_keeps_children_and_drops_those_of_a_removed_parent() {
     let mut rt = spawn_runtime();
     rt.config.max_auto_relays = 100;

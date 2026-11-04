@@ -610,18 +610,31 @@ impl TeamEditor {
     }
 
     fn delete_member(&mut self) {
-        if self.members.len() <= 1 {
-            self.notice = Some("team needs at least one member".to_string());
+        let Some(selected) = self.selected_member() else {
+            return;
+        };
+        if selected.parent.is_some() {
+            self.notice = Some("remove sub-agents from Agents with Ctrl+X".to_string());
             return;
         }
-        self.members.remove(self.selected);
-        if self.selected >= self.members.len() {
-            self.selected = self.members.len() - 1;
+        if self
+            .members
+            .iter()
+            .filter(|member| member.parent.is_none())
+            .count()
+            <= 1
+        {
+            self.notice = Some("team needs at least one top-level member".to_string());
+            return;
         }
+        let removed = selected.id.clone();
+        self.members
+            .retain(|member| member.id != removed && member.parent.as_ref() != Some(&removed));
+        self.selected = self.selected.min(self.members.len() - 1);
         self.normalize_field();
         self.ensure_default_target();
         self.dirty = true;
-        self.notice = Some("member removed; press s to apply".to_string());
+        self.notice = Some("member and its sub-agents removed; press s to apply".to_string());
     }
 
     fn activate_field(&mut self) {
@@ -801,9 +814,21 @@ impl TeamEditor {
                     let display_name =
                         unique_display_name_except(value, &self.members, Some(self.selected));
                     let id = unique_member_id(&display_name, &self.members, Some(self.selected));
+                    // Keep conversation identities stable: a renamed child
+                    // must not be added beside its previous id, and a renamed
+                    // parent must keep its children's references valid.
+                    let keep_id = self.selected_member().is_some_and(|member| {
+                        member.parent.is_some()
+                            || self
+                                .members
+                                .iter()
+                                .any(|child| child.parent.as_ref() == Some(&member.id))
+                    });
                     if let Some(member) = self.selected_member_mut() {
                         member.display_name = display_name;
-                        member.id = MemberId::new(normalize_member_id(&id, fallback));
+                        if !keep_id {
+                            member.id = MemberId::new(normalize_member_id(&id, fallback));
+                        }
                     }
                     if let (Some(old_id), Some(member)) = (old_id, self.selected_member())
                         && matches!(
@@ -1113,6 +1138,60 @@ mod tests {
         })
         .unwrap();
         editor.poll_agent_catalog();
+    }
+
+    fn editor_with_child() -> TeamEditor {
+        let mut editor = editor();
+        let mut child = TeamMember::new("scout", "Scout", BackendKind::Codex, "research");
+        child.parent = Some(editor.members[0].id.clone());
+        editor.members.push(child);
+        editor
+    }
+
+    #[test]
+    fn child_settings_and_name_edits_keep_the_conversation_identity() {
+        let mut editor = editor_with_child();
+        editor.selected = 1;
+        editor.commit_edit(EditState::new(Field::Name, "Researcher".to_string()));
+        editor.commit_edit(EditState::new(Field::Model, "gpt-test".to_string()));
+        let Some(UiCommand::ReplaceTeam { members, .. }) = editor.apply_command() else {
+            panic!("expected child settings update");
+        };
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[1].id.as_str(), "scout");
+        assert_eq!(members[1].display_name, "Researcher");
+        assert_eq!(members[1].model.as_deref(), Some("gpt-test"));
+        assert_eq!(members[1].parent.as_ref(), Some(&members[0].id));
+        assert_eq!(members[0].model, None);
+    }
+
+    #[test]
+    fn parent_rename_preserves_children_and_last_parent_cannot_be_removed() {
+        let mut editor = editor_with_child();
+        editor.commit_edit(EditState::new(Field::Name, "Lead".to_string()));
+        assert_eq!(editor.members[0].id.as_str(), "builder");
+        assert_eq!(
+            editor.members[1].parent.as_ref(),
+            Some(&editor.members[0].id)
+        );
+        editor.delete_member();
+        assert_eq!(editor.members.len(), 2);
+        editor.selected = 1;
+        editor.delete_member();
+        assert_eq!(editor.members.len(), 2);
+        assert!(editor.notice().unwrap().contains("Ctrl+X"));
+        assert!(editor.apply_command().is_some());
+    }
+
+    #[test]
+    fn deleting_a_parent_removes_its_children_from_the_draft() {
+        let mut editor = editor_with_child();
+        editor.add_member();
+        editor.selected = 0;
+        editor.delete_member();
+        assert_eq!(editor.members.len(), 1);
+        assert!(editor.members[0].parent.is_none());
+        assert!(editor.apply_command().is_some());
     }
 
     #[test]

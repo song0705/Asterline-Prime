@@ -1260,7 +1260,7 @@ fn model_change_on_a_viewed_sub_agent_edits_only_that_sub_agent() {
 }
 
 #[test]
-fn team_editor_lists_top_level_members_only() {
+fn team_editor_includes_children_and_preserves_their_parent() {
     use super::focus::child_summary;
     let mut state = AppState::new(Vec::new());
     state.apply(ready_with(
@@ -1281,7 +1281,16 @@ fn team_editor_lists_top_level_members_only() {
 
     let editor = state.team_editor().expect("editor");
     let ids: Vec<&str> = editor.members().iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["builder", "reviewer"]);
+    assert_eq!(ids, ["builder", "scout", "reviewer"]);
+    assert_eq!(editor.members()[1].parent, Some(MemberId::new("builder")));
+    let crate::tui::team_editor::TeamEditorOutcome::Consumed(Some(command)) =
+        state.handle_team_editor_key(KeyCode::Char('s'), KeyModifiers::NONE)
+    else {
+        panic!("expected live roster update");
+    };
+    let members = command_members(command);
+    assert_eq!(members[1].id.as_str(), "scout");
+    assert_eq!(members[1].parent, Some(MemberId::new("builder")));
 }
 
 #[test]

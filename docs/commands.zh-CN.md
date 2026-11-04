@@ -359,6 +359,8 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 
 ### `/team`
 
+编辑器会列出当前聊天的子 Agent，并以 `↳` 标记。选中后可修改模型、推理强度、后端、权限或会话，再按 `s` 保存。子 Agent 配置随当前聊天保存，`/resume` 时恢复，不写入 `team.json` 的启动默认配置。正在运行的 Agent 需等任务结束后才能应用修改；重命名会保留父子关系。删除子 Agent 请在 Agents 面板使用 `Ctrl+X`。
+
 ```text
 /team
 ```

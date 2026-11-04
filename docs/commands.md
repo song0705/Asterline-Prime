@@ -434,6 +434,8 @@ pending, Asterline reports that there is nothing to reject.
 
 ### `/team`
 
+The editor includes the current chat’s sub-agents, marked with `↳`. Select one to edit its model, effort, backend, permissions, or session, then press `s` to save. Child settings are stored with the chat and restored by `/resume`; they are not launch defaults in `team.json`. Wait for an active agent to finish before applying changes. Rename preserves parent/child identities. Remove a child from the Agents view with `Ctrl+X`.
+
 ```text
 /team
 ```

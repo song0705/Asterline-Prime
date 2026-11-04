@@ -3945,11 +3945,11 @@ impl AppState {
     }
 
     fn open_team_editor(&mut self) {
-        // The editor owns the top-level roster; sub-agents belong to the chat.
+        // Edit the live roster, including children. The runtime persists
+        // children in the conversation snapshot, not the launch team.json.
         let members = self
             .members
             .iter()
-            .filter(|view| view.parent.is_none())
             .map(|view| self.view_to_member(view))
             .collect();
         let model_catalog = std::mem::take(&mut self.model_catalog);
