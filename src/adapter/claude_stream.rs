@@ -1134,7 +1134,8 @@ printf '%s\n' '{REPLAY_FIRST}'
 read -r second
 # The first turn ends before the injected message was consumed.
 printf '%s\n' '{RESULT}'
-read -t 0.7 _ ; echo "$?" > {marker}
+SECONDS=0
+read -t 2 _ ; printf '%s %s\n' "$?" "$SECONDS" > {marker}
 printf '%s\n' '{REPLAY_STEER}'
 printf '%s\n' '{RESULT}'
 cat > /dev/null
@@ -1150,16 +1151,17 @@ cat > /dev/null
                 }),
                 "{events:?}"
             );
-            // `read -t` timing out (status above 128) means stdin was still
-            // open after the first result; EOF would have given status 1.
-            let status: i32 = std::fs::read_to_string(fixture.dir.join(marker))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            // Bash 3.2 on macOS returns 1 for both timeout and EOF. Check
+            // elapsed time too, so early EOF still fails on every platform.
+            let marker = std::fs::read_to_string(fixture.dir.join(marker)).unwrap();
+            let values: Vec<u32> = marker
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert_eq!(values.len(), 2, "{marker}");
             assert!(
-                status > 128,
-                "stdin closed too early (read status {status})"
+                values[0] > 128 || (values[0] == 1 && values[1] >= 2),
+                "stdin closed too early (status and elapsed seconds: {marker})"
             );
         }
 

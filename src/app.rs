@@ -958,6 +958,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("db.sqlite3");
+        let team_path = state_paths::team_config_path(&dir);
+        std::fs::create_dir_all(team_path.parent().unwrap()).unwrap();
+        runtime::save_team_config(&team_path, &codex_only_team(&dir)).unwrap();
 
         let mut active = Vec::new();
         for _ in 0..2 {
@@ -1418,6 +1421,9 @@ mod tests {
         let moved_workspace = root.join("moved-location");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&previous_workspace).unwrap();
+        // Resolve the same canonical path when saving and loading the roster
+        // (macOS /var is a symlink; Windows canonical paths include a drive).
+        std::fs::create_dir_all(&moved_workspace).unwrap();
         std::fs::create_dir_all(state_paths::project_dir(&moved_workspace)).unwrap();
 
         let team = crate::domain::config::default_team(

@@ -240,6 +240,7 @@ fn short_hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn ascii_paths_are_munged_like_claude_code() {
         assert_eq!(
@@ -249,26 +250,52 @@ mod tests {
         assert_eq!(project_key(Path::new("/tmp/a b.c/d-e")), "-tmp-a-b-c-d-e");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_keep_the_drive_in_the_key() {
+        assert_eq!(
+            project_key(Path::new(r"C:\home\pys\Pj\my_test\RM")),
+            "C--home-pys-Pj-my_test-RM"
+        );
+        assert_eq!(
+            project_key(Path::new("C:/tmp/a b.c/d-e")),
+            "C--tmp-a-b-c-d-e"
+        );
+    }
+
     #[test]
     fn non_ascii_paths_get_a_stable_hash_suffix() {
-        let first = project_key(Path::new("/home/pys/项目/甲"));
-        let second = project_key(Path::new("/home/pys/项目/乙"));
+        let (path, other, prefix) = if cfg!(windows) {
+            (
+                r"C:\home\pys\项目\甲",
+                r"C:\home\pys\项目\乙",
+                "C--home-pys-",
+            )
+        } else {
+            ("/home/pys/项目/甲", "/home/pys/项目/乙", "-home-pys-")
+        };
+        let first = project_key(Path::new(path));
+        let second = project_key(Path::new(other));
         assert_ne!(first, second, "different folders must not share a key");
-        assert_eq!(first, project_key(Path::new("/home/pys/项目/甲")));
-        // Both would munge to `-home-pys-----` without the hash.
-        assert!(first.starts_with("-home-pys-"), "{first}");
+        assert_eq!(first, project_key(Path::new(path)));
+        assert!(first.starts_with(prefix), "{first}");
         let (_, hash) = first.rsplit_once('-').unwrap();
         assert_eq!(hash.len(), 8);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         // The exact value is part of the on-disk layout: it must never change.
-        assert_eq!(short_hash("/home/pys/项目/甲".as_bytes()), hash);
+        assert_eq!(short_hash(path.as_bytes()), hash);
         assert_eq!(short_hash(b"abc"), "ba7816bf");
     }
 
     #[test]
     fn ascii_keys_carry_no_hash_and_long_keys_are_bounded() {
-        assert!(!project_key(Path::new("/tmp/plain")).contains("--"));
-        let long = format!("/tmp/{}", "x".repeat(400));
+        let (root, expected) = if cfg!(windows) {
+            ("C:/tmp", "C--tmp-plain")
+        } else {
+            ("/tmp", "-tmp-plain")
+        };
+        assert_eq!(project_key(Path::new(&format!("{root}/plain"))), expected);
+        let long = format!("{root}/{}", "x".repeat(400));
         let key = project_key(Path::new(&long));
         assert!(key.len() <= MAX_KEY_LEN + 9, "{}", key.len());
         assert_ne!(key, project_key(Path::new(&format!("{long}y"))));
