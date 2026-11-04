@@ -72,9 +72,9 @@ upstream release does not yet publish a vendored dependency archive.
 Starting with v0.2.6, each Linux architecture uses the same visible asset
 prefix, modeled after the established `Linux-arm64` / `Linux-x86_64` layout:
 
-| CPU architecture | Portable archive | Debian / Ubuntu | RPM Linux |
-| --- | --- | --- | --- |
-| ARM64 | `asterline-v<version>-Linux-arm64.tar.gz` | `asterline-v<version>-Linux-arm64.deb` | `asterline-v<version>-Linux-arm64.rpm` |
+| CPU architecture              | Portable archive                           | Debian / Ubuntu                         | RPM Linux                               |
+| ----------------------------- | ------------------------------------------ | --------------------------------------- | --------------------------------------- |
+| ARM64                         | `asterline-v<version>-Linux-arm64.tar.gz`  | `asterline-v<version>-Linux-arm64.deb`  | `asterline-v<version>-Linux-arm64.rpm`  |
 | Intel / AMD 64-bit (`x86_64`) | `asterline-v<version>-Linux-x86_64.tar.gz` | `asterline-v<version>-Linux-x86_64.deb` | `asterline-v<version>-Linux-x86_64.rpm` |
 
 The workflow builds Debian packages from the already verified GNU/Linux

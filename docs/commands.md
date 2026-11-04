@@ -495,13 +495,13 @@ than two levels shows nothing and `←`/`→` do nothing for it. When the list
 scrolls, a `(3/12)` row shows the position among the models (headings are not
 counted).
 
-| Key                   | Action                                              |
-| --------------------- | --------------------------------------------------- |
-| Type / `Backspace`    | Search backend, model ID, and model name            |
-| `↑` / `↓`             | Select a model (the mouse wheel does the same)      |
-| `←` / `→`             | Change the highlighted model's effort level         |
-| `Enter`               | Apply to the target agent and close                 |
-| `Esc`                 | Close without changing anything                     |
+| Key                | Action                                         |
+| ------------------ | ---------------------------------------------- |
+| Type / `Backspace` | Search backend, model ID, and model name       |
+| `↑` / `↓`          | Select a model (the mouse wheel does the same) |
+| `←` / `→`          | Change the highlighted model's effort level    |
+| `Enter`            | Apply to the target agent and close            |
+| `Esc`              | Close without changing anything                |
 
 Applying always pins the chosen model id in the agent's `model`. An `effort` is
 saved only if you changed it with `←`/`→` on that row; the agent's current
@@ -923,34 +923,34 @@ queued message. If that queued text has not started yet and you want to
 change it, `Shift+←` pulls it back into the composer. The current
 conversation can be scrolled all the way to its first message.
 
-| Key                            | Action                                                        |
-| ------------------------------ | ------------------------------------------------------------- |
-| `Enter`                        | Send or accept the active selection                           |
-| `Shift+Enter`                  | Insert a newline                                              |
-| `Alt+Enter`                    | Newline fallback for terminals without distinct Shift+Enter   |
-| `↑` / `↓`                      | Move in composer, history, or active selection                |
-| `Tab`                          | Accept completion                                             |
-| `Ctrl+R`                       | Reverse-search prompt history (in the Agents list: rename)    |
-| `Ctrl+X` (Agents list)         | Press twice to delete a saved chat or remove a sub-agent      |
-| `n` / `p`                      | Next/previous `/find` match when composer is empty            |
-| `PageUp` / `PageDown`          | Scroll chat or the open drawer by a page                      |
-| `←` (empty composer)           | Open the Agents list (members, sub-agents, saved chats)       |
-| `Shift+←`                      | Pull the last queued, not-yet-started message back to edit    |
-| Mouse drag                     | Select and copy chat, composer, status-bar, or drawer text    |
-| Click a tool group title       | Fold or unfold that tool group                                |
-| Mouse wheel                    | Scroll chat or the open drawer                                |
-| `Esc`                          | Close overlay/find, or stop work and send the queued message  |
-| `Ctrl+T`                       | Expand or collapse thinking                                   |
-| `Ctrl+G`                       | Expand or collapse file-change diffs                          |
-| `Ctrl+O`                       | Show full tool output and open every tool group (toggle)      |
-| `Ctrl+L`                       | Open logs                                                     |
-| `Ctrl+P`                       | Open command palette                                          |
-| `Ctrl+N`                       | New chat (inside the Agents list)                             |
-| `Ctrl+A` / `Ctrl+E`            | Move to line start/end                                        |
-| `Ctrl+U` / `Cmd+Backspace`     | Clear the current composer line (other lines stay)            |
-| `Ctrl+W`                       | Delete previous word                                          |
-| `Ctrl+C`                       | Copy chat/composer selection; else cancel, clear, or arm quit |
-| `Ctrl+V` / `Cmd+V`             | Attach a clipboard image to the next send (not Ctrl+C)        |
+| Key                        | Action                                                        |
+| -------------------------- | ------------------------------------------------------------- |
+| `Enter`                    | Send or accept the active selection                           |
+| `Shift+Enter`              | Insert a newline                                              |
+| `Alt+Enter`                | Newline fallback for terminals without distinct Shift+Enter   |
+| `↑` / `↓`                  | Move in composer, history, or active selection                |
+| `Tab`                      | Accept completion                                             |
+| `Ctrl+R`                   | Reverse-search prompt history (in the Agents list: rename)    |
+| `Ctrl+X` (Agents list)     | Press twice to delete a saved chat or remove a sub-agent      |
+| `n` / `p`                  | Next/previous `/find` match when composer is empty            |
+| `PageUp` / `PageDown`      | Scroll chat or the open drawer by a page                      |
+| `←` (empty composer)       | Open the Agents list (members, sub-agents, saved chats)       |
+| `Shift+←`                  | Pull the last queued, not-yet-started message back to edit    |
+| Mouse drag                 | Select and copy chat, composer, status-bar, or drawer text    |
+| Click a tool group title   | Fold or unfold that tool group                                |
+| Mouse wheel                | Scroll chat or the open drawer                                |
+| `Esc`                      | Close overlay/find, or stop work and send the queued message  |
+| `Ctrl+T`                   | Expand or collapse thinking                                   |
+| `Ctrl+G`                   | Expand or collapse file-change diffs                          |
+| `Ctrl+O`                   | Show full tool output and open every tool group (toggle)      |
+| `Ctrl+L`                   | Open logs                                                     |
+| `Ctrl+P`                   | Open command palette                                          |
+| `Ctrl+N`                   | New chat (inside the Agents list)                             |
+| `Ctrl+A` / `Ctrl+E`        | Move to line start/end                                        |
+| `Ctrl+U` / `Cmd+Backspace` | Clear the current composer line (other lines stay)            |
+| `Ctrl+W`                   | Delete previous word                                          |
+| `Ctrl+C`                   | Copy chat/composer selection; else cancel, clear, or arm quit |
+| `Ctrl+V` / `Cmd+V`         | Attach a clipboard image to the next send (not Ctrl+C)        |
 
 Screenshots and copied images are copied under the process temp directory
 (`std::env::temp_dir()/asterline-pasted/<pid>/`: `%TEMP%` on Windows, `$TMPDIR`
@@ -992,17 +992,17 @@ folded. `⇄ agents` groups are not folded.
 
 The Team editor has member-selection and field-selection levels.
 
-| Key       | Member selection                            | Field selection                          |
-| --------- | ------------------------------------------- | ---------------------------------------- |
-| `↑` / `↓` | Select a member                             | Select a field or model                  |
-| `←` / `→` | —                                           | Select effort in the model list          |
-| `Enter`   | Open member fields                          | Edit or open Agent/model/session picker  |
-| `Esc`     | Close Team                                  | Return to member selection               |
-| `a` / `d` | Add/delete a member                         | —                                        |
-| `t`       | —                                           | Retry failed Model catalog               |
-| `y`       | Copy the session ID                         | Copy the field value                     |
-| `s`       | Apply and save                              | Apply and save                           |
-| `e`       | —                                           | Manually enter model or session ID       |
+| Key       | Member selection    | Field selection                         |
+| --------- | ------------------- | --------------------------------------- |
+| `↑` / `↓` | Select a member     | Select a field or model                 |
+| `←` / `→` | —                   | Select effort in the model list         |
+| `Enter`   | Open member fields  | Edit or open Agent/model/session picker |
+| `Esc`     | Close Team          | Return to member selection              |
+| `a` / `d` | Add/delete a member | —                                       |
+| `t`       | —                   | Retry failed Model catalog              |
+| `y`       | Copy the session ID | Copy the field value                    |
+| `s`       | Apply and save      | Apply and save                          |
+| `e`       | —                   | Manually enter model or session ID      |
 
 The keys for the current level are listed once, in the last row of the editor.
 Text fields open in a focused input box. Press `Enter` to commit or `Esc` to
@@ -1022,15 +1022,15 @@ entry because Asterline has no verified local Agy history format.
 
 ## Runs drawer
 
-| Key                   | Action                                                       |
-| --------------------- | ------------------------------------------------------------ |
-| `←` / `→`             | Select older/newer run                                       |
-| `↑` / `↓`             | Select checklist step; select run when no step exists        |
-| `x`                   | Toggle compact/detail view                                   |
-| `Enter`               | Stage selected step status or run next action in composer    |
-| `Tab`                 | Stage editable dispatch to selected step owner               |
-| `PageUp` / `PageDown` | Scroll details                                               |
-| `Esc`                 | Close drawer                                                 |
+| Key                   | Action                                                    |
+| --------------------- | --------------------------------------------------------- |
+| `←` / `→`             | Select older/newer run                                    |
+| `↑` / `↓`             | Select checklist step; select run when no step exists     |
+| `x`                   | Toggle compact/detail view                                |
+| `Enter`               | Stage selected step status or run next action in composer |
+| `Tab`                 | Stage editable dispatch to selected step owner            |
+| `PageUp` / `PageDown` | Scroll details                                            |
+| `Esc`                 | Close drawer                                              |
 
 `Enter` and `Tab` stage text in the composer; they do not execute it
 immediately. Changing runs clears the selected step. To cancel active work,

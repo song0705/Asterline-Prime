@@ -62,9 +62,9 @@ registry 访问，因为上游 Release 还未发布 vendored dependency archive�
 自 v0.2.6 起，每种 Linux 架构都使用一致、可见的资产前缀，参考成熟的
 `Linux-arm64` / `Linux-x86_64` 布局：
 
-| CPU 架构 | 便携归档 | Debian / Ubuntu | RPM Linux |
-| --- | --- | --- | --- |
-| ARM64 | `asterline-v<version>-Linux-arm64.tar.gz` | `asterline-v<version>-Linux-arm64.deb` | `asterline-v<version>-Linux-arm64.rpm` |
+| CPU 架构                      | 便携归档                                   | Debian / Ubuntu                         | RPM Linux                               |
+| ----------------------------- | ------------------------------------------ | --------------------------------------- | --------------------------------------- |
+| ARM64                         | `asterline-v<version>-Linux-arm64.tar.gz`  | `asterline-v<version>-Linux-arm64.deb`  | `asterline-v<version>-Linux-arm64.rpm`  |
 | Intel / AMD 64 位（`x86_64`） | `asterline-v<version>-Linux-x86_64.tar.gz` | `asterline-v<version>-Linux-x86_64.deb` | `asterline-v<version>-Linux-x86_64.rpm` |
 
 workflow 从已验证的 GNU/Linux 归档构建 Debian 包，用 `dpkg-shlibdeps` 推导运行时依赖，

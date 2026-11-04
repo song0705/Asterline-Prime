@@ -34,7 +34,7 @@ Asterline supports macOS, Linux, and Windows 10/11. It coordinates provider CLIs
 | macOS    | Open `asterline-<version>-macos-universal.dmg` and run `Install Asterline.pkg`              |
 | Windows  | Run `asterline-<version>-x86_64-windows-setup.exe`                                          |
 | Linux    | Choose `asterline-v<version>-Linux-x86_64` or `Linux-arm64` as `.tar.gz`, `.deb`, or `.rpm` |
-| Homebrew | `brew install song0705/asterline-prime/asterline`                                                 |
+| Homebrew | `brew install song0705/asterline-prime/asterline`                                           |
 
 Installers provide both `asterline` and the shorter `ast` command. Linux archives target GNU/glibc 2.28 or newer and embed SQLite; Alpine/musl is not a release target. See the [installation guide](docs/installation.md) for Homebrew, portable packages, source builds, verification, updates, and uninstall.
 
