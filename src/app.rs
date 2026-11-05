@@ -42,6 +42,10 @@ where
         println!("{}", AppConfig::help());
         return Ok(());
     }
+    if config.show_version {
+        println!("asterline {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if config.update {
         println!(
             "{}",
@@ -442,6 +446,7 @@ pub struct AppConfig {
     no_auto_update: bool,
     update: bool,
     show_help: bool,
+    show_version: bool,
 }
 
 impl AppConfig {
@@ -482,6 +487,7 @@ impl AppConfig {
                 "--no-auto-update" => config.no_auto_update = true,
                 "--update" => config.update = true,
                 "-h" | "--help" => config.show_help = true,
+                "-v" | "--version" => config.show_version = true,
                 _ if arg.starts_with("--team=") => {
                     config.team_path = Some(arg["--team=".len()..].into())
                 }
@@ -529,6 +535,7 @@ impl AppConfig {
          \x20 update              Update via Windows Setup or an owning Homebrew Formula.\n\
          \x20 --update            Backward-compatible alias for `update`.\n\
          \x20 --no-auto-update    Skip the Windows installer update check.\n\
+         \x20 -v, --version       Show the version and exit.\n\
          \x20 -h, --help          Show this help.\n\
          \n\
          With no --team, Asterline starts a chat with one `main` agent on the first\n\

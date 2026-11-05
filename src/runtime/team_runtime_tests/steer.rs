@@ -198,20 +198,189 @@ fn engine_dispatch_without_a_sender_is_queued_even_in_the_same_turn() {
 }
 
 #[test]
-fn agent_message_from_a_different_turn_is_queued() {
+fn agent_message_from_a_different_turn_joins_the_live_run_and_keeps_its_turn_active() {
     let mut rt = runtime();
     let (steer, turn) = busy_builder(&mut rt);
+    let other = TurnId(turn.0 + 100);
     let mut step = RuntimeStep::default();
     rt.enqueue_prompt_from(
         &builder(),
-        TurnId(turn.0 + 100),
-        "other conversation".into(),
+        other,
+        "late result".into(),
         Some(reviewer()),
         &mut step,
     );
+    assert_eq!(queue_len(&rt, &builder()), 0);
+    assert_eq!(steer.try_recv().as_deref(), Some("late result"));
+    assert_eq!(steered_len(&rt, &builder()), 1);
+    assert!(rt.turn_active(other));
+    rt.check_turn_complete(other, &mut step);
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { turn } if *turn == other))
+    );
+    rt.on_agent_event(&builder(), AgentEvent::SteerDelivered);
+    assert!(
+        rt.turn_active(other),
+        "delivery must not finish the source turn early"
+    );
+    let finished = exit_ok(&mut rt, &builder());
+    assert!(!rt.turn_active(other));
+    assert!(
+        finished
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { turn } if *turn == other))
+    );
+    assert!(
+        finished.actions.is_empty(),
+        "accepted input must not be run again"
+    );
+}
+
+#[test]
+fn foreign_turn_rejected_by_the_backend_is_queued_without_losing_its_identity() {
+    let mut rt = runtime();
+    let (steer, turn) = busy_builder(&mut rt);
+    let other = TurnId(turn.0 + 100);
+    rt.enqueue_prompt_from(
+        &builder(),
+        other,
+        "late result".into(),
+        Some(reviewer()),
+        &mut RuntimeStep::default(),
+    );
+    assert_eq!(steer.try_recv().as_deref(), Some("late result"));
+    rt.on_agent_event(
+        &builder(),
+        AgentEvent::SteerRejected {
+            prompt: "late result".into(),
+        },
+    );
     assert_eq!(queue_len(&rt, &builder()), 1);
-    assert_eq!(steer.try_recv(), None);
-    assert_eq!(steered_len(&rt, &builder()), 0);
+    assert!(rt.turn_active(other));
+    let next = exit_ok(&mut rt, &builder());
+    assert!(
+        started_run(&next, &builder())
+            .prompt
+            .contains("late result")
+    );
+    assert_eq!(rt.running_turn(&builder()), Some(other));
+}
+
+#[test]
+fn unconfirmed_cross_turn_input_is_requeued_once_with_the_original_turn() {
+    let mut rt = runtime();
+    let (_steer, turn) = busy_builder(&mut rt);
+    let other = TurnId(turn.0 + 100);
+    rt.enqueue_prompt_from(
+        &builder(),
+        other,
+        "late result".into(),
+        Some(reviewer()),
+        &mut RuntimeStep::default(),
+    );
+    let next = exit_ok(&mut rt, &builder());
+    assert!(
+        started_run(&next, &builder())
+            .prompt
+            .contains("late result")
+    );
+    assert_eq!(rt.running_turn(&builder()), Some(other));
+    assert!(
+        !next
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFinished { turn } if *turn == other))
+    );
+    let done = exit_ok(&mut rt, &builder());
+    assert!(done.actions.is_empty());
+    assert_eq!(
+        done.events
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::TurnFinished { turn } if *turn == other))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn delayed_child_handback_reaches_a_parent_that_has_started_a_new_turn() {
+    for backend in [BackendKind::Codex, BackendKind::Claude] {
+        let mut config = team();
+        config
+            .members
+            .iter_mut()
+            .find(|member| member.id == builder())
+            .unwrap()
+            .backend = backend;
+        let mut rt =
+            TeamRuntime::new(config, SqliteStore::in_memory().unwrap()).with_approvals(false);
+        busy_builder(&mut rt);
+        let spawned = rt.on_agent_event(
+            &builder(),
+            AgentEvent::MessageCompleted(
+                r#"@@spawn {"name":"researcher","task":"research this"}"#.to_string(),
+            ),
+        );
+        let child = MemberId::new("researcher");
+        let _ = started_run(&spawned, &child);
+        let child_turn = rt.running_turn(&child).unwrap();
+        exit_ok(&mut rt, &builder());
+        let (parent_input, new_turn) = busy_builder(&mut rt);
+        assert_ne!(child_turn, new_turn);
+        rt.on_agent_event(
+            &child,
+            AgentEvent::MessageCompleted("first research result".to_string()),
+        );
+        let handback = exit_ok(&mut rt, &child);
+        assert_eq!(queue_len(&rt, &builder()), 0);
+        assert!(
+            parent_input
+                .try_recv()
+                .unwrap()
+                .contains("first research result")
+        );
+        assert!(!handback.events.iter().any(
+            |event| matches!(event, RuntimeEvent::TurnFinished { turn } if *turn == child_turn)
+        ));
+        rt.on_agent_event(&builder(), AgentEvent::SteerDelivered);
+        let finished = exit_ok(&mut rt, &builder());
+        assert!(finished.events.iter().any(
+            |event| matches!(event, RuntimeEvent::TurnFinished { turn } if *turn == child_turn)
+        ));
+        assert!(finished.actions.is_empty());
+    }
+}
+
+#[test]
+fn sub_agents_on_different_turns_can_message_each_other_mid_run() {
+    let mut rt = runtime();
+    busy_builder(&mut rt);
+    let spawned = rt.on_agent_event(&builder(), AgentEvent::MessageCompleted(
+        "@@spawn {\"name\":\"first\",\"task\":\"first task\"}\n@@spawn {\"name\":\"second\",\"task\":\"second task\"}".to_string()
+    ));
+    let first = MemberId::new("first");
+    let second = MemberId::new("second");
+    let first_input = started_run(&spawned, &first).steer.unwrap();
+    let original_turn = rt.running_turn(&first).unwrap();
+    rt.on_agent_event(&second, AgentEvent::MessageCompleted("done".to_string()));
+    exit_ok(&mut rt, &second);
+    rt.on_ui_command(UiCommand::UserMessage {
+        target: MessageTarget::Member(second.clone()),
+        body: "new task".to_string(),
+    });
+    assert_ne!(rt.running_turn(&second).unwrap(), original_turn);
+    rt.on_agent_event(
+        &second,
+        AgentEvent::MessageCompleted(
+            r#"@@team_message {"to":"first","body":"new finding"}"#.to_string(),
+        ),
+    );
+    assert_eq!(queue_len(&rt, &first), 0);
+    assert!(first_input.try_recv().unwrap().contains("new finding"));
 }
 
 #[test]

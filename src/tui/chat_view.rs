@@ -53,7 +53,7 @@ pub struct ChatLayout {
     pub composer_wrap: usize,
     /// Visual rows reserved above composer text (attachment chips).
     pub composer_text_origin: u16,
-    /// Clickable disclosure title rows inside the viewport, as
+    /// Clickable disclosure header and expanded-content rows inside the viewport, as
     /// `(flattened line index, disclosure target)`. The
     /// line index is content-anchored, like `first_line`, so a click maps
     /// correctly after the view has scrolled.
@@ -452,7 +452,7 @@ struct ChatPaintCache {
 }
 
 /// Visible styled lines, their plain text, the total flattened line count,
-/// and clickable disclosure titles `(line index, target)`.
+/// and clickable disclosure hit rows `(line index, target)`.
 type PaintedChat = (
     Vec<Line<'static>>,
     Vec<String>,
@@ -832,7 +832,7 @@ fn compose_scrollback(
     let mut titles = Vec::new();
     let mut index = 0usize;
     let mut live_at = 0usize;
-    // `title` identifies the disclosure header on this row, if any.
+    // `title` identifies the disclosure control on this row, if any.
     let mut emit = |line: &Line<'static>, title: Option<FoldTarget>| {
         if index >= start && visible.len() < height {
             plain.push(line_to_plain(line));
@@ -862,14 +862,15 @@ fn compose_scrollback(
             if let Some(chunk) = chunk
                 && let Some(lines) = chunk.lines.as_ref()
             {
+                // Inner controls are registered first and take precedence
+                // over the enclosing group's body. Index once per chunk.
+                let mut targets = std::collections::HashMap::new();
+                for &(line, target) in &chunk.fold_titles {
+                    targets.entry(line).or_insert(target);
+                }
                 for (offset, line) in lines.iter().enumerate() {
                     flush_live_at(origin + offset, live_at, emit);
-                    let title = chunk
-                        .fold_titles
-                        .iter()
-                        .find(|(at, _)| *at == offset)
-                        .map(|(_, key)| *key);
-                    emit(line, title);
+                    emit(line, targets.get(&offset).copied());
                 }
             } else if let Some(chunk) = chunk {
                 for offset in 0..chunk.height {
@@ -1697,8 +1698,14 @@ fn render_tool_group(
             format!("  {fold}{marker} tools"),
             title_style,
         )]));
+        let body_start = out.len();
         for item in tools {
             render_anchored_tool_row(item, width, state, out, &mut anchor);
+        }
+        if let (Some(anchor), Some(key)) = (anchor.as_mut(), key) {
+            anchor
+                .titles
+                .extend((body_start..out.len()).map(|line| (line, FoldTarget::Tools(key))));
         }
         return;
     }
@@ -1767,9 +1774,15 @@ fn render_anchored_tool_row(
         || state.tools_expanded(),
         |target| state.fold_expanded(target),
     );
+    let body_start = out.len() + 1;
     let footer = render_tool_row(name, summary, detail, *ok, width, expanded, out);
     if let (Some(anchor), Some(target), Some(line)) = (anchor.as_mut(), target, footer) {
         anchor.titles.push((line, target));
+    }
+    if expanded && let (Some(anchor), Some(target)) = (anchor.as_mut(), target) {
+        anchor
+            .titles
+            .extend((body_start..out.len()).map(|line| (line, target)));
     }
 }
 
@@ -2052,7 +2065,7 @@ fn render_file_changes(
     ok: bool,
     width: usize,
     out: &mut Vec<Line<'static>>,
-    anchor: Option<ToolGroupAnchor<'_>>,
+    mut anchor: Option<ToolGroupAnchor<'_>>,
 ) {
     let (marker, title_style) = if ok {
         ("✎", theme::accent_bold())
@@ -2063,7 +2076,7 @@ fn render_file_changes(
         || state.diffs_expanded(),
         |a| state.fold_expanded(FoldTarget::Diff(a.first_index)),
     );
-    if let Some(anchor) = anchor {
+    if let Some(anchor) = anchor.as_mut() {
         anchor
             .titles
             .push((out.len(), FoldTarget::Diff(anchor.first_index)));
@@ -2094,6 +2107,7 @@ fn render_file_changes(
             theme::muted_italic(),
         ),
     ]));
+    let body_start = out.len();
     for (index, file) in files.iter().enumerate() {
         if index > 0 {
             out.push(Line::from(vec![Span::raw(" "), Span::raw("")]));
@@ -2157,6 +2171,11 @@ fn render_file_changes(
                 theme::muted_italic(),
             )]));
         }
+    }
+    if let Some(anchor) = anchor {
+        anchor.titles.extend(
+            (body_start..out.len()).map(|line| (line, FoldTarget::Diff(anchor.first_index))),
+        );
     }
 }
 
@@ -2560,7 +2579,7 @@ fn render_item(
     state: &AppState,
     out: &mut Vec<Line<'static>>,
     show_sender_header: bool,
-    anchor: Option<ToolGroupAnchor<'_>>,
+    mut anchor: Option<ToolGroupAnchor<'_>>,
 ) {
     if show_sender_header
         && !matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
@@ -2640,7 +2659,7 @@ fn render_item(
                 || state.thinking_expanded(),
                 |a| state.fold_expanded(FoldTarget::Thinking(a.first_index)),
             );
-            if let Some(anchor) = anchor {
+            if let Some(anchor) = anchor.as_mut() {
                 anchor
                     .titles
                     .push((out.len(), FoldTarget::Thinking(anchor.first_index)));
@@ -2662,11 +2681,18 @@ fn render_item(
                     theme::muted_italic(),
                 ),
             ]));
+            let body_start = out.len();
             for line in markdown::wrap(text.trim(), width.saturating_sub(5).max(1)) {
                 out.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(line, theme::muted_italic()),
                 ]));
+            }
+            if let Some(anchor) = anchor {
+                anchor.titles.extend(
+                    (body_start..out.len())
+                        .map(|line| (line, FoldTarget::Thinking(anchor.first_index))),
+                );
             }
         }
         ChatItem::Tool { .. } => {

@@ -159,6 +159,9 @@ struct RunningState {
     /// member's queue; any left when the run ends are queued too, so a message
     /// is never lost.
     steered: VecDeque<QueuedPrompt>,
+    /// Foreign turns whose messages were accepted by this run. Keep them
+    /// active until the recipient exits, just like work held in its queue.
+    injected_turns: HashSet<TurnId>,
 }
 
 struct QueuedPrompt {
@@ -3340,6 +3343,7 @@ impl TeamRuntime {
 
         let handback: SubAgentOutcome;
         let mut unconfirmed_steers: VecDeque<QueuedPrompt> = VecDeque::new();
+        let mut injected_turns = HashSet::new();
         let (
             turn,
             cancelled,
@@ -3351,6 +3355,14 @@ impl TeamRuntime {
         ) = match self.members.get_mut(member).and_then(|s| s.running.take()) {
             Some(mut running) => {
                 handback = SubAgentOutcome::new(&running);
+                injected_turns.extend(std::mem::take(&mut running.injected_turns));
+                injected_turns.extend(
+                    running
+                        .steered
+                        .iter()
+                        .filter(|prompt| prompt.turn != running.turn)
+                        .map(|prompt| prompt.turn),
+                );
                 // Keep any steered
                 // message the backend never confirmed: it runs after this one
                 // (a member being removed drops it, like the rest of its queue).
@@ -3476,10 +3488,22 @@ impl TeamRuntime {
             return;
         }
 
-        // Start the next queued prompt for this member, if any.
+        let mut injected_turns: Vec<_> = injected_turns.into_iter().collect();
+        injected_turns.sort_unstable_by_key(|turn| turn.0);
+        for injected in injected_turns {
+            let finishing = !self.turn_active(injected);
+            self.check_turn_complete(injected, step);
+            if finishing && self.run_turns.contains_key(&injected) {
+                return;
+            }
+        }
+
+        // A completion callback may already have dispatched the next mode
+        // step. Never replace that live run with queued work.
         let next = self
             .members
             .get_mut(member)
+            .filter(|state| state.running.is_none())
             .and_then(|s| s.queue.pop_front());
         if let Some(queued) = next {
             self.emit_queue_updated(member, step);
@@ -3633,9 +3657,10 @@ impl TeamRuntime {
             .map(|s| s.running.is_some())
             .unwrap_or(false);
         if busy {
-            // Another agent's message reaches a live run of the same turn as
-            // soon as its current tool call ends; the user's own messages
-            // always wait their turn in the queue.
+            // Agent messages can join a live run in this conversation even
+            // when the sender belongs to an older/newer user turn. The
+            // backend chooses the next safe input boundary. User input
+            // continues to wait in the queue.
             if let Some(from) = &origin
                 && self.try_steer(member, turn, &stripped_prompt, from, step)
             {
@@ -3656,7 +3681,8 @@ impl TeamRuntime {
     }
 
     /// Hand `prompt` from agent `from` to the live run of `member` when that
-    /// run is part of the same turn and its backend takes mid-turn input.
+    /// backend takes mid-turn input. Turn ids are not conversation ids:
+    /// delayed child results must also reach a parent's newer live turn.
     /// Returns false (nothing sent) so the caller queues it instead. The run
     /// keeps its own origin: an injected message never changes who the final
     /// reply is handed back to, and the relay was already counted when the
@@ -3679,7 +3705,7 @@ impl TeamRuntime {
         else {
             return false;
         };
-        if running.turn != turn || running.cancel.load(Ordering::Relaxed) {
+        if running.cancel.load(Ordering::Relaxed) {
             return false;
         }
         let Some(steer) = &running.steer else {
@@ -3711,7 +3737,13 @@ impl TeamRuntime {
             .members
             .get_mut(member)
             .and_then(|state| state.running.as_mut())
-            .and_then(|running| running.steered.pop_front())
+            .and_then(|running| {
+                let delivered = running.steered.pop_front()?;
+                if delivered.turn != running.turn {
+                    running.injected_turns.insert(delivered.turn);
+                }
+                Some(delivered)
+            })
         else {
             return;
         };
@@ -3822,6 +3854,7 @@ impl TeamRuntime {
                 error: None,
                 steer: steer_tx,
                 steered: VecDeque::new(),
+                injected_turns: HashSet::new(),
             });
             state.status = MemberStatus::Running;
             state.tools.clear();
@@ -4008,8 +4041,11 @@ impl TeamRuntime {
 
     fn turn_active(&self, turn: TurnId) -> bool {
         let in_members = self.members.values().any(|state| {
-            state.running.as_ref().map(|r| r.turn) == Some(turn)
-                || state.queue.iter().any(|q| q.turn == turn)
+            state.running.as_ref().is_some_and(|running| {
+                running.turn == turn
+                    || running.injected_turns.contains(&turn)
+                    || running.steered.iter().any(|prompt| prompt.turn == turn)
+            }) || state.queue.iter().any(|q| q.turn == turn)
         });
         in_members
             || self.paused_routes.iter().any(|r| r.turn == turn)

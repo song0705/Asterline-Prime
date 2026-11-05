@@ -25,6 +25,7 @@ pub mod keymap;
 pub mod markdown;
 pub mod mode_editor;
 pub mod model_picker;
+mod mouse_click;
 pub mod notify;
 pub mod rollout_import;
 pub mod runs_view;
@@ -280,6 +281,7 @@ fn run_loop(
         if drain_runtime_events(state, events, notify_enabled) {
             dirty = true;
         }
+        dirty |= dispatch_pending_clicks(state, Instant::now());
         if state.warm_model_catalog_once() {
             dirty = true;
         }
@@ -325,7 +327,7 @@ fn run_loop(
         for event in read_pending_input(poll_for)? {
             dirty = true;
             match event {
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => state.chat_clicks.reset(),
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key_press(key, state, handle, last_layout.as_ref());
                 }
@@ -395,9 +397,24 @@ fn run_loop(
     }
 }
 
+fn dispatch_pending_clicks(state: &mut AppState, now: Instant) -> bool {
+    let actions = state.chat_clicks.take_due(now);
+    let changed = !actions.is_empty();
+    for action in actions {
+        match action {
+            mouse_click::ClickAction::Fold(target) => state.toggle_fold(target),
+            mouse_click::ClickAction::Link(url) => {
+                hyperlink::open_url(&url);
+            }
+        }
+    }
+    changed
+}
+
 fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_view::ChatLayout>) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
+            state.chat_clicks.cancel_double_click();
             if state.drawer() == Some(drawers::Drawer::Agents) {
                 state.select_previous_agent();
             } else if state.model_picker_open() {
@@ -413,6 +430,7 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::ScrollDown => {
+            state.chat_clicks.cancel_double_click();
             if state.drawer() == Some(drawers::Drawer::Agents) {
                 state.select_next_agent();
             } else if state.model_picker_open() {
@@ -447,11 +465,25 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
                     .then(|| layout.screen_to_content(mouse.column, mouse.row))
                     .flatten()
             }) {
-                Some(pos) => state.begin_chat_selection(pos),
-                None => state.clear_chat_selection(),
+                Some(pos) => {
+                    if state.chat_clicks.press(pos, Instant::now()) {
+                        state.begin_chat_selection((pos.0, 0));
+                        state.update_chat_selection((
+                            pos.0,
+                            layout.unwrap().width.saturating_sub(1).max(1),
+                        ));
+                    } else {
+                        state.begin_chat_selection(pos);
+                    }
+                }
+                None => {
+                    state.chat_clicks.cancel_double_click();
+                    state.clear_chat_selection();
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            state.chat_clicks.cancel_double_click();
             if let Some(index) = layout.and_then(|layout| {
                 layout.screen_to_composer_index(state.composer(), mouse.column, mouse.row)
             }) {
@@ -465,6 +497,7 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            state.chat_clicks.finish_press();
             if state.drawer().is_some() {
                 return;
             }
@@ -474,22 +507,23 @@ fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_vi
                 return;
             }
             if let (Some(layout), Some(selection)) = (layout, state.chat_selection()) {
-                // A press and release on the same cell is a click, not a
-                // drag. On a disclosure title it folds or unfolds that block.
-                if selection.is_empty()
-                    && let Some(url) = hyperlink::url_at(mouse.column, mouse.row)
-                {
-                    state.clear_chat_selection();
-                    hyperlink::open_url(&url);
-                    return;
-                }
+                // Wait for a possible second press before folding or opening
+                // a link, so double-click selection never hides its own row.
                 if selection.is_empty()
                     && layout.contains(mouse.column, mouse.row)
                     && layout.screen_to_content(mouse.column, mouse.row) == Some(selection.start)
-                    && let Some(target) = layout.fold_target_at_line(selection.start.0)
                 {
+                    let action = hyperlink::url_at(mouse.column, mouse.row)
+                        .map(mouse_click::ClickAction::Link)
+                        .or_else(|| {
+                            layout
+                                .fold_target_at_line(selection.start.0)
+                                .map(mouse_click::ClickAction::Fold)
+                        });
+                    state
+                        .chat_clicks
+                        .release(selection.start, action, Instant::now());
                     state.clear_chat_selection();
-                    state.toggle_fold(target);
                     return;
                 }
                 let text = layout.selected_text(selection);
@@ -1824,6 +1858,7 @@ mod tests {
                 Some(layout),
             );
         }
+        dispatch_pending_clicks(state, Instant::now() + mouse_click::DOUBLE_CLICK_DELAY);
     }
 
     fn link_state() -> AppState {
@@ -2089,6 +2124,178 @@ mod tests {
         assert!(state.fold_expanded(ToolOutput(1)));
     }
 
+    fn content_cell(layout: &chat_view::ChatLayout, needle: &str) -> (u16, u16) {
+        let (row, text) = layout
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, text)| text.contains(needle))
+            .expect("visible content");
+        let start = text.find(needle).unwrap();
+        let column = unicode_width::UnicodeWidthStr::width(&text[..start]);
+        (layout.area.x + column as u16, layout.area.y + row as u16)
+    }
+
+    fn raw_click(state: &mut AppState, layout: &chat_view::ChatLayout, cell: (u16, u16)) {
+        mouse_at(state, layout, MouseEventKind::Down(MouseButton::Left), cell);
+        mouse_at(state, layout, MouseEventKind::Up(MouseButton::Left), cell);
+    }
+
+    #[test]
+    fn expanded_thinking_body_click_is_delayed_and_folds_only_that_block() {
+        use app_state::FoldTarget::Thinking;
+        let mut state = AppState::new(vec![
+            thinking_item("first body line"),
+            thinking_item("second body line"),
+        ]);
+        state.toggle_thinking_expansion();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        raw_click(
+            &mut state,
+            &layout,
+            content_cell(&layout, "first body line"),
+        );
+        assert!(
+            state.fold_expanded(Thinking(0)),
+            "wait for a possible double click"
+        );
+        dispatch_pending_clicks(&mut state, Instant::now() + mouse_click::DOUBLE_CLICK_DELAY);
+        assert!(!state.fold_expanded(Thinking(0)));
+        assert!(state.fold_expanded(Thinking(1)));
+    }
+
+    #[test]
+    fn double_click_selects_the_full_unicode_row_without_collapsing_it() {
+        use app_state::FoldTarget::Thinking;
+        let mut state = AppState::new(vec![thinking_item(
+            "第一行 中文内容
+second line remains separate",
+        )]);
+        state.toggle_thinking_expansion();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let cell = content_cell(&layout, "中文内容");
+        raw_click(&mut state, &layout, cell);
+        raw_click(&mut state, &layout, cell);
+        let selected = layout.selected_text(state.chat_selection().expect("whole-line selection"));
+        assert_eq!(selected, layout.lines[(cell.1 - layout.area.y) as usize]);
+        assert!(selected.contains("第一行 中文内容"));
+        assert!(!selected.contains("second line"));
+        dispatch_pending_clicks(&mut state, Instant::now() + mouse_click::DOUBLE_CLICK_DELAY);
+        assert!(state.fold_expanded(Thinking(0)));
+    }
+
+    #[test]
+    fn double_clicking_a_link_selects_its_row_without_opening_the_link() {
+        let mut state = link_state();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let cell = content_cell(&layout, "官方仓库");
+        let _ = hyperlink::take_opened();
+        raw_click(&mut state, &layout, cell);
+        raw_click(&mut state, &layout, cell);
+        dispatch_pending_clicks(&mut state, Instant::now() + mouse_click::DOUBLE_CLICK_DELAY);
+        assert!(hyperlink::take_opened().is_empty());
+        assert_eq!(
+            layout.selected_text(state.chat_selection().unwrap()),
+            layout.lines[(cell.1 - layout.area.y) as usize]
+        );
+    }
+
+    #[test]
+    fn expanded_body_can_be_drag_selected_without_collapsing() {
+        use app_state::FoldTarget::Thinking;
+        let mut state = AppState::new(vec![thinking_item("select this body text")]);
+        state.toggle_thinking_expansion();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        let cell = content_cell(&layout, "select this");
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+        );
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Drag(MouseButton::Left),
+            (cell.0 + 5, cell.1),
+        );
+        mouse_at(
+            &mut state,
+            &layout,
+            MouseEventKind::Up(MouseButton::Left),
+            (cell.0 + 5, cell.1),
+        );
+        dispatch_pending_clicks(&mut state, Instant::now() + mouse_click::DOUBLE_CLICK_DELAY);
+        assert!(state.fold_expanded(Thinking(0)));
+        assert!(
+            layout
+                .selected_text(state.chat_selection().unwrap())
+                .contains("select")
+        );
+    }
+
+    #[test]
+    fn body_click_survives_resize_and_scroll_when_the_header_is_offscreen() {
+        use app_state::FoldTarget::Thinking;
+        let text = (0..100)
+            .map(|n| format!("body row {n} 中文"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = AppState::new(vec![thinking_item(&text)]);
+        state.toggle_thinking_expansion();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
+        let _ = paint(&mut terminal, &state);
+        state.scroll_by(3);
+        let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(50, 14)).unwrap();
+        let layout = paint(&mut narrow, &state);
+        assert!(
+            !layout
+                .lines
+                .iter()
+                .any(|line| line.contains("click to collapse"))
+        );
+        click(&mut state, &layout, content_cell(&layout, "body row"));
+        assert!(!state.fold_expanded(Thinking(0)));
+    }
+
+    #[test]
+    fn nested_tool_output_body_collapses_the_inner_output_before_the_group() {
+        use app_state::FoldTarget::{ToolOutput, Tools};
+        let mut state = AppState::new(
+            (0..5)
+                .map(|n| ChatItem::Tool {
+                    member: MemberId::new("builder"),
+                    name: "Read".to_string(),
+                    summary: format!("file{n}.rs"),
+                    detail: if n == 0 {
+                        "nested output content".to_string()
+                    } else {
+                        String::new()
+                    },
+                    ok: Some(true),
+                })
+                .collect(),
+        );
+        state.toggle_tool_group(0);
+        state.toggle_fold(ToolOutput(0));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        click(
+            &mut state,
+            &layout,
+            content_cell(&layout, "nested output content"),
+        );
+        assert!(!state.fold_expanded(ToolOutput(0)));
+        assert!(state.fold_expanded(Tools(0)));
+        let layout = paint(&mut terminal, &state);
+        click(&mut state, &layout, content_cell(&layout, "file1.rs"));
+        assert!(!state.fold_expanded(Tools(0)));
+    }
+
     #[test]
     fn clicking_file_changes_collapses_and_reopens_the_diff() {
         use app_state::FoldTarget::Diff;
@@ -2106,7 +2313,11 @@ mod tests {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         let layout = paint(&mut terminal, &state);
         assert!(format!("{}", terminal.backend()).contains("after_unique_change"));
-        click(&mut state, &layout, fold_cell(&layout, Diff(0)));
+        click(
+            &mut state,
+            &layout,
+            content_cell(&layout, "after_unique_change"),
+        );
         let layout = paint(&mut terminal, &state);
         assert!(!format!("{}", terminal.backend()).contains("after_unique_change"));
         click(&mut state, &layout, fold_cell(&layout, Diff(0)));

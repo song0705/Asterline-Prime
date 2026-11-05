@@ -469,6 +469,7 @@ pub struct AppState {
     clock_override: Option<i64>,
     /// Drag-select range in flattened chat-line coordinates, if any.
     chat_selection: Option<ChatSelection>,
+    pub(super) chat_clicks: crate::tui::mouse_click::ChatClicks,
     composer_dragging: bool,
     queued_prompts: HashMap<MemberId, Vec<String>>,
     /// Bumped whenever transcript text changes so the chat painter can reuse
@@ -582,6 +583,7 @@ impl AppState {
             pending_command: None,
             clock_override: None,
             chat_selection: None,
+            chat_clicks: Default::default(),
             composer_dragging: false,
             queued_prompts: HashMap::new(),
             chat_fingerprint: 0,
@@ -2844,6 +2846,7 @@ impl AppState {
     fn assign_focus(&mut self, focus: Option<MemberId>) {
         self.focus_initialized = true;
         if self.focus != focus {
+            self.chat_clicks.reset();
             self.focus = focus;
             self.scroll = 0;
             self.chat_selection = None;
@@ -4697,6 +4700,7 @@ impl AppState {
 
     /// Forget per-block choices on a new or resumed chat.
     fn clear_tool_group_expansion(&mut self) {
+        self.chat_clicks.reset();
         self.expanded_tool_groups.clear();
         self.fold_overrides.clear();
         self.tool_groups_revision = self.tool_groups_revision.wrapping_add(1);

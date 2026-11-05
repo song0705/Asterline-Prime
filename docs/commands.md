@@ -1,5 +1,7 @@
 # Asterline command and keyboard reference
 
+Check the installed build with `ast -v` or `ast --version` (`asterline` accepts the same flags). The version is printed without starting an agent or opening the workspace.
+
 This is the complete reference for Asterline's startup options, composer
 syntax, slash commands, drawers, and keyboard controls. For installation and
 the product overview, return to the [English README](../README.en.md). A
@@ -919,6 +921,8 @@ Set or clear the owner. `member` may be written with or without `@`.
 
 ## Global keyboard controls
 
+Agent-to-agent messages, including child results sent back to their parent, can join a running Codex or Claude turn in the current chat even when the sender started on an earlier user turn. The backend chooses when to consume the injected message. Unsupported backends, runs whose input is closed or cancellation is underway, and rejected or unconfirmed injection fall back to the queue; messages are not silently dropped. User-entered follow-up prompts still queue.
+
 While a member is working, `Enter` queues the next message instead of
 starting a second run. `Esc` interrupts the live member and then sends the
 queued message. If that queued text has not started yet and you want to
@@ -954,7 +958,7 @@ conversation can be scrolled all the way to its first message.
 | `Ctrl+C`                   | Copy chat/composer selection; else cancel, clear, or arm quit |
 | `Ctrl+V` / `Cmd+V`         | Attach a clipboard image to the next send (not Ctrl+C)        |
 
-Click the header of an existing thinking block, file-change block, tool group, or individual tool output to expand/collapse it. Tool-output truncation hints are clickable too. Clicking changes only that block; dragging still selects text. Ctrl+T, Ctrl+G, and Ctrl+O remain available for global toggles. Codex’s returned reasoning summaries are retained as collapsed thinking blocks. Click a header to inspect the summary; completed sections are saved with the conversation and restored by `/resume`, including after restarting the application.
+Click the header of an existing thinking block, file-change block, tool group, or individual tool output to expand/collapse it. Click anywhere in an expanded block to collapse it; nested tool outputs take priority over their enclosing group. Tool-output truncation hints are clickable too. Double-click selects the entire visible row, including on expanded content or link text, without folding it or opening a link. Single-click actions wait briefly (300 ms) to distinguish double-clicks. Dragging still selects text. Ctrl+T, Ctrl+G, and Ctrl+O remain available for global toggles. Codex’s returned reasoning summaries are retained as collapsed thinking blocks. Click a header to inspect the summary; completed sections are saved with the conversation and restored by `/resume`, including after restarting the application.
 
 Screenshots and copied images are copied under the process temp directory
 (`std::env::temp_dir()/asterline-pasted/<pid>/`: `%TEMP%` on Windows, `$TMPDIR`
