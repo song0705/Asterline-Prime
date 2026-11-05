@@ -1035,7 +1035,7 @@ fn reasoning_section_break_clears_progress_and_starts_fresh() {
             if member == &builder && text == "second section"
     )));
     assert!(
-        !rt.store
+        rt.store
             .replay_chat()
             .unwrap()
             .iter()
@@ -2103,7 +2103,7 @@ fn empty_terminal_message_keeps_the_streamed_answer() {
 }
 
 #[test]
-fn control_only_completion_discards_thinking_progress() {
+fn control_only_completion_retains_codex_summary() {
     let mut rt = runtime();
     rt.on_ui_command(user("hi"));
     let builder = MemberId::new("builder");
@@ -2120,7 +2120,7 @@ fn control_only_completion_discards_thinking_progress() {
     );
 
     assert!(
-        !rt.store
+        rt.store
             .replay_chat()
             .unwrap()
             .iter()
@@ -2129,7 +2129,7 @@ fn control_only_completion_discards_thinking_progress() {
 }
 
 #[test]
-fn thought_only_exit_discards_thinking_progress() {
+fn thought_only_exit_retains_codex_summary() {
     let mut rt = runtime();
     rt.on_ui_command(user("hi"));
     let builder = MemberId::new("builder");
@@ -2147,7 +2147,7 @@ fn thought_only_exit_discards_thinking_progress() {
     );
 
     assert!(
-        !rt.store
+        rt.store
             .replay_chat()
             .unwrap()
             .iter()
@@ -2156,7 +2156,70 @@ fn thought_only_exit_discards_thinking_progress() {
 }
 
 #[test]
-fn tools_discard_thinking_progress() {
+fn codex_summaries_survive_reopening_the_database_and_resuming_the_chat() {
+    let dir = std::env::temp_dir().join(format!(
+        "asterline-retained-reasoning-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("chat.sqlite3");
+    let mut rt = TeamRuntime::new(team(), SqliteStore::open(&path).unwrap()).with_approvals(false);
+    let original = rt.store.current_conversation().unwrap();
+    let builder = MemberId::new("builder");
+    rt.on_ui_command(user("check this"));
+    rt.on_agent_event(&builder, AgentEvent::Reasoning("first ".to_string()));
+    rt.on_agent_event(&builder, AgentEvent::Reasoning("first section".to_string()));
+    rt.on_agent_event(&builder, AgentEvent::ReasoningCompleted);
+    rt.on_agent_event(&builder, AgentEvent::ReasoningCompleted);
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Reasoning("second section".to_string()),
+    );
+    rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+    drop(rt);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let chat = store.replay_chat_for(original).unwrap();
+    let summaries: Vec<_> = chat
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Thinking {
+                member,
+                backend,
+                text,
+                elapsed_secs,
+                ..
+            } => {
+                assert_eq!(member, &builder);
+                assert_eq!(*backend, BackendKind::Codex);
+                assert!(elapsed_secs.is_some());
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries, ["first section", "second section"]);
+    let mut rt = TeamRuntime::new(team(), store).with_approvals(false);
+    rt.on_ui_command(UiCommand::NewSession { prompt: None });
+    let resumed = rt.on_ui_command(UiCommand::ResumeConversation {
+        conversation: original,
+    });
+    assert!(resumed.events.iter().any(|event| matches!(event,
+        RuntimeEvent::ConversationResumed { chat, .. }
+            if chat.iter().filter(|item| matches!(item, ChatItem::Thinking { .. })).count() == 2
+    )));
+    drop(rt);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tools_close_and_retain_codex_summary_sections() {
     let mut rt = runtime();
     rt.on_ui_command(user("hi"));
     let builder = MemberId::new("builder");
@@ -2197,7 +2260,7 @@ fn tools_discard_thinking_progress() {
             _ => None,
         })
         .collect();
-    assert!(thoughts.is_empty());
+    assert_eq!(thoughts, ["read roster", "read mode.rs"]);
 }
 
 #[test]

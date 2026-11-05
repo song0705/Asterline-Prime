@@ -359,7 +359,7 @@ pub struct AppState {
     tool_groups_revision: u64,
     active_reasoning: HashMap<MemberId, String>,
     reasoning_buffers: HashMap<MemberId, String>,
-    /// Legacy/imported thinking cells that still need an elapsed-time closeout.
+    /// Thinking cells that still need an elapsed-time closeout.
     open_thinking: HashMap<MemberId, usize>,
     thinking_started: HashMap<MemberId, Instant>,
     last_message_target: Option<MessageTarget>,
@@ -1517,26 +1517,22 @@ impl AppState {
         }
         let current_text = buffer.clone();
         let (display_name, backend) = self.member_meta(&member);
-        if backend != BackendKind::Codex {
-            if let Some(&idx) = self.open_thinking.get(&member) {
-                if !current_text.is_empty()
-                    && let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx)
-                {
-                    *text = current_text;
-                    self.touch_chat();
-                }
-            } else {
-                let idx = self.chat.len();
-                self.chat.push(ChatItem::Thinking {
-                    member: member.clone(),
-                    display_name,
-                    backend,
-                    text: current_text,
-                    elapsed_secs: None,
-                });
-                self.open_thinking.insert(member, idx);
+        if let Some(&idx) = self.open_thinking.get(&member) {
+            if !current_text.is_empty()
+                && let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx)
+            {
+                *text = current_text;
                 self.touch_chat();
             }
+        } else {
+            let idx = self.push(ChatItem::Thinking {
+                member: member.clone(),
+                display_name,
+                backend,
+                text: current_text,
+                elapsed_secs: None,
+            });
+            self.open_thinking.insert(member, idx);
         }
     }
 

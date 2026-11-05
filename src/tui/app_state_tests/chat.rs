@@ -56,7 +56,7 @@ fn empty_message_completion_keeps_streamed_text() {
 }
 
 #[test]
-fn reasoning_is_a_live_status_and_never_enters_history() {
+fn reasoning_closes_live_status_and_retains_history() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
     let builder = MemberId::new("builder");
@@ -89,7 +89,7 @@ fn reasoning_is_a_live_status_and_never_enters_history() {
     });
 
     assert!(
-        !state
+        state
             .chat()
             .iter()
             .any(|item| matches!(item, ChatItem::Thinking { .. }))

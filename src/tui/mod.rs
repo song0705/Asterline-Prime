@@ -1952,6 +1952,34 @@ mod tests {
     }
 
     #[test]
+    fn restored_codex_summary_is_collapsed_and_clickable() {
+        let mut state = AppState::new(vec![ChatItem::Thinking {
+            member: MemberId::new("builder"),
+            display_name: "Builder".to_string(),
+            backend: BackendKind::Codex,
+            text: "retained Codex summary".to_string(),
+            elapsed_secs: Some(2),
+        }]);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("retained Codex summary"));
+        click(
+            &mut state,
+            &layout,
+            fold_cell(&layout, app_state::FoldTarget::Thinking(0)),
+        );
+        let layout = paint(&mut terminal, &state);
+        assert!(format!("{}", terminal.backend()).contains("retained Codex summary"));
+        click(
+            &mut state,
+            &layout,
+            fold_cell(&layout, app_state::FoldTarget::Thinking(0)),
+        );
+        let _ = paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("retained Codex summary"));
+    }
+
+    #[test]
     fn clicking_thinking_toggles_only_that_block_and_keyboard_still_controls_all() {
         use app_state::FoldTarget::Thinking;
         let mut state = AppState::new(vec![

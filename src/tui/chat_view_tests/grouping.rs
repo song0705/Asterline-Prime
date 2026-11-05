@@ -886,7 +886,7 @@ fn reasoning_status_stays_on_the_current_turn_then_becomes_history() {
     assert!(greeting < follow_up && follow_up < tool, "{joined}");
     assert!(!joined.contains("prompt injection"), "{joined}");
     assert!(
-        !state
+        state
             .chat()
             .iter()
             .any(|item| matches!(item, ChatItem::Thinking { .. }))
@@ -894,7 +894,7 @@ fn reasoning_status_stays_on_the_current_turn_then_becomes_history() {
 }
 
 #[test]
-fn reasoning_status_stays_with_its_member_then_disappears() {
+fn reasoning_summary_stays_with_its_member_and_retains_a_collapsed_block() {
     use crate::domain::event::{MessageId, TurnId};
 
     let mut state = AppState::new(Vec::new());
@@ -988,7 +988,7 @@ fn reasoning_status_stays_with_its_member_then_disappears() {
     assert!(joined.contains("cargo test"), "{joined}");
     assert!(!joined.contains("parser invariants"), "{joined}");
     assert!(
-        !state
+        state
             .chat()
             .iter()
             .any(|item| matches!(item, ChatItem::Thinking { .. }))
@@ -1090,7 +1090,7 @@ fn live_working_status_follows_that_members_last_message() {
 }
 
 #[test]
-fn legacy_thinking_is_hidden_without_hiding_tool_output() {
+fn stored_codex_thinking_is_collapsed_without_hiding_tool_output() {
     let state = AppState::new(vec![
         ChatItem::Thinking {
             member: MemberId::new("builder"),
@@ -1111,7 +1111,7 @@ fn legacy_thinking_is_hidden_without_hiding_tool_output() {
     render_chat_history(&state, 80, 0, &mut lines);
     let text = plain_text(&lines).join("\n");
     assert!(!text.contains("secret scratch work"), "{text}");
-    assert!(!text.contains("thinking for 8s"), "{text}");
+    assert!(text.contains("thinking for 8s"), "{text}");
     assert!(text.contains("cargo test"), "{text}");
 }
 
@@ -1172,7 +1172,7 @@ fn stored_zero_second_thinking_does_not_claim_a_duration() {
 }
 
 #[test]
-fn reasoning_status_shows_a_spinner_then_disappears() {
+fn reasoning_status_shows_a_spinner_then_becomes_collapsible_history() {
     let builder = MemberId::new("builder");
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
@@ -1198,13 +1198,13 @@ fn reasoning_status_shows_a_spinner_then_disappears() {
     let mut live = Vec::new();
     render_chat_history(&state, 80, 0, &mut live);
     let live = plain_text(&live).join("\n");
-    assert!(live.contains("Thinking"), "{live}");
+    assert!(live.contains("thinking"), "{live}");
     assert!(live.contains("Looking at the parser"), "{live}");
     assert!(
         live.chars().any(|ch| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch)),
         "live thinking needs a spinner: {live}"
     );
-    assert!(!live.contains("Ctrl+T"), "{live}");
+    assert!(live.contains("Ctrl+T"), "{live}");
 
     state.apply(RuntimeEvent::ToolStarted {
         member: builder,
@@ -1217,8 +1217,11 @@ fn reasoning_status_shows_a_spinner_then_disappears() {
     let done = plain_text(&done).join("\n");
     assert!(done.contains("src/lib.rs"), "{done}");
     assert!(!done.contains("Looking at the parser"), "{done}");
-    assert!(!done.contains("thinking for"), "{done}");
-    assert!(!done.contains("Ctrl+T expand"), "{done}");
+    assert!(
+        done.contains("thought") || done.contains("thinking for"),
+        "{done}"
+    );
+    assert!(done.contains("Ctrl+T expand"), "{done}");
 }
 
 #[test]
@@ -1239,7 +1242,7 @@ fn active_tool_spinner_invalidates_the_cached_tail() {
 }
 
 #[test]
-fn completed_reasoning_leaves_no_history_item_for_codex() {
+fn completed_reasoning_leaves_collapsible_history_for_codex() {
     let builder = MemberId::new("builder");
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
@@ -1272,7 +1275,7 @@ fn completed_reasoning_leaves_no_history_item_for_codex() {
     assert!(!rendered.contains("Checking the parser"), "{rendered}");
     assert!(!rendered.contains("secret scratch work"), "{rendered}");
     assert!(
-        !state
+        state
             .chat()
             .iter()
             .any(|item| matches!(item, ChatItem::Thinking { .. }))

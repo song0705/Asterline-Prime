@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::domain::event::{ChatItem, FileChangeItem};
-use crate::domain::team::{BackendKind, MemberId};
+#[cfg(test)]
+use crate::domain::team::BackendKind;
+use crate::domain::team::MemberId;
 use crate::tui::agents_view;
 use crate::tui::app_state::{AppState, FocusRow, FoldTarget, focus_row, member_status_is_active};
 use crate::tui::completion::Completion;
@@ -1124,15 +1126,6 @@ fn render_chat_history_range(
             continue;
         }
         let item = &items[i];
-        if matches!(
-            item,
-            ChatItem::Thinking {
-                backend: BackendKind::Codex,
-                ..
-            }
-        ) {
-            continue;
-        }
         let before = out.len();
         let previous = previous_rendered(state, items, &order, pos, start, false);
         // Agent-to-agent rows (`⇄ agents`) belong to the block they sit in,
@@ -2629,7 +2622,17 @@ fn render_item(
             let label =
                 thinking_label(live, *elapsed_secs, state.thinking_live_secs(member), lines);
             let label = if live {
-                format!("{} {label}", status_indicator::spinner())
+                let summary = state
+                    .active_reasoning()
+                    .get(member)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let summary = if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {summary}")
+                };
+                format!("{} {label}{summary}", status_indicator::spinner())
             } else {
                 format!("✻ {label}")
             };

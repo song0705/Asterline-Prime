@@ -954,7 +954,7 @@ conversation can be scrolled all the way to its first message.
 | `Ctrl+C`                   | Copy chat/composer selection; else cancel, clear, or arm quit |
 | `Ctrl+V` / `Cmd+V`         | Attach a clipboard image to the next send (not Ctrl+C)        |
 
-Click the header of an existing thinking block, file-change block, tool group, or individual tool output to expand/collapse it. Tool-output truncation hints are clickable too. Clicking changes only that block; dragging still selects text. Ctrl+T, Ctrl+G, and Ctrl+O remain available for global toggles. Codex reasoning currently remains a live status rather than a stored thinking block.
+Click the header of an existing thinking block, file-change block, tool group, or individual tool output to expand/collapse it. Tool-output truncation hints are clickable too. Clicking changes only that block; dragging still selects text. Ctrl+T, Ctrl+G, and Ctrl+O remain available for global toggles. Codex’s returned reasoning summaries are retained as collapsed thinking blocks. Click a header to inspect the summary; completed sections are saved with the conversation and restored by `/resume`, including after restarting the application.
 
 Screenshots and copied images are copied under the process temp directory
 (`std::env::temp_dir()/asterline-pasted/<pid>/`: `%TEMP%` on Windows, `$TMPDIR`

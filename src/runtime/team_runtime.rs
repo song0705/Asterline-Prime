@@ -2776,25 +2776,39 @@ impl TeamRuntime {
         }
     }
 
-    /// Clear the current thinking progress before the next tool or answer.
-    /// Thinking is transient status, not transcript content.
+    /// Close a reasoning section before the next tool, answer, or exit.
+    /// Codex's returned summaries are retained in the conversation transcript.
     fn commit_open_thinking(&mut self, member: &MemberId, step: &mut RuntimeStep) {
-        if self.running_turn(member).is_none() {
+        let Some(turn) = self.running_turn(member) else {
             return;
-        }
-        let had_reasoning = self
+        };
+        let Some(running) = self
             .members
-            .get(member)
-            .and_then(|state| state.running.as_ref())
-            .is_some_and(|running| !running.reasoning.trim().is_empty());
-        if let Some(state) = self.members.get_mut(member)
-            && let Some(running) = &mut state.running
-        {
-            running.reasoning.clear();
-            running.reasoning_started = None;
-        }
-        if !had_reasoning {
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+        else {
             return;
+        };
+        let text = std::mem::take(&mut running.reasoning);
+        let elapsed = running
+            .reasoning_started
+            .take()
+            .map(|start| start.elapsed().as_secs());
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Some(config) = self.config.member(member)
+            && config.backend == BackendKind::Codex
+            && let Err(err) = self.store.record_thinking(
+                turn,
+                member,
+                &config.display_name,
+                config.backend,
+                &text,
+                elapsed,
+            )
+        {
+            self.report_store_error("save the Codex reasoning summary", err, step);
         }
         step.events.push(RuntimeEvent::ReasoningCompleted {
             member: member.clone(),
