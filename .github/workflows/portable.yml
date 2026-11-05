@@ -5,7 +5,7 @@ on:
       tag:
         description: Existing Prime release tag
         required: true
-        default: prime-v1.0.10
+        default: prime-v1.0.11
 permissions:
   contents: read
 jobs:
