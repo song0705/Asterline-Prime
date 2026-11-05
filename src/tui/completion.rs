@@ -60,7 +60,11 @@ pub(crate) const COMMANDS: &[(&str, &str, bool)] = &[
     ("mode", "open mode panel or switch dispatch mode", true),
     ("find", "search the transcript", true),
     ("diff", "show working-tree git diff", false),
-    ("retry", "re-send the latest user request", false),
+    (
+        "retry",
+        "retry failed input or the latest user request",
+        false,
+    ),
     ("help", "show commands", false),
     ("exit", "exit Asterline", false),
     // Approvals & sessions

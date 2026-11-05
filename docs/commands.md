@@ -352,10 +352,17 @@ by itself.
 /retry
 ```
 
-Re-send the most recent user request through the currently active mode. It
-does not resume a blocked run or a paused approval route; use `/continue` or
-`/approve` for those cases. If the conversation has no previous user request,
-nothing is sent.
+Retry the most recent failed member execution in this chat, using its original
+input and any agent messages confirmed as delivered during that attempt. This
+also covers executions started by an agent message. The recipient and sender
+are preserved; an explicit retry waits if the recipient is busy. Unconfirmed
+messages retain their normal queue delivery and are not added again to retry.
+
+If there is no saved failure, re-send the latest user request through the
+currently active mode. Failed structured workflows still use `/continue` to
+preserve their workflow state; paused approval routes use `/approve`. New or
+resumed chats clear this in-memory retry history. Retrying sends the input again
+in the existing backend session; it does not roll back completed tool actions.
 
 ### `/attach`
 

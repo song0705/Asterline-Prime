@@ -162,6 +162,16 @@ struct RunningState {
     /// Foreign turns whose messages were accepted by this run. Keep them
     /// active until the recipient exits, just like work held in its queue.
     injected_turns: HashSet<TurnId>,
+    /// Business input, including acknowledged agent messages, for failure recovery.
+    retry_prompt: String,
+}
+
+#[derive(Clone)]
+struct FailedInput {
+    member: MemberId,
+    prompt: String,
+    origin: Option<MemberId>,
+    run_id: Option<RunId>,
 }
 
 struct QueuedPrompt {
@@ -251,6 +261,7 @@ pub struct TeamRuntime {
     /// Field-level conversation overlay on `config.modes`.
     session_mode_overrides: ModesConfig,
     last_user: Option<(MessageTarget, String)>,
+    last_failed: Option<FailedInput>,
     next_message_id: u64,
     /// When false (default), Codex tool asks are approved automatically.
     manual_approvals: bool,
@@ -385,6 +396,7 @@ impl TeamRuntime {
             active_mode,
             session_mode_overrides,
             last_user: None,
+            last_failed: None,
             next_message_id: 0,
             manual_approvals,
             startup_notices,
@@ -657,14 +669,7 @@ impl TeamRuntime {
             UiCommand::EditQueuedPrompt { member } => {
                 self.handle_edit_queued_prompt(member, &mut step);
             }
-            UiCommand::Retry => {
-                if let Some((target, body)) = self.last_user.clone() {
-                    self.handle_active_user_message(target, body, &mut step);
-                } else {
-                    step.events
-                        .push(RuntimeEvent::Notice("nothing to retry".to_string()));
-                }
-            }
+            UiCommand::Retry => self.handle_retry(&mut step),
             UiCommand::Approve { id, decision } => self.handle_approval(id, decision, &mut step),
             UiCommand::SetRelayPaused(paused) => {
                 self.relay_paused = paused;
@@ -957,6 +962,60 @@ impl TeamRuntime {
         Some(turn)
     }
 
+    fn handle_retry(&mut self, step: &mut RuntimeStep) {
+        let Some(input) = self.last_failed.clone() else {
+            if let Some((target, body)) = self.last_user.clone() {
+                self.handle_active_user_message(target, body, step);
+            } else {
+                step.events
+                    .push(RuntimeEvent::Notice("nothing to retry".to_string()));
+            }
+            return;
+        };
+        // Structured workflows own their recovery state and must not be
+        // silently replayed as an unrelated free-form member turn.
+        if let Some(run_id) = input.run_id {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "failed input belongs to {run_id}; use /continue {run_id} to resume the workflow"
+            )));
+            return;
+        }
+        if !self.members.contains_key(&input.member) || self.closing.contains_key(&input.member) {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "cannot retry: {} is no longer available",
+                input.member
+            )));
+            return;
+        }
+        let turn = match self.store.create_turn() {
+            Ok(turn) => turn,
+            Err(err) => {
+                self.report_store_error("create a retry turn", err, step);
+                return;
+            }
+        };
+        step.events.push(RuntimeEvent::TurnStarted { turn });
+        step.events.push(RuntimeEvent::MemberNotice {
+            member: input.member.clone(),
+            text: "retrying failed input, including received agent messages".to_string(),
+        });
+        // Explicit retries wait for a new execution even when their original
+        // sender was an agent. Do not steer them into unrelated live work.
+        let state = self.members.get_mut(&input.member).expect("member checked");
+        if state.running.is_some() {
+            state.queue.push_back(QueuedPrompt {
+                turn,
+                prompt: input.prompt,
+                origin: input.origin,
+            });
+            self.emit_queue_updated(&input.member, step);
+            self.note_roster_write(step);
+        } else {
+            self.start_run(&input.member, turn, input.prompt, input.origin, step);
+        }
+        self.last_failed = None;
+    }
+
     fn resolve_message_target(&self, target: &MessageTarget) -> (Vec<MemberId>, Vec<String>) {
         match target {
             MessageTarget::Default => (self.config.default_member_ids(), Vec::new()),
@@ -1235,6 +1294,7 @@ impl TeamRuntime {
         self.paused_routes.clear();
         self.held_approvals.clear();
         self.last_user = None;
+        self.last_failed = None;
         // The goal belongs to the chat being left; the fresh chat has none.
         self.goal_turns.clear();
         if self.goal.take().is_some() {
@@ -1433,6 +1493,7 @@ impl TeamRuntime {
         self.active_mode = mode;
         self.session_mode_overrides = mode_overrides;
         self.last_user = None;
+        self.last_failed = None;
         if let Err(err) = self.restore_goal() {
             self.goal = None;
             self.report_store_error("restore the chat's goal", err, step);
@@ -3355,6 +3416,16 @@ impl TeamRuntime {
         ) = match self.members.get_mut(member).and_then(|s| s.running.take()) {
             Some(mut running) => {
                 handback = SubAgentOutcome::new(&running);
+                if !running.cancel.load(Ordering::Relaxed)
+                    && (running.failed || (!ok && !running.permission_denied))
+                {
+                    self.last_failed = Some(FailedInput {
+                        member: member.clone(),
+                        prompt: running.retry_prompt.clone(),
+                        origin: running.origin.clone(),
+                        run_id: self.run_turns.get(&running.turn).copied(),
+                    });
+                }
                 injected_turns.extend(std::mem::take(&mut running.injected_turns));
                 injected_turns.extend(
                     running
@@ -3742,6 +3813,14 @@ impl TeamRuntime {
                 if delivered.turn != running.turn {
                     running.injected_turns.insert(delivered.turn);
                 }
+                let from = delivered
+                    .origin
+                    .as_ref()
+                    .map_or_else(|| "another agent".to_string(), ToString::to_string);
+                running.retry_prompt.push_str(&format!(
+                    "\n\n[Agent message from {from}, received during the failed attempt]\n{}",
+                    delivered.prompt,
+                ));
                 Some(delivered)
             })
         else {
@@ -3855,6 +3934,7 @@ impl TeamRuntime {
                 steer: steer_tx,
                 steered: VecDeque::new(),
                 injected_turns: HashSet::new(),
+                retry_prompt: prompt.clone(),
             });
             state.status = MemberStatus::Running;
             state.tools.clear();

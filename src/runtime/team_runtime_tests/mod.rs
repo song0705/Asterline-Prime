@@ -188,6 +188,7 @@ mod gates;
 mod goal;
 mod mode_overrides;
 mod plan;
+mod retry;
 mod review;
 mod roster;
 mod steer;
