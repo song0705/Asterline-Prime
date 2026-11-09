@@ -221,7 +221,7 @@ cargo test --all-targets --locked --no-fail-fast
 cargo audit
 ```
 
-Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate. Real-backend smoke tests are opt-in; see the [controlled local and Actions entrypoints](docs/real-smoke.md). Use [GitHub Issues](https://github.com/song0705/Asterline-Prime/issues) for reproducible bugs and focused proposals.
+Rust 1.89 or newer and `cargo-audit` 0.22.2 are required for this complete gate. Real-backend smoke tests are opt-in; see the [controlled local and Actions entrypoints](docs/real-smoke.md). Use [GitHub Issues](https://github.com/song0705/Asterline-Prime/issues) for reproducible bugs and focused proposals.
 
 ## Project status
 

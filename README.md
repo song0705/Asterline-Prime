@@ -219,7 +219,7 @@ cargo test --all-targets --locked --no-fail-fast
 cargo audit
 ```
 
-完整检查需要 Rust 1.88 或更高，以及 `cargo-audit` 0.22.2。真实后端 smoke 是显式启用的，见[说明](docs/real-smoke.zh-CN.md)。可复现的问题和范围明确的建议请提到 [GitHub Issues](https://github.com/song0705/Asterline-Prime/issues)。
+完整检查需要 Rust 1.89 或更高，以及 `cargo-audit` 0.22.2。真实后端 smoke 是显式启用的，见[说明](docs/real-smoke.zh-CN.md)。可复现的问题和范围明确的建议请提到 [GitHub Issues](https://github.com/song0705/Asterline-Prime/issues)。
 
 ## 项目状态
 

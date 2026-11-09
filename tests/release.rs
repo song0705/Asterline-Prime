@@ -5,12 +5,12 @@ use common::*;
 
 #[test]
 fn rust_and_dependency_policy_is_explicit_and_gated() {
-    assert!(CARGO_MANIFEST.contains("rust-version = \"1.88\""));
+    assert!(CARGO_MANIFEST.contains("rust-version = \"1.89\""));
     assert!(CARGO_MANIFEST.contains("features = [\"bundled\"]"));
     assert!(!CARGO_MANIFEST.contains("bundled-windows"));
 
-    assert!(CI_WORKFLOW.contains("name: MSRV · Rust 1.88.0"));
-    assert!(CI_WORKFLOW.contains("toolchain: 1.88.0"));
+    assert!(CI_WORKFLOW.contains("name: MSRV · Rust 1.89.0"));
+    assert!(CI_WORKFLOW.contains("toolchain: 1.89.0"));
     assert!(CI_WORKFLOW.contains("toolchain: 1.93.1"));
     assert!(!CI_WORKFLOW.contains("toolchain: stable"));
     assert!(!RELEASE_WORKFLOW.contains("toolchain: stable"));
@@ -33,7 +33,7 @@ fn rust_and_dependency_policy_is_explicit_and_gated() {
     }
     for (path, document) in INSTALLATION_DOCS {
         assert!(
-            document.contains("Rust 1.88"),
+            document.contains("Rust 1.89"),
             "{path} must advertise the Cargo MSRV"
         );
         assert!(

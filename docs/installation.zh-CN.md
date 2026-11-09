@@ -186,7 +186,7 @@ ast --help
 
 ## 从源码构建
 
-安装 Rust 1.88 或更高版本，克隆仓库后运行：
+安装 Rust 1.89 或更高版本，克隆仓库后运行：
 
 ```bash
 cargo install --path . --locked --force

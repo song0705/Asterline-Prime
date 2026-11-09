@@ -6,7 +6,7 @@
 
 Asterline 由 GitHub Actions 构建和发布。Release tag 必须与 `Cargo.toml` 中的包版本精确
 匹配。常规 workflow 和 release workflow 使用 Rust 1.93.1；显式 MSRV job 强制包声明的
-最低 Rust 1.88。
+最低 Rust 1.89。
 
 下一次发布前，仓库管理员必须在 **Settings → General → Releases** 启用
 **Enable release immutability**。GitHub 说明该设置只保护未来 Release，不影响既有 Release。
@@ -191,7 +191,7 @@ gh run watch --exit-status
 ```
 
 Workflow action 按完整 commit SHA 固定。Rust 的正常 toolchain 也固定为 1.93.1，而不是会
-漂移的 `stable` channel；MSRV job 固定为 1.88.0。接受更新时审查 release notes，并在每个
+漂移的 `stable` channel；MSRV job 固定为 1.89.0。接受更新时审查 release notes，并在每个
 SHA 旁保留人类可读 Action 版本注释。Rust toolchain 和 manylinux digest 更新仍是有意的维护者
 工作。
 

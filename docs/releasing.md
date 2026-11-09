@@ -7,7 +7,7 @@
 Asterline releases are built and published by GitHub Actions. A release tag
 must exactly match the package version in `Cargo.toml`. The normal and release
 workflows use Rust 1.93.1; the explicit MSRV job enforces the package's declared
-Rust 1.88 minimum.
+Rust 1.89 minimum.
 
 Before the next release, a repository administrator must enable **Settings →
 General → Releases → Enable release immutability**. GitHub documents that this
@@ -225,7 +225,7 @@ gh run watch --exit-status
 
 Workflow actions are pinned to full commit SHAs. Rust's normal toolchain is also
 pinned to 1.93.1 instead of the drifting `stable` channel, while the MSRV job is
-pinned to 1.88.0. Review release notes and keep the human-readable Action
+pinned to 1.89.0. Review release notes and keep the human-readable Action
 version comment beside each SHA when accepting an update. Rust toolchain and
 manylinux digest updates remain deliberate maintainer work.
 

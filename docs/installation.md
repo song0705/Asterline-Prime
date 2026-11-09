@@ -209,7 +209,7 @@ attestation before installing it.
 
 ## Build from source
 
-Install Rust 1.88 or newer, clone the repository, and run:
+Install Rust 1.89 or newer, clone the repository, and run:
 
 ```bash
 cargo install --path . --locked --force
