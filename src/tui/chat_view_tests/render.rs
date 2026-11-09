@@ -1953,3 +1953,26 @@ fn table_bold_reaches_terminal_cells_without_extra_body_rules() {
         assert_eq!(rows.iter().filter(|row| row.contains('├')).count(), 1);
     }
 }
+
+#[test]
+fn formula_conversion_only_changes_display_and_survives_resize() {
+    let source = r"Distance: $d_\beta^2 = \beta_t\cdot\frac{1}{3}$";
+    let state = AppState::new(vec![ChatItem::Agent {
+        member: MemberId::new("main"),
+        display_name: "Main".into(),
+        backend: BackendKind::Agy,
+        text: source.into(),
+    }]);
+    for width in [100, 32, 100] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state);
+            })
+            .unwrap();
+        let view = format!("{}", terminal.backend());
+        assert!(view.contains("dᵦ²") && view.contains("βₜ"), "{view}");
+        assert!(!view.contains("\\frac"), "{view}");
+        assert!(matches!(&state.chat()[0], ChatItem::Agent { text, .. } if text == source));
+    }
+}

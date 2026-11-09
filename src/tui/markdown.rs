@@ -84,17 +84,73 @@ fn parser_options() -> Options {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_MATH);
     options
 }
 
 fn render_uncached(text: &str, width: usize, keep_line_breaks: bool) -> Vec<Line<'static>> {
     let mut renderer = Renderer::new(width);
     renderer.keep_line_breaks = keep_line_breaks;
-    let prepared = fix_cjk_emphasis(text);
+    let (prepared, pipe_marker) = protect_math_pipes(text);
+    let prepared = fix_cjk_emphasis(&prepared);
     for event in Parser::new_ext(&prepared, parser_options()) {
+        // Restore protected bars before conversion or literal fallback.
+        let event = match (pipe_marker, event) {
+            (Some(marker), Event::InlineMath(value)) => {
+                Event::InlineMath(value.replace(marker, "|").into())
+            }
+            (Some(marker), Event::DisplayMath(value)) => {
+                Event::DisplayMath(value.replace(marker, "|").into())
+            }
+            (Some(marker), Event::Text(value)) => Event::Text(value.replace(marker, "|").into()),
+            (_, event) => event,
+        };
         renderer.handle(event);
     }
     renderer.finish()
+}
+
+/// GFM splits tables before parsing inline math. Protect only bars inside
+/// math recognized without table parsing, so absolute values are not columns.
+/// The marker is absent from the source and is restored before rendering.
+fn protect_math_pipes(text: &str) -> (Cow<'_, str>, Option<char>) {
+    if !text.contains('|') || !text.contains('$') {
+        return (Cow::Borrowed(text), None);
+    }
+    let mut options = parser_options();
+    options.remove(Options::ENABLE_TABLES);
+    let ranges: Vec<_> = Parser::new_ext(text, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::InlineMath(_) | Event::DisplayMath(_))
+                .then_some(range)
+                .filter(|range| text[range.clone()].contains('|'))
+        })
+        .collect();
+    if ranges.is_empty() {
+        return (Cow::Borrowed(text), None);
+    }
+    let used: std::collections::HashSet<_> = text.chars().collect();
+    let marker = (0xE000..=0xF8FF)
+        .chain(0xF0000..=0xFFFFD)
+        .filter_map(char::from_u32)
+        .find(|ch| !used.contains(ch));
+    let Some(marker) = marker else {
+        return (Cow::Borrowed(text), None);
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut previous = 0;
+    for range in ranges {
+        out.push_str(&text[previous..range.start]);
+        out.extend(
+            text[range.clone()]
+                .chars()
+                .map(|ch| if ch == '|' { marker } else { ch }),
+        );
+        previous = range.end;
+    }
+    out.push_str(&text[previous..]);
+    (Cow::Owned(out), Some(marker))
 }
 
 /// Find the first bare `http://` / `https://` URL in `text` as a byte range.
@@ -203,6 +259,8 @@ fn fix_cjk_emphasis(text: &str) -> Cow<'_, str> {
     for (event, range) in Parser::new_ext(text, parser_options()).into_offset_iter() {
         match event {
             Event::Code(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
             | Event::Html(_)
             | Event::InlineHtml(_)
             | Event::Start(Tag::CodeBlock(_)) => protected.push(range),
@@ -449,11 +507,25 @@ impl Renderer {
                     theme::dim(),
                 )));
             }
-            // Raw HTML / math: surface their text verbatim.
-            Event::Html(s)
-            | Event::InlineHtml(s)
-            | Event::InlineMath(s)
-            | Event::DisplayMath(s) => {
+            Event::InlineMath(source) => {
+                let text = crate::tui::math_text::to_unicode(&source)
+                    .unwrap_or_else(|| format!("${source}$"));
+                self.push_units(&text, self.inline_style());
+            }
+            Event::DisplayMath(source) => {
+                let text = crate::tui::math_text::to_unicode(&source)
+                    .unwrap_or_else(|| format!("$${source}$$"));
+                let in_table = matches!(self.mode, Mode::Table(_));
+                if !in_table {
+                    self.block_separator();
+                }
+                self.push_units(&text, self.inline_style());
+                if !in_table {
+                    self.flush_block();
+                }
+            }
+            // Raw HTML: surface its text verbatim.
+            Event::Html(s) | Event::InlineHtml(s) => {
                 self.push_units(&strip_zwsp(&s), self.inline_style());
             }
             Event::TaskListMarker(done) => {
@@ -1588,6 +1660,74 @@ mod tests {
             hyperlink::url_of_style(find_span(&lines, "link").style).as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test]
+    fn inline_and_display_math_render_unicode_without_changing_surrounding_text() {
+        let inline = texts(&render(
+            r"距离 $d_\beta^2 = \beta_t\cdot\frac{1}{3}|\Delta\psi^A|_2^2$ 完毕",
+            120,
+        ))
+        .join("\n");
+        assert_eq!(inline, "距离 dᵦ² = βₜ · (1/3)|Δψᴬ|₂² 完毕");
+        let display = texts(&render("before\n\n$$\n\\frac{a+b}{c+d}\n$$\n\nafter", 80));
+        assert_eq!(display, ["before", "", "((a + b)/(c + d))", "", "after"]);
+    }
+
+    #[test]
+    fn math_preserves_unknown_syntax_code_and_currency() {
+        for source in [r"$\unknown{x}$", r"$\frac{a}{$", "prices $5 and $10"] {
+            assert_eq!(texts(&render(source, 100)).join("\n"), source);
+        }
+        let code = texts(&render("`$x_i$`\n\n```text\n$\\beta_t$\n```", 80)).join("\n");
+        assert!(code.contains("$x_i$"));
+        assert!(code.contains(r"$\beta_t$"));
+        assert!(!code.contains("βₜ"));
+    }
+
+    #[test]
+    fn math_in_table_cells_retains_bold_and_single_bars() {
+        let lines = render(
+            r"| expression | value |
+|---|---|
+| **$\beta_t$** | $|x|_2$ |",
+            80,
+        );
+        assert!(
+            find_span(&lines, "βₜ")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(texts(&lines).join("\n").contains("|x|₂"));
+    }
+
+    #[test]
+    fn math_bars_do_not_leak_placeholders_or_change_unsupported_source() {
+        let source = r"| formula | note |
+|---|---|
+| $\left\|x\right\|_2$ | norm |
+| $\unknown{|x|}$ | unsupported |
+| `$|x|$` | literal |";
+        let view = texts(&render(source, 80)).join("\n");
+        assert!(view.contains("‖x‖₂"), "{view}");
+        assert!(view.contains(r"$\unknown{|x|}$"), "{view}");
+        assert!(
+            !view
+                .chars()
+                .any(|ch| ('\u{e000}'..='\u{f8ff}').contains(&ch))
+        );
+        // Code is never selected for formula conversion.
+        assert_eq!(texts(&render(r"`$|x|$`", 80)), ["$|x|$"]);
+    }
+
+    #[test]
+    fn display_math_wraps_within_the_terminal_width() {
+        let source = "$$\\beta_t \\cdot \\frac{a+b}{c+d} + \\sqrt{x^2+y^2}$$";
+        let lines = texts(&render(source, 24));
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| display_width(line) <= 24));
+        assert!(!lines.join(" ").contains("\\frac"));
     }
 
     #[test]

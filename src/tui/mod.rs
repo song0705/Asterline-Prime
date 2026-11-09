@@ -23,6 +23,7 @@ pub mod hyperlink;
 mod import_io;
 pub mod keymap;
 pub mod markdown;
+mod math_text;
 pub mod mode_editor;
 pub mod model_picker;
 mod mouse_click;

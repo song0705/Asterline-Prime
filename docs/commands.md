@@ -1078,3 +1078,9 @@ for an already-bound session that Asterline can identify safely; a Claude fork
 is imported only when its prior transcript proves the lineage. Ambiguous native
 sessions are never guessed. Grok and Agy resume their native sessions but
 attached messages are not currently imported.
+
+## Terminal formula display
+
+Math enclosed in `$...$` or `$$...$$` is displayed as Unicode terminal text. Common Greek letters, subscripts and superscripts, fractions, roots, norms, sums, integrals and comparison operators are supported. Fractions use explicit parentheses; composite scripts without suitable Unicode glyphs use bracketed indices or parenthesized exponents. This is linear text rendering, not a full TeX layout engine.
+
+Code spans and fenced code blocks keep their literal contents. Unsupported commands, matrix environments and incomplete formulas remain in their original notation. Conversion affects display only; stored messages and exported conversation data retain the source. Selecting visible chat text copies the rendered form.
