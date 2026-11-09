@@ -1912,3 +1912,44 @@ fn splash_rows_never_exceed_the_width() {
         }
     }
 }
+
+#[test]
+fn table_bold_reaches_terminal_cells_without_extra_body_rules() {
+    use ratatui::style::Modifier;
+    let state = AppState::new(vec![ChatItem::Agent {
+        member: MemberId::new("main"),
+        display_name: "Main".into(),
+        backend: BackendKind::Agy,
+        text: "| method | score |\n|---|---:|\n| baseline | 7.5 |\n| candidate | **9.5** |".into(),
+    }]);
+    for width in [80, 24, 80] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        for (needle, bold) in [("9.5", true), ("7.5", false), ("baseline", false)] {
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, row)| row.contains(needle))
+                .expect(needle);
+            let x = row[..row.find(needle).unwrap()].chars().count();
+            for offset in 0..needle.len() {
+                assert_eq!(
+                    buffer[((x + offset) as u16, y as u16)]
+                        .modifier
+                        .contains(Modifier::BOLD),
+                    bold,
+                    "{needle} width={width}"
+                );
+            }
+        }
+        assert_eq!(rows.iter().filter(|row| row.contains('├')).count(), 1);
+    }
+}

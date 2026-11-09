@@ -330,11 +330,13 @@ enum Mode {
     Table(Table),
 }
 
+type TableCell = Vec<Unit>;
+
 struct Table {
     alignments: Vec<pulldown_cmark::Alignment>,
-    rows: Vec<Vec<String>>,
-    row: Vec<String>,
-    cell: String,
+    rows: Vec<Vec<TableCell>>,
+    row: Vec<TableCell>,
+    cell: TableCell,
     head_rows: usize,
     in_head: bool,
 }
@@ -418,15 +420,13 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.text(&strip_zwsp(&text)),
             Event::Code(code) => {
-                if let Mode::Table(table) = &mut self.mode {
-                    table.cell.push_str(&code);
+                let style = self.inline_style();
+                let style = if matches!(self.mode, Mode::Table(_)) {
+                    style
                 } else {
-                    let style = self
-                        .inline_style()
-                        .fg(theme::warning_color())
-                        .bg(theme::code_bg());
-                    self.push_units(&code, style);
-                }
+                    style.fg(theme::warning_color()).bg(theme::code_bg())
+                };
+                self.push_units(&code, style);
             }
             // In prose a soft break is a newline unit: the wrapper turns it
             // into a space, or into nothing between two CJK characters.
@@ -553,7 +553,7 @@ impl Renderer {
                     alignments,
                     rows: Vec::new(),
                     row: Vec::new(),
-                    cell: String::new(),
+                    cell: Vec::new(),
                     head_rows: 0,
                     in_head: false,
                 });
@@ -630,11 +630,11 @@ impl Renderer {
     }
 
     fn text(&mut self, text: &str) {
+        let style = self.inline_style();
         match &mut self.mode {
             Mode::Code { buf, .. } => buf.push_str(text),
-            Mode::Table(t) => t.cell.push_str(text),
+            Mode::Table(t) => t.cell.extend(text.chars().map(|ch| (ch, style))),
             Mode::Normal => {
-                let style = self.inline_style();
                 let same_style = self
                     .normal_text
                     .as_ref()
@@ -706,9 +706,11 @@ impl Renderer {
     }
 
     fn push_units(&mut self, text: &str, style: Style) {
-        for ch in text.chars() {
-            self.cur.push((ch, style));
-        }
+        let target = match &mut self.mode {
+            Mode::Table(table) => &mut table.cell,
+            _ => &mut self.cur,
+        };
+        target.extend(text.chars().map(|ch| (ch, style)));
     }
 
     /// The active inline style from the open emphasis/heading/link/quote state.
@@ -954,20 +956,22 @@ fn render_table(table: &Table, width: usize) -> Vec<Line<'static>> {
         } else {
             body_style
         };
-        let cells: Vec<Vec<String>> = col_w
+        let cells: Vec<Vec<TableCell>> = col_w
             .iter()
             .enumerate()
-            .map(|(c, w)| wrap_cell(row.get(c).map(|s| s.trim()).unwrap_or(""), *w))
+            .map(|(c, w)| wrap_cell(row.get(c).map(Vec::as_slice).unwrap_or(&[]), *w))
             .collect();
         let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
         for line_index in 0..height {
             let mut spans = vec![Span::styled("│ ", rule_style)];
             for (c, w) in col_w.iter().enumerate() {
-                let piece = cells[c].get(line_index).map(String::as_str).unwrap_or("");
-                spans.push(Span::styled(
-                    pad_to(piece, *w, table.alignments.get(c).copied()),
+                let piece = cells[c].get(line_index).map(Vec::as_slice).unwrap_or(&[]);
+                spans.extend(coalesce(pad_cell(
+                    piece,
+                    *w,
+                    table.alignments.get(c).copied(),
                     style,
-                ));
+                )));
                 spans.push(Span::styled(
                     if c + 1 == cols { " │" } else { " │ " },
                     rule_style,
@@ -1001,10 +1005,10 @@ fn table_column_widths(table: &Table, cols: usize, width: usize) -> Vec<usize> {
     let mut widest_char = vec![1usize; cols];
     for row in &table.rows {
         for (i, cell) in row.iter().enumerate() {
-            let cell = cell.trim();
-            natural[i] = natural[i].max(display_width(cell));
-            for ch in cell.chars() {
-                widest_char[i] = widest_char[i].max(char_width(ch));
+            let cell = trim_cell(cell);
+            natural[i] = natural[i].max(cell_width(cell));
+            for (ch, _) in cell {
+                widest_char[i] = widest_char[i].max(char_width(*ch));
             }
         }
     }
@@ -1050,16 +1054,29 @@ fn table_column_widths(table: &Table, cols: usize, width: usize) -> Vec<usize> {
 
 /// Wrap one table cell to `width` display cells with the same rules as prose
 /// (see [`wrap_units`]). Always returns at least one (possibly empty) line.
-fn wrap_cell(text: &str, width: usize) -> Vec<String> {
-    let units: Vec<Unit> = text.chars().map(|c| (c, Style::default())).collect();
-    let lines = wrap_units(&units, width);
+fn wrap_cell(cell: &[Unit], width: usize) -> Vec<TableCell> {
+    let lines = wrap_units(trim_cell(cell), width);
     if lines.is_empty() {
-        return vec![String::new()];
+        vec![Vec::new()]
+    } else {
+        lines
     }
-    lines
-        .into_iter()
-        .map(|line| line.into_iter().map(|(c, _)| c).collect())
-        .collect()
+}
+
+fn cell_width(cell: &[Unit]) -> usize {
+    display_width(&cell.iter().map(|(ch, _)| *ch).collect::<String>())
+}
+
+fn trim_cell(cell: &[Unit]) -> &[Unit] {
+    let start = cell
+        .iter()
+        .position(|(ch, _)| !ch.is_whitespace())
+        .unwrap_or(cell.len());
+    let end = cell
+        .iter()
+        .rposition(|(ch, _)| !ch.is_whitespace())
+        .map_or(start, |index| index + 1);
+    &cell[start..end]
 }
 
 fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> String {
@@ -1076,18 +1093,25 @@ fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> String
     rule
 }
 
-/// Pad `text` (already wrapped to fit) to display width `w` with alignment.
-fn pad_to(text: &str, w: usize, align: Option<pulldown_cmark::Alignment>) -> String {
+/// Pad a wrapped cell while retaining inline styles and link targets.
+fn pad_cell(
+    cell: &[Unit],
+    width: usize,
+    align: Option<pulldown_cmark::Alignment>,
+    base: Style,
+) -> TableCell {
     use pulldown_cmark::Alignment;
-    let pad = w.saturating_sub(display_width(text));
-    match align {
-        Some(Alignment::Right) => format!("{}{}", " ".repeat(pad), text),
-        Some(Alignment::Center) => {
-            let left = pad / 2;
-            format!("{}{}{}", " ".repeat(left), text, " ".repeat(pad - left))
-        }
-        _ => format!("{}{}", text, " ".repeat(pad)),
-    }
+    let used = cell_width(cell);
+    let pad = width.saturating_sub(used);
+    let left = match align {
+        Some(Alignment::Right) => pad,
+        Some(Alignment::Center) => pad / 2,
+        _ => 0,
+    };
+    let mut out = vec![(' ', base); left];
+    out.extend(cell.iter().map(|(ch, style)| (*ch, base.patch(*style))));
+    out.extend(std::iter::repeat_n((' ', base), pad - left));
+    out
 }
 
 /// Coalesce consecutive same-style units into spans.
@@ -1461,6 +1485,110 @@ mod tests {
         let lines = render("first paragraph\n\nsecond paragraph", 80);
         let text: Vec<_> = lines.iter().map(Line::to_string).collect();
         assert_eq!(text, ["first paragraph", "", "second paragraph"]);
+    }
+
+    #[test]
+    fn table_cells_keep_inline_styles_without_adding_body_row_rules() {
+        let lines = render(
+            "| 方法 | 数值 |\n|---|---:|\n| baseline | 7.5 |\n| candidate | **9.5** |",
+            80,
+        );
+        assert!(
+            find_span(&lines, "9.5")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        for plain in ["candidate", "baseline", "7.5"] {
+            assert!(
+                !find_span(&lines, plain)
+                    .style
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
+        }
+        let text = texts(&lines);
+        assert_eq!(
+            text.iter().filter(|line| line.starts_with('├')).count(),
+            1,
+            "only the existing header rule"
+        );
+        assert_eq!(text.len(), 6);
+    }
+
+    #[test]
+    fn wrapped_table_cells_preserve_bold_cjk_and_number_styles() {
+        let lines = render(
+            "| 方法 | 数值 |\n|---|---:|\n| **加粗内容跨行仍然保留** | **12345±0.67** |\n| plain | 8.0 |",
+            24,
+        );
+        let body: Vec<_> = lines.iter().skip(3).flat_map(|line| &line.spans).collect();
+        let bold: String = body
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            .map(|span| span.content.as_ref())
+            .collect();
+        // The two cells interleave physically; inspect their character sets separately.
+        let cjk: String = bold
+            .chars()
+            .filter(|ch| !ch.is_ascii() && *ch != '±')
+            .collect();
+        let number: String = bold
+            .chars()
+            .filter(|ch| ch.is_ascii_digit() || matches!(ch, '±' | '.'))
+            .collect();
+        assert_eq!(cjk, "加粗内容跨行仍然保留");
+        assert_eq!(number, "12345±0.67");
+        assert!(
+            !find_span(&lines, "plain")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(texts(&lines).iter().all(|line| display_width(line) <= 24));
+    }
+
+    #[test]
+    fn table_inline_code_emphasis_and_links_retain_their_styles() {
+        let lines = render(
+            "| a | b |\n|---|---|\n| **best** then plain | *italic* ~~removed~~ **`code`** [link](https://example.com) |",
+            100,
+        );
+        assert!(
+            find_span(&lines, "best")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            !find_span(&lines, "then plain")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            find_span(&lines, "italic")
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            find_span(&lines, "removed")
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert!(
+            find_span(&lines, "code")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(find_span(&lines, "code").style.bg, None);
+        assert_eq!(
+            hyperlink::url_of_style(find_span(&lines, "link").style).as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]
