@@ -183,7 +183,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState)
             "Esc interrupt · ← agents · /help",
             theme::muted(),
         ));
-        let queued = state.queued_prompt_count();
+        let queued = state.visible_queued_prompt_count();
         if queued > 0 {
             parts.push(Span::raw("   "));
             parts.push(Span::styled(

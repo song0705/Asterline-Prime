@@ -26,13 +26,20 @@ pub(crate) fn unified_hunks(patch: &str) -> Vec<DiffLine> {
     let mut old_line = 0;
     let mut new_line = 0;
     let mut in_hunk = false;
+    let mut numbered = false;
     let mut out = Vec::new();
 
     for raw_line in patch.lines() {
+        if raw_line == "@@ replacement @@" {
+            in_hunk = true;
+            numbered = false;
+            continue;
+        }
         if let Some((old_start, new_start)) = unified_hunk_starts(raw_line) {
             old_line = old_start;
             new_line = new_start;
             in_hunk = true;
+            numbered = true;
             continue;
         }
         if !in_hunk || raw_line.starts_with("\\ No newline at end of file") {
@@ -40,18 +47,18 @@ pub(crate) fn unified_hunks(patch: &str) -> Vec<DiffLine> {
         }
         let Some((kind, text, number)) = (match raw_line.as_bytes().first() {
             Some(b' ') => {
-                let number = Some(new_line);
+                let number = numbered.then_some(new_line);
                 old_line += 1;
                 new_line += 1;
                 Some((' ', &raw_line[1..], number))
             }
             Some(b'-') => {
-                let number = Some(old_line);
+                let number = numbered.then_some(old_line);
                 old_line += 1;
                 Some(('-', &raw_line[1..], number))
             }
             Some(b'+') => {
-                let number = Some(new_line);
+                let number = numbered.then_some(new_line);
                 new_line += 1;
                 Some(('+', &raw_line[1..], number))
             }
@@ -215,6 +222,16 @@ fn lcs_hunks(old: &[&str], new: &[&str]) -> Vec<DiffLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_snippets_preserve_separate_edits_without_inventing_line_numbers() {
+        let hunks =
+            unified_hunks("@@ replacement @@\n-old\n+new\n@@ replacement @@\n-other\n+changed\n");
+        assert_eq!(hunks.len(), 4);
+        assert!(hunks.iter().all(|line| line.number.is_none()));
+        assert_eq!(hunks[0].text, "old");
+        assert_eq!(hunks[3].text, "changed");
+    }
 
     #[test]
     fn replace_one_line_is_minus_then_plus() {

@@ -29,8 +29,8 @@ use crate::adapter::prompt_images::{
 use crate::domain::config::{DetectedBackends, MAIN_MEMBER_ID, detect_backends};
 use crate::domain::event::{
     AgentSessionId, ApprovalId, ChatItem, ConversationSummary, DepartedMember, LogEntry,
-    MemberStatus, MessageId, MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary,
-    RuntimeEvent, UiCommand,
+    MemberStatus, MessageId, MessageTarget, RetryStatus, RunId, RunStatus, RunStepStatus,
+    RunSummary, RuntimeEvent, UiCommand,
 };
 use crate::domain::goal::GoalState;
 use crate::domain::mode::{ModesConfig, TerminalMode};
@@ -408,6 +408,7 @@ pub struct AppState {
     /// When each currently-running member started, for the elapsed-time
     /// "working" indicator. Set on entering Running, cleared otherwise.
     running_since: HashMap<MemberId, Instant>,
+    retry_status: HashMap<MemberId, (RetryStatus, Instant)>,
     /// Active reverse history search (Ctrl+R), if any.
     history_search: Option<HistorySearch>,
     /// Active transcript search (`/find`), if any.
@@ -557,6 +558,7 @@ impl AppState {
             history_cursor: None,
             history_draft: String::new(),
             running_since: HashMap::new(),
+            retry_status: HashMap::new(),
             history_search: None,
             find: None,
             drawer_scroll: 0,
@@ -671,6 +673,8 @@ impl AppState {
                     .collect();
                 let member_ids: std::collections::HashSet<MemberId> =
                     self.members.iter().map(|m| m.id.clone()).collect();
+                self.retry_status
+                    .retain(|member, _| member_ids.contains(member));
                 self.running_since
                     .retain(|member, _| member_ids.contains(member));
                 self.last_reply_at
@@ -682,6 +686,7 @@ impl AppState {
                             .or_insert_with(Instant::now);
                     } else {
                         self.running_since.remove(&member.id);
+                        self.retry_status.remove(&member.id);
                     }
                 }
                 if let (Some(focus), Some(parent)) = (&self.focus, focus_parent)
@@ -757,6 +762,14 @@ impl AppState {
                 let _ = self.composer.set_text(&body);
                 self.composer.home();
                 self.reconcile_pending_images();
+            }
+            RuntimeEvent::MemberRetryStatus { member, status } => {
+                if let Some(status) = status {
+                    self.close_thinking(&member);
+                    self.retry_status.insert(member, (status, Instant::now()));
+                } else {
+                    self.retry_status.remove(&member);
+                }
             }
             RuntimeEvent::MemberStatus { member, status } => {
                 if !member_status_is_active(status) {
@@ -1210,6 +1223,7 @@ impl AppState {
                 self.attach_pending = None;
                 self.attach_request = None;
                 self.running_since.clear();
+                self.retry_status.clear();
                 self.find = None;
                 self.runs.clear();
                 self.selected_run = None;
@@ -1265,6 +1279,7 @@ impl AppState {
                 self.attach_pending = None;
                 self.attach_request = None;
                 self.running_since.clear();
+                self.retry_status.clear();
                 self.find = None;
                 self.scroll = 0;
                 self.drawer = None;
@@ -1468,7 +1483,14 @@ impl AppState {
         }
     }
 
+    pub(crate) fn member_retry_status(&self, member: &MemberId) -> Option<(RetryStatus, u64)> {
+        self.retry_status
+            .get(member)
+            .map(|(status, since)| (*status, since.elapsed().as_secs()))
+    }
+
     fn set_status(&mut self, member: &MemberId, status: MemberStatus) {
+        self.retry_status.remove(member);
         if let Some(view) = self.members.iter_mut().find(|m| &m.id == member) {
             view.status = status;
         }
@@ -1886,6 +1908,13 @@ impl AppState {
         self.queued_prompts.values().map(Vec::len).sum()
     }
 
+    pub fn visible_queued_prompt_count(&self) -> usize {
+        self.focus().map_or_else(
+            || self.queued_prompt_count(),
+            |member| self.queued_prompts_for(member).len(),
+        )
+    }
+
     pub fn queued_prompts_for(&self, member: &MemberId) -> &[String] {
         self.queued_prompts
             .get(member)
@@ -1941,6 +1970,7 @@ impl AppState {
         self.open_thinking.clear();
         self.thinking_started.clear();
         self.running_since.clear();
+        self.retry_status.clear();
         for member in &mut self.members {
             if member_status_is_active(member.status) {
                 member.status = MemberStatus::Failed;

@@ -93,6 +93,13 @@ impl fmt::Display for MemberStatus {
     }
 }
 
+/// Transient automatic retry state; never part of the chat transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryStatus {
+    Waiting { attempt: u32, delay_secs: u64 },
+    Retrying { attempt: u32 },
+}
+
 /// A user's decision on a pending approval.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
@@ -478,6 +485,8 @@ pub enum AgentEvent {
     Raw(String),
     /// A raw line from the backend's stderr.
     Stderr(String),
+    /// Automatic retry progress, cleared when the backend produces work.
+    RetryStatus(Option<RetryStatus>),
     /// A diagnostic line worth keeping in the logs drawer.
     Log(String),
     /// The backend emitted something the parser did not recognize.
@@ -748,6 +757,11 @@ pub enum RuntimeEvent {
     MemberStatus {
         member: MemberId,
         status: MemberStatus,
+    },
+    /// Replace the member's live retry indicator without appending chat.
+    MemberRetryStatus {
+        member: MemberId,
+        status: Option<RetryStatus>,
     },
     /// A member's not-yet-started prompts after a queue change.
     QueueUpdated {

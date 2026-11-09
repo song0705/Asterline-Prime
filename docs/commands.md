@@ -934,7 +934,9 @@ While a member is working, `Enter` queues the next message instead of
 starting a second run. `Esc` interrupts the live member and then sends the
 queued message. If that queued text has not started yet and you want to
 change it, `Shift+←` pulls it back into the composer. The current
-conversation can be scrolled all the way to its first message.
+conversation can be scrolled all the way to its first message. Queue previews and counts show only the viewed member’s pending inputs; the All view shows all members’ queues.
+
+Agy quota retries update one live status row: a countdown while waiting, then “Retrying” when the next attempt starts. Retry diagnostics remain in the logs rather than accumulating in chat.
 
 | Key                        | Action                                                        |
 | -------------------------- | ------------------------------------------------------------- |
@@ -965,7 +967,7 @@ conversation can be scrolled all the way to its first message.
 | `Ctrl+C`                   | Copy chat/composer selection; else cancel, clear, or arm quit |
 | `Ctrl+V` / `Cmd+V`         | Attach a clipboard image to the next send (not Ctrl+C)        |
 
-Click the header of an existing thinking block, file-change block, tool group, or individual tool output to expand/collapse it. Click anywhere in an expanded block to collapse it; nested tool outputs take priority over their enclosing group. Tool-output truncation hints are clickable too. Double-click selects the entire visible row, including on expanded content or link text, without folding it or opening a link. Single-click actions wait briefly (300 ms) to distinguish double-clicks. Dragging still selects text. Ctrl+T, Ctrl+G, and Ctrl+O remain available for global toggles. Codex’s returned reasoning summaries are retained as collapsed thinking blocks. Click a header to inspect the summary; completed sections are saved with the conversation and restored by `/resume`, including after restarting the application.
+Click the header of an existing thinking block, file-change block, tool group, or individual tool output to expand/collapse it. Click anywhere in an expanded block to collapse it; nested tool outputs take priority over their enclosing group. Tool-output truncation hints are clickable too. Double-click selects the entire visible row, including on expanded content or link text, without folding it or opening a link. Single-click actions wait briefly (300 ms) to distinguish double-clicks. Dragging still selects text. Ctrl+T, Ctrl+G, and Ctrl+O remain available for global toggles. Codex’s returned progress summaries are displayed directly, without a disclosure header, and stay visible when Ctrl+T is used. Completed sections are saved with the conversation and restored by `/resume`, including after restarting the application. Other backends retain collapsible thinking blocks.
 
 Screenshots and copied images are copied under the process temp directory
 (`std::env::temp_dir()/asterline-pasted/<pid>/`: `%TEMP%` on Windows, `$TMPDIR`

@@ -307,7 +307,7 @@ fn content_width(width: usize) -> usize {
 const QUEUED_PREVIEW_LINE_LIMIT: usize = 3;
 
 fn queued_input_preview_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
-    if state.queued_prompt_count() == 0 || width < 4 {
+    if state.visible_queued_prompt_count() == 0 || width < 4 {
         return Vec::new();
     }
 
@@ -318,6 +318,9 @@ fn queued_input_preview_lines(state: &AppState, width: usize) -> Vec<Line<'stati
     let content_width = width.saturating_sub(4).max(1);
 
     for member in state.members() {
+        if state.focus().is_some_and(|focus| focus != &member.id) {
+            continue;
+        }
         for prompt in state.queued_prompts_for(&member.id) {
             let wrapped = markdown::wrap(prompt, content_width);
             let wrapped_len = wrapped.len();
@@ -1200,14 +1203,14 @@ fn render_chat_history_range(
             match &mut live {
                 #[cfg(test)]
                 LiveRender::Inline => {
-                    if matches!(item, ChatItem::Thinking { .. })
+                    if (matches!(item, ChatItem::Thinking { .. }) && state.is_thinking_live(member))
                         || render_live_member_activity(state, width, member, false, out)
                     {
                         rendered_live.insert(member.clone());
                     }
                 }
                 LiveRender::Record(slots) => {
-                    if matches!(item, ChatItem::Thinking { .. }) {
+                    if matches!(item, ChatItem::Thinking { .. }) && state.is_thinking_live(member) {
                         rendered_live.insert(member.clone());
                     } else {
                         slots.push(LiveSlot {
@@ -1310,7 +1313,7 @@ fn render_live_member_activity(
         return false;
     }
     // A streaming answer is itself the live view; do not add a second row.
-    if state.has_active_message(&member.id) {
+    if state.has_active_message(&member.id) && state.member_retry_status(member_id).is_none() {
         return false;
     }
     if show_placeholder_header {
@@ -1323,13 +1326,17 @@ fn render_live_member_activity(
         ));
     }
     let reasoning = state.active_reasoning().get(member_id).map(String::as_str);
-    let line_text = status_indicator::member_activity_text(
-        member.status,
-        reasoning,
-        reasoning.is_some(),
-        state.member_elapsed_secs(&member.id),
-        status_indicator::spinner(),
-    );
+    let line_text = if let Some((status, elapsed)) = state.member_retry_status(member_id) {
+        status_indicator::retry_activity_text(status, elapsed, status_indicator::spinner())
+    } else {
+        status_indicator::member_activity_text(
+            member.status,
+            reasoning,
+            reasoning.is_some(),
+            state.member_elapsed_secs(&member.id),
+            status_indicator::spinner(),
+        )
+    };
     for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
         out.push(Line::from(vec![
             Span::raw(" "),
@@ -2135,6 +2142,15 @@ fn render_file_changes(
                     (Some(old_text), Some(new_text)) => file_diff::line_hunks(old_text, new_text),
                 },
             );
+        if hunks.is_empty() {
+            let message =
+                if file.old_text.is_some() || file.new_text.is_some() || file.patch.is_some() {
+                    "      No textual changes in the supplied diff."
+                } else {
+                    "      Diff unavailable: the backend supplied only the file path."
+                };
+            out.push(Line::styled(message, theme::muted_italic()));
+        }
         let max_hunks = 80;
         let clipped = hunks.len() > max_hunks;
         let line_number_width = hunks
@@ -2625,12 +2641,43 @@ fn render_item(
         }
         ChatItem::Thinking {
             member,
+            backend,
             text,
             elapsed_secs,
             ..
         } => {
             let live = elapsed_secs.is_none() && state.is_thinking_live(member);
             if text.is_empty() && !live {
+                return;
+            }
+            if *backend == crate::domain::team::BackendKind::Codex {
+                // Codex emits progress summaries. Show them directly, including
+                // restored history, without reasoning disclosure controls.
+                let marker = if live {
+                    status_indicator::spinner()
+                } else {
+                    "·"
+                };
+                let body = if text.trim().is_empty() {
+                    "Working"
+                } else {
+                    text.trim()
+                };
+                for (index, line) in markdown::render(body, width.saturating_sub(4).max(1))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let prefix = if index == 0 {
+                        format!("  {marker} ")
+                    } else {
+                        "    ".to_string()
+                    };
+                    let mut spans = vec![Span::styled(prefix, theme::muted_italic())];
+                    spans.extend(line.spans.into_iter().map(|span| {
+                        Span::styled(span.content, theme::muted_italic().patch(span.style))
+                    }));
+                    out.push(Line::from(spans));
+                }
                 return;
             }
             let lines = text

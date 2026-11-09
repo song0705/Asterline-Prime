@@ -1987,7 +1987,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_codex_summary_is_collapsed_and_clickable() {
+    fn restored_codex_summary_stays_visible_without_disclosure_controls() {
         let mut state = AppState::new(vec![ChatItem::Thinking {
             member: MemberId::new("builder"),
             display_name: "Builder".to_string(),
@@ -1997,21 +1997,21 @@ mod tests {
         }]);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         let layout = paint(&mut terminal, &state);
-        assert!(!format!("{}", terminal.backend()).contains("retained Codex summary"));
-        click(
-            &mut state,
-            &layout,
-            fold_cell(&layout, app_state::FoldTarget::Thinking(0)),
-        );
-        let layout = paint(&mut terminal, &state);
         assert!(format!("{}", terminal.backend()).contains("retained Codex summary"));
+        assert!(layout.fold_titles.is_empty());
         click(
             &mut state,
             &layout,
-            fold_cell(&layout, app_state::FoldTarget::Thinking(0)),
+            content_cell(&layout, "retained Codex summary"),
         );
-        let _ = paint(&mut terminal, &state);
-        assert!(!format!("{}", terminal.backend()).contains("retained Codex summary"));
+        for _ in 0..2 {
+            state.toggle_thinking_expansion();
+            let layout = paint(&mut terminal, &state);
+            let view = format!("{}", terminal.backend());
+            assert!(view.contains("retained Codex summary"));
+            assert!(!view.contains("click to") && !view.contains("Ctrl+T"));
+            assert!(layout.fold_titles.is_empty());
+        }
     }
 
     #[test]
@@ -2294,6 +2294,40 @@ second line remains separate",
         let layout = paint(&mut terminal, &state);
         click(&mut state, &layout, content_cell(&layout, "file1.rs"));
         assert!(!state.fold_expanded(Tools(0)));
+    }
+
+    #[test]
+    fn clicking_agy_multi_edit_shows_each_replacement_and_can_collapse_again() {
+        use crate::adapter::process::LineParser;
+        use crate::domain::event::AgentEvent;
+        let mut parser = crate::adapter::agy_stream::AgyLineParser::default();
+        let events = parser.parse_line(r#"{"event":"step_update","step_update":{"step_index":6,"state":"DONE","step_type":"tool","tool_name":"multi_replace_file_content","tool_info":{"parameters":{"TargetFile":"src/main.rs","ReplacementChunks":[{"TargetContent":"old first","ReplacementContent":"new first"},{"TargetContent":"old second","ReplacementContent":"new second"}]}}}}"#);
+        let mut state = AppState::new(Vec::new());
+        for event in events {
+            if let AgentEvent::FileChange { files, ok } = event {
+                state.apply(RuntimeEvent::FileChange {
+                    member: MemberId::new("builder"),
+                    files,
+                    ok,
+                });
+            }
+        }
+        let target = app_state::FoldTarget::Diff(0);
+        if state.fold_expanded(target) {
+            state.toggle_fold(target);
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
+        let layout = paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("new second"));
+        click(&mut state, &layout, fold_cell(&layout, target));
+        let layout = paint(&mut terminal, &state);
+        let view = format!("{}", terminal.backend());
+        for expected in ["-old first", "+new first", "-old second", "+new second"] {
+            assert!(view.contains(expected), "{expected}: {view}");
+        }
+        click(&mut state, &layout, content_cell(&layout, "new second"));
+        paint(&mut terminal, &state);
+        assert!(!format!("{}", terminal.backend()).contains("new second"));
     }
 
     #[test]

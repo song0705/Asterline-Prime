@@ -4,7 +4,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::domain::event::MemberStatus;
+use crate::domain::event::{MemberStatus, RetryStatus};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -86,6 +86,26 @@ pub(crate) fn member_activity_text(
     }
 }
 
+pub(crate) fn retry_activity_text(status: RetryStatus, elapsed_secs: u64, spin: &str) -> String {
+    match status {
+        RetryStatus::Waiting {
+            attempt,
+            delay_secs,
+        } => {
+            let remaining = delay_secs.saturating_sub(elapsed_secs);
+            if remaining == 0 {
+                format!("Quota exhausted · waiting to retry · attempt {attempt}")
+            } else {
+                format!(
+                    "Quota exhausted · retry in {} · attempt {attempt}",
+                    fmt_elapsed_compact(remaining)
+                )
+            }
+        }
+        RetryStatus::Retrying { attempt } => format!("{spin} Retrying · attempt {attempt}"),
+    }
+}
+
 fn with_elapsed(label: &str, elapsed: Option<&str>) -> String {
     match elapsed {
         Some(elapsed) => format!("{label} · {elapsed}"),
@@ -145,6 +165,19 @@ mod tests {
         let text = member_activity_text(MemberStatus::Running, None, true, Some(5), "⠋");
         assert!(!text.contains("model"), "{text}");
         assert!(!text.contains("interrupt"), "{text}");
+    }
+
+    #[test]
+    fn retry_countdown_does_not_claim_a_retry_started_when_time_expires() {
+        let status = RetryStatus::Waiting {
+            attempt: 9,
+            delay_secs: 120,
+        };
+        assert!(retry_activity_text(status, 30, "x").contains("retry in 1m 30s"));
+        assert_eq!(
+            retry_activity_text(status, 121, "x"),
+            "Quota exhausted · waiting to retry · attempt 9"
+        );
     }
 
     #[test]

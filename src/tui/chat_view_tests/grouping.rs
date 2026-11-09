@@ -884,7 +884,7 @@ fn reasoning_status_stays_on_the_current_turn_then_becomes_history() {
     let follow_up = joined.find("你有看到附加提示词吗").expect(&joined);
     let tool = joined.find("SKILL.md").expect(&joined);
     assert!(greeting < follow_up && follow_up < tool, "{joined}");
-    assert!(!joined.contains("prompt injection"), "{joined}");
+    assert!(joined.contains("prompt injection"), "{joined}");
     assert!(
         state
             .chat()
@@ -894,7 +894,7 @@ fn reasoning_status_stays_on_the_current_turn_then_becomes_history() {
 }
 
 #[test]
-fn reasoning_summary_stays_with_its_member_and_retains_a_collapsed_block() {
+fn codex_progress_summary_stays_visible_with_its_member() {
     use crate::domain::event::{MessageId, TurnId};
 
     let mut state = AppState::new(Vec::new());
@@ -986,7 +986,7 @@ fn reasoning_summary_stays_with_its_member_and_retains_a_collapsed_block() {
     render_chat_history(&state, 80, 0, &mut lines);
     let joined = plain_text(&lines).join("\n");
     assert!(joined.contains("cargo test"), "{joined}");
-    assert!(!joined.contains("parser invariants"), "{joined}");
+    assert!(joined.contains("parser invariants"), "{joined}");
     assert!(
         state
             .chat()
@@ -1090,13 +1090,13 @@ fn live_working_status_follows_that_members_last_message() {
 }
 
 #[test]
-fn stored_codex_thinking_is_collapsed_without_hiding_tool_output() {
+fn stored_codex_progress_is_visible_without_expanding_tool_output() {
     let state = AppState::new(vec![
         ChatItem::Thinking {
             member: MemberId::new("builder"),
             display_name: "Builder".to_string(),
             backend: BackendKind::Codex,
-            text: "secret scratch work".to_string(),
+            text: "saved progress summary".to_string(),
             elapsed_secs: Some(8),
         },
         ChatItem::Tool {
@@ -1110,8 +1110,11 @@ fn stored_codex_thinking_is_collapsed_without_hiding_tool_output() {
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
     let text = plain_text(&lines).join("\n");
-    assert!(!text.contains("secret scratch work"), "{text}");
-    assert!(text.contains("thinking for 8s"), "{text}");
+    assert!(text.contains("saved progress summary"), "{text}");
+    assert!(
+        !text.contains("thinking for") && !text.contains("Ctrl+T"),
+        "{text}"
+    );
     assert!(text.contains("cargo test"), "{text}");
 }
 
@@ -1172,7 +1175,7 @@ fn stored_zero_second_thinking_does_not_claim_a_duration() {
 }
 
 #[test]
-fn reasoning_status_shows_a_spinner_then_becomes_collapsible_history() {
+fn codex_progress_shows_a_spinner_then_remains_visible_in_history() {
     let builder = MemberId::new("builder");
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
@@ -1198,13 +1201,13 @@ fn reasoning_status_shows_a_spinner_then_becomes_collapsible_history() {
     let mut live = Vec::new();
     render_chat_history(&state, 80, 0, &mut live);
     let live = plain_text(&live).join("\n");
-    assert!(live.contains("thinking"), "{live}");
+    assert!(!live.contains("thinking"), "{live}");
     assert!(live.contains("Looking at the parser"), "{live}");
     assert!(
         live.chars().any(|ch| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch)),
         "live thinking needs a spinner: {live}"
     );
-    assert!(live.contains("Ctrl+T"), "{live}");
+    assert!(!live.contains("Ctrl+T"), "{live}");
 
     state.apply(RuntimeEvent::ToolStarted {
         member: builder,
@@ -1216,12 +1219,11 @@ fn reasoning_status_shows_a_spinner_then_becomes_collapsible_history() {
     render_chat_history(&state, 80, 0, &mut done);
     let done = plain_text(&done).join("\n");
     assert!(done.contains("src/lib.rs"), "{done}");
-    assert!(!done.contains("Looking at the parser"), "{done}");
+    assert!(done.contains("Looking at the parser"), "{done}");
     assert!(
-        done.contains("thought") || done.contains("thinking for"),
+        !done.contains("Ctrl+T") && !done.contains("thinking for"),
         "{done}"
     );
-    assert!(done.contains("Ctrl+T expand"), "{done}");
 }
 
 #[test]
@@ -1242,7 +1244,7 @@ fn active_tool_spinner_invalidates_the_cached_tail() {
 }
 
 #[test]
-fn completed_reasoning_leaves_collapsible_history_for_codex() {
+fn completed_codex_progress_remains_visible_in_history() {
     let builder = MemberId::new("builder");
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
@@ -1263,7 +1265,7 @@ fn completed_reasoning_leaves_collapsible_history_for_codex() {
     });
     state.apply(RuntimeEvent::Reasoning {
         member: builder.clone(),
-        text: "**Checking the parser**\nsecret scratch work about the parser".to_string(),
+        text: "**Checking the parser**\nsaved progress summary about the parser".to_string(),
     });
     state.apply(RuntimeEvent::ReasoningCompleted {
         member: builder.clone(),
@@ -1272,8 +1274,8 @@ fn completed_reasoning_leaves_collapsible_history_for_codex() {
     let mut lines = Vec::new();
     render_chat_history(&state, 80, 0, &mut lines);
     let rendered = plain_text(&lines).join("\n");
-    assert!(!rendered.contains("Checking the parser"), "{rendered}");
-    assert!(!rendered.contains("secret scratch work"), "{rendered}");
+    assert!(rendered.contains("Checking the parser"), "{rendered}");
+    assert!(rendered.contains("saved progress summary"), "{rendered}");
     assert!(
         state
             .chat()

@@ -964,3 +964,150 @@ fn notices_wrap_cjk_text_with_kinsoku_and_hang_under_the_text() {
         .collect();
     assert_eq!(joined.replace(' ', ""), notice);
 }
+
+#[test]
+fn quota_retries_replace_the_live_row_without_growing_chat() {
+    use crate::domain::event::RetryStatus;
+    let mut state = state_over(vec![user("go", &[builder()])], Some(builder()));
+    state.apply(RuntimeEvent::MemberStatus {
+        member: builder(),
+        status: MemberStatus::Running,
+    });
+    let initial_chat = state.chat().len();
+    for attempt in 1..=9 {
+        state.apply(RuntimeEvent::MemberRetryStatus {
+            member: builder(),
+            status: Some(RetryStatus::Waiting {
+                attempt,
+                delay_secs: 120,
+            }),
+        });
+        let rows = draw_rows(&state, 110, 20).join("\n");
+        assert_eq!(rows.matches("Quota exhausted").count(), 1, "{rows}");
+        assert!(rows.contains(&format!("attempt {attempt}")), "{rows}");
+        assert!(
+            !rows.contains("Working") && !rows.contains("Retrying"),
+            "{rows}"
+        );
+        assert_eq!(state.chat().len(), initial_chat);
+    }
+    state.apply(RuntimeEvent::MemberRetryStatus {
+        member: builder(),
+        status: Some(RetryStatus::Retrying { attempt: 9 }),
+    });
+    let rows = draw_rows(&state, 110, 20).join("\n");
+    assert!(rows.contains("Retrying · attempt 9"), "{rows}");
+    assert!(!rows.contains("Quota exhausted"), "{rows}");
+    state.apply(RuntimeEvent::MemberRetryStatus {
+        member: builder(),
+        status: None,
+    });
+    assert!(draw_rows(&state, 110, 20).join("\n").contains("Working"));
+    state.apply(RuntimeEvent::MemberRetryStatus {
+        member: builder(),
+        status: Some(RetryStatus::Waiting {
+            attempt: 10,
+            delay_secs: 120,
+        }),
+    });
+    state.apply(RuntimeEvent::MemberStatus {
+        member: builder(),
+        status: MemberStatus::Idle,
+    });
+    let rows = draw_rows(&state, 110, 20).join("\n");
+    assert!(
+        !rows.contains("Quota exhausted") && !rows.contains("Retrying"),
+        "{rows}"
+    );
+}
+
+#[test]
+fn retry_status_replaces_live_thinking_and_is_scoped_to_its_member() {
+    use crate::domain::event::RetryStatus;
+    let mut state = state_over(vec![user("go", &[builder()])], Some(builder()));
+    state.apply(RuntimeEvent::MemberStatus {
+        member: builder(),
+        status: MemberStatus::Running,
+    });
+    state.apply(RuntimeEvent::Reasoning {
+        member: builder(),
+        text: "planning".into(),
+    });
+    let _ = draw_rows(&state, 110, 20);
+    state.apply(RuntimeEvent::MemberRetryStatus {
+        member: builder(),
+        status: Some(RetryStatus::Waiting {
+            attempt: 1,
+            delay_secs: 120,
+        }),
+    });
+    assert!(
+        draw_rows(&state, 110, 20)
+            .join("\n")
+            .contains("Quota exhausted")
+    );
+    state.set_focus(Some(reviewer()));
+    assert!(
+        !draw_rows(&state, 110, 20)
+            .join("\n")
+            .contains("Quota exhausted")
+    );
+}
+
+#[test]
+fn queue_preview_and_footer_follow_the_viewed_member() {
+    let mut state = state_over(vec![user("go", &[builder(), reviewer()])], Some(builder()));
+    for member in [builder(), reviewer()] {
+        state.apply(RuntimeEvent::MemberStatus {
+            member,
+            status: MemberStatus::Running,
+        });
+    }
+    state.apply(RuntimeEvent::QueueUpdated {
+        member: builder(),
+        prompts: vec!["builder-only pending input".into()],
+    });
+    let rows = draw_rows(&state, 110, 24).join("\n");
+    assert!(
+        rows.contains("builder-only pending input") && rows.contains("1 queued"),
+        "{rows}"
+    );
+    state.set_focus(Some(reviewer()));
+    let rows = draw_rows(&state, 110, 24).join("\n");
+    assert!(
+        !rows.contains("builder-only pending input")
+            && !rows.contains("Queued follow-up")
+            && !rows.contains("1 queued"),
+        "{rows}"
+    );
+    state.apply(RuntimeEvent::QueueUpdated {
+        member: reviewer(),
+        prompts: vec!["reviewer-only pending input".into()],
+    });
+    let rows = draw_rows(&state, 110, 24).join("\n");
+    assert!(
+        rows.contains("reviewer-only pending input") && rows.contains("1 queued"),
+        "{rows}"
+    );
+    assert!(!rows.contains("builder-only pending input"), "{rows}");
+    state.set_focus(None);
+    let rows = draw_rows(&state, 110, 24).join("\n");
+    assert!(
+        rows.contains("reviewer-only pending input")
+            && rows.contains("builder-only pending input")
+            && rows.contains("2 queued"),
+        "{rows}"
+    );
+    state.set_focus(Some(builder()));
+    let rows = draw_rows(&state, 110, 24).join("\n");
+    assert!(
+        rows.contains("builder-only pending input")
+            && !rows.contains("reviewer-only pending input"),
+        "{rows}"
+    );
+    assert_eq!(
+        state.queued_prompt_count(),
+        2,
+        "switching views must not change delivery queues"
+    );
+}

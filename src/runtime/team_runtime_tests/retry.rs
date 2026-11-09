@@ -269,3 +269,25 @@ fn resume_discards_failed_input_from_the_previous_chat() {
             .any(|event| matches!(event, RuntimeEvent::Notice(text) if text == "nothing to retry"))
     );
 }
+
+#[test]
+fn automatic_retry_progress_is_transient_and_does_not_append_notices() {
+    use crate::domain::event::RetryStatus;
+    let mut rt = runtime();
+    let member = MemberId::new("builder");
+    rt.on_ui_command(user("task"));
+    for attempt in 1..=9 {
+        let status = Some(RetryStatus::Waiting {
+            attempt,
+            delay_secs: 120,
+        });
+        let step = rt.on_agent_event(&member, AgentEvent::RetryStatus(status));
+        assert!(step.events.iter().any(|event| matches!(event,
+            RuntimeEvent::MemberRetryStatus { member: recipient, status: actual } if recipient == &member && actual == &status
+        )));
+        assert!(!step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(_) | RuntimeEvent::MemberNotice { .. }
+        )));
+    }
+}

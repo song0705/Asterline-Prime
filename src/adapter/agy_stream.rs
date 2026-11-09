@@ -308,6 +308,7 @@ pub struct AgyLineParser {
     text_acc: String,
     session_id: Option<String>,
     active_tools: HashMap<u64, String>,
+    pending_file_changes: HashMap<u64, crate::domain::event::FileChangeItem>,
     completed_tools: HashSet<u64>,
     result_seen: bool,
     permission_denied: bool,
@@ -374,6 +375,17 @@ impl AgyLineParser {
             .to_string();
         let state = str_field(step, "state").unwrap_or_default();
 
+        if !self.completed_tools.contains(&index)
+            && let Some(file) = tool
+                .get("parameters")
+                .and_then(|params| file_change_from_params(&name, params))
+        {
+            let detailed =
+                file.old_text.is_some() || file.new_text.is_some() || file.patch.is_some();
+            if detailed || !self.pending_file_changes.contains_key(&index) {
+                self.pending_file_changes.insert(index, file);
+            }
+        }
         if state == "ACTIVE" && !self.active_tools.contains_key(&index) {
             self.close_message(out);
             self.active_tools.insert(index, name.clone());
@@ -416,10 +428,7 @@ impl AgyLineParser {
                 ok: state == "DONE",
                 summary: tool_detail(&summary, TOOL_OUTPUT_MAX),
             });
-            if let Some(file) = tool
-                .get("parameters")
-                .and_then(|params| file_change_from_params(&name, params))
-            {
+            if let Some(file) = self.pending_file_changes.remove(&index) {
                 out.push(AgentEvent::FileChange {
                     files: vec![file],
                     ok: state == "DONE",
@@ -890,6 +899,26 @@ mod tests {
             ],
             ok: true,
         }));
+    }
+
+    #[test]
+    fn multi_edit_preserves_all_replacement_chunks_when_done_omits_parameters() {
+        let mut parser = AgyLineParser::default();
+        parser.parse_line(r#"{"event":"step_update","step_update":{"step_index":6,"state":"ACTIVE","step_type":"tool","tool_name":"multi_replace_file_content","tool_info":{"parameters":{"TargetFile":"src/main.rs","ReplacementChunks":[{"TargetContent":"old one","ReplacementContent":"new one"},{"TargetContent":"old two","ReplacementContent":"new two"}]}}}}"#);
+        let events = parser.parse_line(r#"{"event":"step_update","step_update":{"step_index":6,"state":"DONE","step_type":"tool","tool_name":"multi_replace_file_content","tool_info":{"output":"Updated src/main.rs"}}}"#);
+        let files = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::FileChange { files, ok: true } => Some(files),
+                _ => None,
+            })
+            .expect("completed edit must retain its original input");
+        assert_eq!(files[0].path, "src/main.rs");
+        let patch = files[0].patch.as_deref().unwrap();
+        assert!(patch.contains("-old one\n+new one"));
+        assert!(patch.contains("-old two\n+new two"));
+        assert!(parser.pending_file_changes.is_empty());
+        assert!(parser.parse_line(r#"{"event":"step_update","step_update":{"step_index":6,"state":"DONE","step_type":"tool","tool_name":"multi_replace_file_content","tool_info":{}}}"#).is_empty());
     }
 
     #[test]

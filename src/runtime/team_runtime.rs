@@ -2716,10 +2716,18 @@ impl TeamRuntime {
             AgentEvent::Stderr(line) => {
                 self.log(member, LogEntry::warn(member.as_str(), line), &mut step)
             }
+            AgentEvent::RetryStatus(status) => {
+                step.events.push(RuntimeEvent::MemberRetryStatus {
+                    member: member.clone(),
+                    status,
+                });
+                self.log(
+                    member,
+                    LogEntry::info(member.as_str(), format!("automatic retry: {status:?}")),
+                    &mut step,
+                );
+            }
             AgentEvent::Log(message) => {
-                if message.contains("agy quota exhausted") {
-                    step.events.push(RuntimeEvent::Notice(message.clone()));
-                }
                 self.log(member, LogEntry::info(member.as_str(), message), &mut step)
             }
             AgentEvent::ParseWarning(message) => {

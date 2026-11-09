@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::adapter::steer::{SteerReceiver, SteerRecv};
 use crate::adapter::{MemberRunner, RunRequest};
 use crate::domain::config::resolve_binary_on_path;
-use crate::domain::event::{AgentEvent, AgentSessionId};
+use crate::domain::event::{AgentEvent, AgentSessionId, RetryStatus};
 use crate::domain::team::{BackendKind, Effort};
 
 pub(crate) const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -453,6 +453,11 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
                 finish(None, false);
                 return;
             }
+            if attempt > 0 {
+                let _ = events.send(AgentEvent::RetryStatus(Some(RetryStatus::Retrying {
+                    attempt,
+                })));
+            }
             let command = self
                 .adapter
                 .build_command(&req.prompt, req.session.as_ref(), req.effort);
@@ -470,7 +475,16 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
             let mut quota_hint = false;
             let mut retryable_fatal = None;
             let mut exit = None;
+            let mut retry_active = attempt > 0;
             while let Ok(event) = rx.recv() {
+                if retry_active
+                    && (matches!(&event,
+                        AgentEvent::TextDelta(text) | AgentEvent::Reasoning(text) | AgentEvent::MessageCompleted(text) if !text.trim().is_empty()
+                    ) || matches!(&event, AgentEvent::ToolStarted { .. }))
+                {
+                    let _ = events.send(AgentEvent::RetryStatus(None));
+                    retry_active = false;
+                }
                 match event {
                     AgentEvent::Stderr(line) => {
                         if self.adapter.retry_delay(&line, attempt).is_some() {
@@ -504,10 +518,10 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
             };
             if let Some(delay) = retry_delay.filter(|_| !cancelled) {
                 attempt = attempt.saturating_add(1);
-                let _ = events.send(AgentEvent::Log(format!(
-                    "agy quota exhausted; retrying in {}s (attempt {attempt})",
-                    delay.as_secs().max(1)
-                )));
+                let _ = events.send(AgentEvent::RetryStatus(Some(RetryStatus::Waiting {
+                    attempt,
+                    delay_secs: delay.as_secs().max(1),
+                })));
                 if sleep_cancelable(delay, &req.cancel) {
                     continue;
                 }
@@ -1152,10 +1166,29 @@ mod tests {
         let events = collect(rx);
         let _ = std::fs::remove_dir_all(&dir);
 
+        let phases: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::RetryStatus(status) => Some(*status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                Some(RetryStatus::Waiting {
+                    attempt: 1,
+                    delay_secs: 1
+                }),
+                Some(RetryStatus::Retrying { attempt: 1 }),
+                None,
+            ]
+        );
+
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                AgentEvent::Log(message) if message.contains("agy quota exhausted")
+                AgentEvent::RetryStatus(Some(RetryStatus::Waiting { attempt: 1, .. }))
             )),
             "{events:?}"
         );
@@ -1200,9 +1233,9 @@ mod tests {
             AgentEvent::Fatal(message) if message.contains("model not found")
         )));
         assert!(
-            !events.iter().any(
-                |event| matches!(event, AgentEvent::Log(message) if message.contains("retrying"))
-            ),
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RetryStatus(_))),
             "{events:?}"
         );
     }

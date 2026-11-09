@@ -348,7 +348,52 @@ pub fn file_change_from_params(name: &str, params: &Value) -> Option<FileChangeI
             _ => "update",
         },
     };
-    Some(FileChangeItem::new(path, change_kind).with_texts(old_text, new_text))
+    let mut file = FileChangeItem::new(path, change_kind).with_texts(old_text, new_text);
+    if let Some(patch) = json_string_field(params, &["patch", "diff", "unified_diff"]) {
+        file.patch = Some(patch.to_string());
+    } else if let Some(chunks) = params
+        .as_object()
+        .and_then(|map| map_value_by_names(map, &["replacement_chunks", "edits", "replacements"]))
+        .and_then(Value::as_array)
+    {
+        // Each replacement is its own hunk. Joining snippets into one before/
+        // after snapshot would invent adjacency between unrelated file regions.
+        let mut patch = String::new();
+        for chunk in chunks {
+            let Some(old) = json_string_field(
+                chunk,
+                &["target_content", "old_string", "old_text", "before"],
+            ) else {
+                continue;
+            };
+            let Some(new) = json_string_field(
+                chunk,
+                &["replacement_content", "new_string", "new_text", "after"],
+            ) else {
+                continue;
+            };
+            if old == new {
+                continue;
+            }
+            // These are replacement snippets, not full-file snapshots. Leave
+            // line numbers unknown unless the backend supplied a unified diff.
+            patch.push_str("@@ replacement @@\n");
+            for line in old.lines() {
+                patch.push('-');
+                patch.push_str(line);
+                patch.push('\n');
+            }
+            for line in new.lines() {
+                patch.push('+');
+                patch.push_str(line);
+                patch.push('\n');
+            }
+        }
+        if !patch.is_empty() {
+            file.patch = Some(patch);
+        }
+    }
+    Some(file)
 }
 
 #[derive(Clone, Copy)]
@@ -366,6 +411,8 @@ fn file_tool_kind(name: &str) -> Option<FileToolKind> {
         "write" | "write_file" | "writefile" | "write_to_file" | "writetofile" | "create"
         | "create_file" => Some(FileToolKind::Write),
         "edit"
+        | "multiedit"
+        | "multi_edit"
         | "edit_file"
         | "str_replace"
         | "search_replace"
