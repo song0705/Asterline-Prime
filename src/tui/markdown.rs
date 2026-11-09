@@ -719,8 +719,7 @@ impl Renderer {
         if let Some(level) = self.heading {
             let color = match level {
                 HeadingLevel::H1 => theme::accent_color(),
-                HeadingLevel::H2 => theme::emphasis_color(),
-                _ => theme::muted_color(),
+                _ => theme::emphasis_color(),
             };
             style = style.fg(color).add_modifier(Modifier::BOLD);
         } else if self.in_footnote {
@@ -1974,16 +1973,19 @@ mod tests {
     }
 
     #[test]
-    fn heading_levels_are_visually_distinct_and_use_theme_colours() {
-        let lines = render("# One\n\n## Two\n\n### Three\n\n#### Four", 40);
+    fn section_headings_use_emphasis_instead_of_muted_text() {
+        let lines = render(
+            "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six",
+            40,
+        );
         let fg = |text: &str| find_span(&lines, text).style.fg;
         assert_eq!(fg("One"), Some(theme::accent_color()));
         assert_eq!(fg("Two"), Some(theme::emphasis_color()));
-        assert_eq!(fg("Three"), Some(theme::muted_color()));
-        assert_eq!(fg("Four"), Some(theme::muted_color()));
+        for title in ["Three", "Four", "Five", "Six"] {
+            assert_eq!(fg(title), Some(theme::emphasis_color()));
+        }
         assert_ne!(fg("One"), fg("Two"));
-        assert_ne!(fg("Two"), fg("Three"));
-        for text in ["One", "Two", "Three"] {
+        for text in ["One", "Two", "Three", "Four", "Five", "Six"] {
             let m = find_span(&lines, text).style.add_modifier;
             assert!(m.contains(Modifier::BOLD) && !m.contains(Modifier::UNDERLINED));
         }
