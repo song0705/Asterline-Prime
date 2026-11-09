@@ -473,10 +473,18 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
                 run_streaming_steerable(command, parser, cancel, tx, steer);
             });
             let mut quota_hint = false;
+            let mut made_progress = false;
+            let mut non_retryable_fatal = false;
             let mut retryable_fatal = None;
             let mut exit = None;
             let mut retry_active = attempt > 0;
             while let Ok(event) = rx.recv() {
+                made_progress |= matches!(&event,
+                    AgentEvent::TextDelta(text) | AgentEvent::MessageCompleted(text) if !text.trim().is_empty()
+                ) || matches!(
+                    &event,
+                    AgentEvent::ToolStarted { .. } | AgentEvent::FileChange { .. }
+                );
                 if retry_active
                     && (matches!(&event,
                         AgentEvent::TextDelta(text) | AgentEvent::Reasoning(text) | AgentEvent::MessageCompleted(text) if !text.trim().is_empty()
@@ -497,6 +505,7 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
                             quota_hint = true;
                             retryable_fatal = Some(message);
                         } else {
+                            non_retryable_fatal = true;
                             let _ = events.send(AgentEvent::Fatal(message));
                         }
                     }
@@ -511,12 +520,16 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
             let cancelled = req.cancel.load(Ordering::Relaxed);
             let retry_delay = match retryable_fatal.as_deref() {
                 Some(message) => self.adapter.retry_delay(message, attempt),
-                None if quota_hint && !cancelled => {
+                None if quota_hint && exit.is_some_and(|(_, ok)| !ok) => {
                     self.adapter.retry_delay("RESOURCE_EXHAUSTED", attempt)
                 }
                 None => None,
             };
-            if let Some(delay) = retry_delay.filter(|_| !cancelled) {
+            // Replaying the original prompt after output or tools can repeat
+            // completed work. Leave genuine mid-task failures to explicit retry.
+            if let Some(delay) =
+                retry_delay.filter(|_| !cancelled && !made_progress && !non_retryable_fatal)
+            {
                 attempt = attempt.saturating_add(1);
                 let _ = events.send(AgentEvent::RetryStatus(Some(RetryStatus::Waiting {
                     attempt,
@@ -526,7 +539,9 @@ impl<A: StreamAdapter> MemberRunner for ProcessRunner<A> {
                     continue;
                 }
             }
-            if let Some(message) = retryable_fatal {
+            if !req.cancel.load(Ordering::Relaxed)
+                && let Some(message) = retryable_fatal
+            {
                 let _ = events.send(AgentEvent::Fatal(message));
             }
             match exit {
@@ -1096,6 +1111,12 @@ mod tests {
         fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
             if let Some(message) = line.strip_prefix("FATAL:") {
                 vec![AgentEvent::Fatal(message.to_string())]
+            } else if let Some(name) = line.strip_prefix("TOOL:") {
+                vec![AgentEvent::ToolStarted {
+                    id: "t1".into(),
+                    name: name.into(),
+                    summary: String::new(),
+                }]
             } else {
                 vec![AgentEvent::TextDelta(line.to_string())]
             }
@@ -1209,6 +1230,99 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::Exited { ok: true, .. }))
         );
+    }
+
+    fn quota_events_with_timeout(script: &str) -> Vec<AgentEvent> {
+        let runner = ProcessRunner::new(QuotaRetryAdapter {
+            script: script.into(),
+        });
+        let (tx, rx) = mpsc::sync_channel(65_536);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let watchdog = cancel.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        // Bound unexpected automatic replays without slowing successful tests.
+        let guard = thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                watchdog.store(true, Ordering::Relaxed);
+            }
+        });
+        runner.run(
+            RunRequest {
+                steer: None,
+                prompt: "task".into(),
+                session: None,
+                cancel,
+                effort: None,
+            },
+            tx,
+        );
+        let _ = done_tx.send(());
+        guard.join().unwrap();
+        collect(rx)
+    }
+
+    #[test]
+    fn recovered_stderr_quota_warning_does_not_replay_a_successful_process() {
+        let events =
+            quota_events_with_timeout("printf '%s\n' 'RESOURCE_EXHAUSTED (code 429)' >&2; exit 0");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RetryStatus(_) | AgentEvent::Fatal(_))),
+            "{events:?}"
+        );
+        assert!(events.contains(&AgentEvent::Exited {
+            code: Some(0),
+            ok: true
+        }));
+    }
+
+    #[test]
+    fn quota_failure_after_a_response_or_tool_is_not_automatically_replayed() {
+        for progress in ["Completed some work", "TOOL:write_file"] {
+            let events = quota_events_with_timeout(&format!(
+                "printf '%s\n' '{progress}' 'FATAL:RESOURCE_EXHAUSTED (code 429)'; exit 1"
+            ));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::RetryStatus(_))),
+                "{events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(_) | AgentEvent::ToolStarted { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Fatal(_)))
+            );
+            assert!(events.contains(&AgentEvent::Exited {
+                code: Some(1),
+                ok: false
+            }));
+        }
+    }
+
+    #[test]
+    fn old_quota_hint_does_not_override_a_non_retryable_failure() {
+        let events = quota_events_with_timeout(
+            "printf '%s\n' 'RESOURCE_EXHAUSTED (code 429)' >&2; printf '%s\n' 'FATAL:model not found'; exit 1",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RetryStatus(_))),
+            "{events:?}"
+        );
+        assert!(events.contains(&AgentEvent::Fatal("model not found".into())));
     }
 
     #[test]

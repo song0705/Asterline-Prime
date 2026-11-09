@@ -275,10 +275,10 @@ pub(crate) fn agy_quota_retry_delay(fatal: &str, attempt: u32) -> Option<Duratio
 pub(crate) fn is_agy_quota_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("resource_exhausted")
-        || lower.contains("eligibility check failed")
         || lower.contains("resource has been exhausted")
         || lower.contains("rate limited")
-        || (lower.contains("429") && lower.contains("quota"))
+        || (lower.contains("429")
+            && (lower.contains("quota") || lower.contains("resource exhausted")))
 }
 
 fn agy_quota_retry_backoff(attempt: u32) -> Duration {
@@ -312,6 +312,12 @@ pub struct AgyLineParser {
     completed_tools: HashSet<u64>,
     result_seen: bool,
     permission_denied: bool,
+    /// Agy 1.4.12 can retain an earlier turn's quota error in its cumulative
+    /// terminal result. Only explicit current-turn completion can override it.
+    current_turn_start: Option<u64>,
+    current_turn_error: bool,
+    current_response_done: bool,
+    current_response_has_text: bool,
 }
 
 impl AgyLineParser {
@@ -343,6 +349,46 @@ impl AgyLineParser {
     }
 
     fn handle_step(&mut self, step: &Value, out: &mut Vec<AgentEvent>) {
+        let step_type = str_field(step, "step_type");
+        let state = str_field(step, "state");
+        let index = step.get("step_index").and_then(Value::as_u64);
+        if step_type == Some("user_input") {
+            self.current_turn_start = index;
+            self.current_turn_error = false;
+            self.current_response_done = false;
+            self.current_response_has_text = false;
+        } else if self
+            .current_turn_start
+            .zip(index)
+            .is_some_and(|(start, index)| index > start)
+        {
+            if step_type == Some("error_message")
+                || matches!(state, Some("ERROR" | "INTERRUPTED" | "CANCELLED"))
+                || step
+                    .get("error_details")
+                    .is_some_and(|error| !error.is_null())
+            {
+                self.current_turn_error = true;
+            }
+            if matches!(step_type, Some("tool" | "agent_response" | "error_message")) {
+                self.current_response_done =
+                    step_type == Some("agent_response") && state == Some("DONE");
+            }
+        }
+
+        if self
+            .current_turn_start
+            .zip(index)
+            .is_some_and(|(start, index)| index > start)
+        {
+            if matches!(step_type, Some("tool" | "error_message")) {
+                self.current_response_has_text = false;
+            } else if step_type == Some("agent_response")
+                && str_field(step, "text_delta").is_some_and(|text| !text.trim().is_empty())
+            {
+                self.current_response_has_text = true;
+            }
+        }
         if let Some(thought) = ["thought_delta", "raw_thought", "thinking_delta"]
             .into_iter()
             .find_map(|field| str_field(step, field))
@@ -490,7 +536,18 @@ impl LineParser for AgyLineParser {
                         .to_string();
                     // A refused shell is already a failed tool. Do not fail the
                     // whole print run — Plan would otherwise block the mode.
-                    if self.permission_denied || is_permission_denied_tool(&error) {
+                    if self.current_turn_start.is_some_and(|index| index > 0)
+                        && self.current_response_done
+                        && self.current_response_has_text
+                        && !self.current_turn_error
+                        && self.active_tools.is_empty()
+                        && str_field(result, "response").is_some_and(|text| !text.trim().is_empty())
+                        && is_agy_quota_error(&error)
+                    {
+                        out.push(AgentEvent::Log(
+                            "agy completed the current turn; ignoring a stale quota error in the cumulative result".to_string(),
+                        ));
+                    } else if self.permission_denied || is_permission_denied_tool(&error) {
                         self.permission_denied = true;
                         out.push(AgentEvent::Log(format!(
                             "agy tool permission denied: {error}"
@@ -921,6 +978,91 @@ mod tests {
         assert!(parser.parse_line(r#"{"event":"step_update","step_update":{"step_index":6,"state":"DONE","step_type":"tool","tool_name":"multi_replace_file_content","tool_info":{}}}"#).is_empty());
     }
 
+    fn replay_quota_result(steps: &[Value], response: &str) -> Vec<AgentEvent> {
+        let mut parser = AgyLineParser::default();
+        let mut events = Vec::new();
+        for step in steps {
+            events.extend(
+                parser.parse_line(
+                    &serde_json::json!({
+                        "event": "step_update", "step_update": step,
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        events.extend(parser.parse_line(&serde_json::json!({
+            "event": "result", "result": {
+                "status": "ERROR", "error": "Resource exhausted. Please try again later. Please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429 for more details.",
+                "response": response, "duration_seconds": 5080.9, "num_turns": 19,
+                "finished_reason": "error",
+            }
+        }).to_string()));
+        events
+    }
+
+    #[test]
+    fn completed_current_turn_does_not_inherit_an_earlier_quota_failure() {
+        use serde_json::json;
+        // Sanitized SSR event shape: failed step 171 precedes user turn 178;
+        // current response 183 completes without a current error step.
+        let events = replay_quota_result(
+            &[
+                json!({"step_index":171,"step_type":"error_message","state":"DONE"}),
+                json!({"step_index":178,"step_type":"user_input","state":"DONE"}),
+                json!({"step_index":181,"step_type":"tool","state":"ACTIVE","tool_name":"read_file"}),
+                json!({"step_index":181,"step_type":"tool","state":"DONE","tool_name":"read_file"}),
+                json!({"step_index":183,"step_type":"agent_response","state":"ACTIVE","text_delta":"Complete answer"}),
+                json!({"step_index":183,"step_type":"agent_response","state":"DONE","text_delta":"\n"}),
+            ],
+            "Complete answer\n",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Fatal(_)))
+        );
+        assert!(events.contains(&AgentEvent::MessageCompleted("Complete answer\n".into())));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::Log(text) if text.contains("stale quota error"))
+        ));
+    }
+
+    #[test]
+    fn quota_error_is_not_hidden_without_unambiguous_current_turn_success() {
+        use serde_json::json;
+        let user = json!({"step_index":178,"step_type":"user_input","state":"DONE"});
+        let done = json!({"step_index":183,"step_type":"agent_response","state":"DONE","text_delta":"Partial answer"});
+        let error = json!({"step_index":184,"step_type":"error_message","state":"DONE"});
+        for steps in [
+            vec![],             // A response in the terminal result alone proves nothing.
+            vec![done.clone()], // No current-turn boundary.
+            vec![
+                user.clone(),
+                json!({"step_index":183,"step_type":"agent_response","state":"ACTIVE","text_delta":"Partial"}),
+            ],
+            vec![user.clone(), done.clone(), error.clone()],
+            vec![user.clone(), error, done.clone()],
+            vec![
+                user.clone(),
+                done,
+                json!({"step_index":184,"step_type":"tool","state":"ACTIVE","tool_name":"run_command"}),
+            ],
+            vec![
+                user,
+                json!({"step_index":183,"step_type":"agent_response","state":"DONE"}),
+            ], // No current response text.
+        ] {
+            let events = replay_quota_result(&steps, "Partial answer");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Fatal(_))),
+                "{steps:?}"
+            );
+        }
+    }
+
     #[test]
     fn failed_result_is_fatal() {
         let mut parser = AgyLineParser::default();
@@ -957,6 +1099,12 @@ mod tests {
             "Eligibility check failed: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
         ));
         assert!(is_agy_quota_error("rate limited"));
+        assert!(is_agy_quota_error(
+            "Resource exhausted. See https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429"
+        ));
+        assert!(!is_agy_quota_error(
+            "Eligibility check failed: PERMISSION_DENIED (code 403)"
+        ));
         assert!(!is_agy_quota_error(
             "agy exited without a terminal result event"
         ));

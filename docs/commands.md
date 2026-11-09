@@ -936,6 +936,8 @@ queued message. If that queued text has not started yet and you want to
 change it, `Shift+←` pulls it back into the composer. The current
 conversation can be scrolled all the way to its first message. Queue previews and counts show only the viewed member’s pending inputs; the All view shows all members’ queues.
 
+Agy automatically retries quota failures only before the attempt has produced a reply or started a tool. After actual progress, a genuine failure stops for explicit `/retry`, avoiding a replay of completed work. On resumed Agy sessions, a stale cumulative quota error is ignored only when the current turn has a completed response, no current error step, and no outstanding tool.
+
 Agy quota retries update one live status row: a countdown while waiting, then “Retrying” when the next attempt starts. Retry diagnostics remain in the logs rather than accumulating in chat.
 
 | Key                        | Action                                                        |
